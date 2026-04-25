@@ -38,6 +38,7 @@ resolve_paths() {
   GH_DIR="$script_dir/.groundhog"
   SCHED="$GH_DIR/schedule"
   OUT="$GH_DIR/out"
+  FIRED="$GH_DIR/fired"
 }
 
 require_root() {
@@ -46,7 +47,7 @@ require_root() {
 }
 
 ensure_dirs() {
-  mkdir -p "$SCHED" "$OUT"
+  mkdir -p "$SCHED" "$OUT" "$FIRED"
 }
 
 is_hh()  { [[ "$1" =~ ^([01][0-9]|2[0-3])$ ]]; }
@@ -251,11 +252,10 @@ cmd_due() {
   ensure_dirs
   local now_t
   now_t="$(now_today)"
-  local name src is_once dst
+  local name src is_once
   while IFS=$'\t' read -r name src is_once; do
     [[ -n "$name" ]] || continue
-    dst="$OUT/${name}-${now_t}"
-    [[ -e "$dst" ]] && continue
+    [[ -e "$FIRED/$now_t/$name" ]] && continue
     printf '%s\n' "$src"
   done < <(walk_due)
 }
@@ -269,11 +269,19 @@ cmd_tick() {
   while IFS=$'\t' read -r name src is_once; do
     [[ -n "$name" ]] || continue
     dst="$OUT/${name}-${now_t}"
-    if [[ ! -e "$dst" ]]; then
+    if [[ -e "$FIRED/$now_t/$name" ]]; then
+      :  # journal says this already fired today — leave it alone
+    elif [[ -e "$dst" ]]; then
+      printf 'warning: %s already exists in out/; recording firing without overwrite\n' "$(basename "$dst")" >&2
+      mkdir -p "$FIRED/$now_t"
+      touch "$FIRED/$now_t/$name"
+    else
       tmp="$OUT/${name}-${now_t}.partial"
       [[ -e "$tmp" ]] && rm -rf -- "$tmp"
       cp -R -- "$src" "$tmp"
       mv -- "$tmp" "$dst"
+      mkdir -p "$FIRED/$now_t"
+      touch "$FIRED/$now_t/$name"
       printf 'fired %s -> %s\n' "$name" "$dst"
     fi
     if [[ "$is_once" == "1" ]]; then
@@ -358,15 +366,15 @@ cmd_out() {
 }
 
 sweep_dir() {
-  local dir="$1" days="$2"
+  local dir="$1" kind="$2" days="$3"
   [[ -d "$dir" ]] || return 0
   local entry name
   while IFS= read -r entry; do
     [[ -n "$entry" ]] || continue
     name="$(basename "$entry")"
     rm -rf -- "$entry"
-    printf 'swept %s\n' "$name"
-  done < <(find "$dir" -mindepth 1 -maxdepth 1 -mtime +"$days" | sort)
+    printf 'swept %s %s\n' "$kind" "$name"
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 -type d -mtime +"$days" | sort)
 }
 
 cmd_sweep() {
@@ -374,7 +382,8 @@ cmd_sweep() {
   ensure_dirs
   local days="${1:-14}"
   [[ "$days" =~ ^[0-9]+$ ]] || die "sweep <days> must be a non-negative integer"
-  sweep_dir "$OUT" "$days"
+  sweep_dir "$OUT" out "$days"
+  sweep_dir "$FIRED" fired "$days"
 }
 
 main() {

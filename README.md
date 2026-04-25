@@ -10,17 +10,18 @@ When you open `.groundhog/schedule/`, you are looking at the things that come ar
 .groundhog/
   schedule/
   out/
+  fired/
 ```
 
 ## What groundhog is for
 
 Some things should appear on a schedule. A weekly prompt. A monthly check. A daily nudge. The occasional one-shot reminder for a future date.
 
-Groundhog holds the pattern. Each tick, anything due is copied into `out/`, ready to be picked up — by a hand, by an agent, by a script.
+Groundhog holds the pattern. Each tick, anything due is copied into `out/`, ready to be picked up — by a hand, by an agent, by a script. A small note is left in `fired/` so groundhog remembers what it has already done.
 
 What an item *is* is up to you. A directory of files. A single prompt. A payload to run. An empty directory whose mere appearance is the signal. Groundhog does not care what's inside.
 
-The schedule is a directory tree. There are no header fields, no metadata files, no state outside the file system.
+Three folders, three roles: `schedule/` is what *should* happen, `fired/` is what *has* happened, `out/` is the tray for whatever picks the work up. There are no header fields, no metadata files, no state outside the file system.
 
 ## Structure
 
@@ -51,6 +52,10 @@ An item is a directory under a known schedule path.
     morning-nudge-2026-04-25/
       note.md
     follow-up-2026-04-25/
+  fired/
+    2026-04-25/
+      morning-nudge
+      follow-up
 ```
 
 The path *above* the item is its schedule. The path table:
@@ -79,7 +84,7 @@ An item placed at the *root* of an axis fires on the first slot of the cycle: Mo
 
 1. The schedule is the path. Move an item under `schedule/` to reschedule it.
 2. Materialize by copy: a due item is `cp -r`'d to `out/<item-name>-<YYYY-MM-DD>/`.
-3. Idempotent by name: if `out/<item-name>-<YYYY-MM-DD>/` exists, the item has already fired today.
+3. Each firing is recorded by `touch fired/<YYYY-MM-DD>/<item-name>`. An item with a marker for today will not fire again that day.
 4. One-shots remove themselves from `schedule/once/<date>/` after firing.
 5. Item contents are opaque. Groundhog only reads paths.
 
@@ -89,10 +94,10 @@ The file system is the protocol.
 
 1. Read every item directory at the expected depth under each schedule axis.
 2. For each, decide whether today (and the current hour, if specified) matches its path.
-3. If due and `out/<id>-<YYYY-MM-DD>/` does not exist, copy the item there.
+3. If due and `fired/<today>/<item-name>` does not exist: copy to `out/<item-name>-<today>/`, then `touch fired/<today>/<item-name>`.
 4. For each one-shot under `once/<past-or-today-date>/`, remove the source after firing.
 
-The loop has no memory. The path encodes the schedule; `out/` encodes what's already fired today. That's all the state groundhog needs.
+`fired/` is groundhog's only memory. The path encodes the schedule; the journal encodes what's done. That's all the state groundhog needs.
 
 ## Catch-up
 
@@ -108,7 +113,17 @@ One-shots wait. A `once/2026-05-01/<item>/` whose date has passed fires on the n
 * an agent: point its inbox at `out/` and let it tend
 * a script: cron + tick + mv, in one line
 
-If `out/` accumulates, that is a visible signal — items are being deposited but no one is collecting.
+A consumer can yoink items from `out/` immediately and the next tick will not re-deposit them — `fired/` remembers, not `out/`. If `out/` accumulates, that is a visible signal: items are being deposited but no one is collecting.
+
+## Fired
+
+`fired/<YYYY-MM-DD>/<item-name>` is an empty file recording that the item fired on that date. Groundhog writes it; nothing else should. Three useful things fall out:
+
+* **Idempotency**, even if the consumer takes items immediately.
+* **History**: `ls fired/2026-04-25/` answers "what fired that day?" forever, regardless of whether the items have been collected.
+* **One-shot trace**: when a `once/<date>/<item>/` self-deletes, its `fired/` marker is the only durable record that it ever existed.
+
+Old `fired/<date>/` directories are pruned by `sweep` on the same retention as `out/`.
 
 ## Commands
 
