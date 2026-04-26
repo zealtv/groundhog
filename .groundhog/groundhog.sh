@@ -293,7 +293,7 @@ cmd_tick() {
       mkdir -p "$(dirname "$marker")"
       touch "$marker"
     else
-      tmp="$OUT/${name}-${now_t}.partial"
+      tmp="$OUT/${name}-${now_t}.landing"
       [[ -e "$tmp" ]] && rm -rf -- "$tmp"
       cp -R -- "$src" "$tmp"
       mv -- "$tmp" "$dst"
@@ -465,7 +465,7 @@ cmd_out() {
   for entry in "$OUT"/*; do
     [[ -e "$entry" ]] || continue
     name="$(basename "$entry")"
-    [[ "$name" == *.partial ]] && continue
+    [[ "$name" == *.landing ]] && continue
     printf '%s\n' "$name"
   done
   shopt -u nullglob
