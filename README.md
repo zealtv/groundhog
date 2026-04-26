@@ -105,6 +105,14 @@ Missed days are missed. If a tick doesn't run on Monday, Monday's daily and week
 
 One-shots wait. A `once/2026-05-01/<item>/` whose date has passed fires on the next tick regardless. A scheduled date should not be missed just because the tick was late.
 
+### Short-month days
+
+`monthly/29/`, `monthly/30/`, and `monthly/31/` only fire when that day-of-month actually exists. February has no 29..31 in non-leap years; April, June, September, and November have no 31. **There is no end-of-month fallback.** If you want "always the last day of the month," use `monthly/28/` (which exists every month) and accept the early trigger, or schedule the item explicitly with `once/<YYYY-MM-DD>/` entries generated for each month you care about. Keep the protocol simple; let the schedule express the truth.
+
+### Daylight saving time
+
+Groundhog reads local time. On the spring-forward day, an item at `daily/02/<item>/` may never fire — the local clock skips from 01:59 directly to 03:00. On the autumn-back day, the same item may fire twice if you tick during the doubled hour. **The tick is "the agent ran groundhog at this wall-clock moment," not "groundhog scheduled an event."** If precision-at-an-hour matters more than precision-at-a-day, prefer hour buckets that don't sit on the DST boundary.
+
 ## Out
 
 `out/` is a tray of fresh items. Groundhog does not know what consumes them. Pipe, move, watch, or ignore — the next reader is your concern.
@@ -117,11 +125,19 @@ A consumer can yoink items from `out/` immediately and the next tick will not re
 
 ## Fired
 
-`fired/<YYYY-MM-DD>/<item-name>` is an empty file recording that the item fired on that date. Groundhog writes it; nothing else should. Three useful things fall out:
+`fired/<YYYY-MM-DD>/<schedule-relative-path>` is an empty file recording that the item fired on that date. The marker mirrors the schedule subtree, so `weekly/sat/foo` and `monthly/25/foo` get distinct markers and neither is silently swallowed. Groundhog writes it; nothing else should. Three useful things fall out:
 
 * **Idempotency**, even if the consumer takes items immediately.
-* **History**: `ls fired/2026-04-25/` answers "what fired that day?" forever, regardless of whether the items have been collected.
+* **History**: `find fired/2026-04-25 -type f` answers "what fired that day?" forever, regardless of whether the items have been collected.
 * **One-shot trace**: when a `once/<date>/<item>/` self-deletes, its `fired/` marker is the only durable record that it ever existed.
+
+To **rearm an item that already fired today** — say you accidentally tended it and want a fresh copy — remove its marker:
+
+```
+rm .groundhog/fired/$(date +%Y-%m-%d)/weekly/sat/foo
+```
+
+The next tick will refire it. Groundhog has no other override; the journal is the truth.
 
 Old `fired/<date>/` directories are pruned by `sweep` on the same retention as `out/`.
 
@@ -133,6 +149,7 @@ Old `fired/<date>/` directories are pruned by `sweep` on the same retention as `
 ./groundhog.sh tick                     # fire any due items into out/
 ./groundhog.sh due                      # what would fire now (read-only)
 ./groundhog.sh list                     # tree-like view of schedule/
+./groundhog.sh lint                     # report any orphaned paths walk_due will never see
 ./groundhog.sh drop <item-id>           # remove from schedule/
 ./groundhog.sh out                      # ls out/
 ./groundhog.sh sweep [days]             # remove out/ entries older than N days (default 14)

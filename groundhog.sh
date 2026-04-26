@@ -9,6 +9,7 @@ usage:
   groundhog.sh tick
   groundhog.sh due
   groundhog.sh list
+  groundhog.sh lint
   groundhog.sh drop <item-id>
   groundhog.sh out
   groundhog.sh sweep [days]
@@ -67,6 +68,10 @@ is_id() {
   is_dom "$v" && return 1
   is_md "$v"  && return 1
   is_ymd "$v" && return 1
+  # Reject pure-numeric and dash-numeric shapes — these are
+  # indistinguishable from typo'd axis params (`monthly/99`, `yearly/13-45`).
+  [[ "$v" =~ ^[0-9]+$ ]] && return 1
+  [[ "$v" =~ ^[0-9]+-[0-9]+$ ]] && return 1
   return 0
 }
 
@@ -247,15 +252,26 @@ cmd_add() {
   echo "$path"
 }
 
+# Translate a source schedule path into its fired-marker path.
+# The marker mirrors the schedule subtree, so two distinct items
+# with the same name (e.g. weekly/sat/foo and monthly/25/foo) get
+# distinct markers and neither is silently swallowed.
+fired_marker_for() {
+  local src="$1" now_t="$2"
+  local rel="${src#"$SCHED"/}"
+  printf '%s/%s/%s\n' "$FIRED" "$now_t" "$rel"
+}
+
 cmd_due() {
   require_root
   ensure_dirs
   local now_t
   now_t="$(now_today)"
-  local name src is_once
+  local name src is_once marker
   while IFS=$'\t' read -r name src is_once; do
     [[ -n "$name" ]] || continue
-    [[ -e "$FIRED/$now_t/$name" ]] && continue
+    marker="$(fired_marker_for "$src" "$now_t")"
+    [[ -e "$marker" ]] && continue
     printf '%s\n' "$src"
   done < <(walk_due)
 }
@@ -265,23 +281,24 @@ cmd_tick() {
   ensure_dirs
   local now_t
   now_t="$(now_today)"
-  local name src is_once dst tmp date_dir
+  local name src is_once dst tmp date_dir marker
   while IFS=$'\t' read -r name src is_once; do
     [[ -n "$name" ]] || continue
     dst="$OUT/${name}-${now_t}"
-    if [[ -e "$FIRED/$now_t/$name" ]]; then
+    marker="$(fired_marker_for "$src" "$now_t")"
+    if [[ -e "$marker" ]]; then
       :  # journal says this already fired today — leave it alone
     elif [[ -e "$dst" ]]; then
       printf 'warning: %s already exists in out/; recording firing without overwrite\n' "$(basename "$dst")" >&2
-      mkdir -p "$FIRED/$now_t"
-      touch "$FIRED/$now_t/$name"
+      mkdir -p "$(dirname "$marker")"
+      touch "$marker"
     else
       tmp="$OUT/${name}-${now_t}.partial"
       [[ -e "$tmp" ]] && rm -rf -- "$tmp"
       cp -R -- "$src" "$tmp"
       mv -- "$tmp" "$dst"
-      mkdir -p "$FIRED/$now_t"
-      touch "$FIRED/$now_t/$name"
+      mkdir -p "$(dirname "$marker")"
+      touch "$marker"
       printf 'fired %s -> %s\n' "$name" "$dst"
     fi
     if [[ "$is_once" == "1" ]]; then
@@ -327,6 +344,95 @@ cmd_list() {
   else
     echo "(no items scheduled)"
   fi
+}
+
+# Walk the schedule tree and report directories that walk_due will
+# never reach — orphans from typos, manual mkdirs, or invalid paths.
+# The "state" arg is the small grammar machine: at each position we
+# know which dir-name shapes are valid; anything else is an orphan.
+# When we hit a valid item-id, we stop descending (item contents are opaque).
+LINT_ORPHANS=()
+
+lint_walk() {
+  local dir="$1"
+  local state="$2"
+  local entry name
+  shopt -s nullglob
+  for entry in "$dir"/*; do
+    [[ -d "$entry" ]] || continue
+    name="$(basename "$entry")"
+
+    case "$state" in
+      axis-daily)
+        if   is_hh "$name"; then lint_walk "$entry" "item-only"
+        elif is_id "$name"; then : # item; opaque below
+        else LINT_ORPHANS+=("$entry"); fi
+        ;;
+      axis-weekly)
+        if   is_dow "$name"; then lint_walk "$entry" "weekly-dow"
+        elif is_hh  "$name"; then lint_walk "$entry" "item-only"
+        elif is_id  "$name"; then :
+        else LINT_ORPHANS+=("$entry"); fi
+        ;;
+      axis-monthly)
+        if   is_dom "$name"; then lint_walk "$entry" "param-with-hour-or-item"
+        elif is_hh  "$name"; then lint_walk "$entry" "item-only"
+        elif is_id  "$name"; then :
+        else LINT_ORPHANS+=("$entry"); fi
+        ;;
+      axis-yearly)
+        if   is_md "$name"; then lint_walk "$entry" "param-with-hour-or-item"
+        elif is_hh "$name"; then lint_walk "$entry" "item-only"
+        elif is_id "$name"; then :
+        else LINT_ORPHANS+=("$entry"); fi
+        ;;
+      axis-once)
+        # once supports YYYY-MM-DD or root-with-optional-HH; no HH below a date
+        if   is_ymd "$name"; then lint_walk "$entry" "item-only"
+        elif is_hh  "$name"; then lint_walk "$entry" "item-only"
+        elif is_id  "$name"; then :
+        else LINT_ORPHANS+=("$entry"); fi
+        ;;
+      weekly-dow|param-with-hour-or-item)
+        if   is_hh "$name"; then lint_walk "$entry" "item-only"
+        elif is_id "$name"; then :
+        else LINT_ORPHANS+=("$entry"); fi
+        ;;
+      item-only)
+        if is_id "$name"; then :
+        else LINT_ORPHANS+=("$entry"); fi
+        ;;
+    esac
+  done
+  shopt -u nullglob
+}
+
+cmd_lint() {
+  require_root
+  LINT_ORPHANS=()
+  local axis_dir name
+  shopt -s nullglob
+  for axis_dir in "$SCHED"/*; do
+    [[ -d "$axis_dir" ]] || continue
+    name="$(basename "$axis_dir")"
+    case "$name" in
+      daily)   lint_walk "$axis_dir" "axis-daily"   ;;
+      weekly)  lint_walk "$axis_dir" "axis-weekly"  ;;
+      monthly) lint_walk "$axis_dir" "axis-monthly" ;;
+      yearly)  lint_walk "$axis_dir" "axis-yearly"  ;;
+      once)    lint_walk "$axis_dir" "axis-once"    ;;
+      *)       LINT_ORPHANS+=("$axis_dir") ;;
+    esac
+  done
+  shopt -u nullglob
+
+  if (( ${#LINT_ORPHANS[@]} == 0 )); then
+    echo "schedule is clean"
+    return 0
+  fi
+  printf 'orphan: %s\n' "${LINT_ORPHANS[@]}"
+  echo "${#LINT_ORPHANS[@]} orphan(s) found — these paths will not fire" >&2
+  return 1
 }
 
 cmd_drop() {
@@ -394,6 +500,7 @@ main() {
     tick)  shift; cmd_tick  "$@" ;;
     due)   shift; cmd_due   "$@" ;;
     list)  shift; cmd_list  "$@" ;;
+    lint)  shift; cmd_lint  "$@" ;;
     drop)  shift; cmd_drop  "$@" ;;
     out)   shift; cmd_out   "$@" ;;
     sweep) shift; cmd_sweep "$@" ;;
