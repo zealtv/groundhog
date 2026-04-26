@@ -8,6 +8,7 @@ When you open `.groundhog/schedule/`, you are looking at the things that come ar
 
 ```
 .groundhog/
+  groundhog.sh
   schedule/
   out/
   fired/
@@ -122,6 +123,18 @@ Groundhog reads local time. On the spring-forward day, an item at `daily/02/<ite
 * a script: cron + tick + mv, in one line
 
 A consumer can yoink items from `out/` immediately and the next tick will not re-deposit them — `fired/` remembers, not `out/`. If `out/` accumulates, that is a visible signal: items are being deposited but no one is collecting.
+
+### Polling
+
+Groundhog is passive — `tick` only fires when invoked. To bring the schedule to life, run `tick` on an interval. The simplest possible loop:
+
+```
+while sleep 60; do ./groundhog.sh tick; done
+```
+
+Run it in a tmux pane, background it, or wrap it in launchd / systemd / cron — groundhog itself doesn't care. `sleep` is interruptible by Ctrl-C. `tick` already prints a line per firing, so piping the loop to a log gives you a free audit trail.
+
+This single loop is the heartbeat for any system built on these protocols. Anything else that wants to "come alive" — a tender, an agent, a watcher — can be triggered by a groundhog item firing into its inbox.
 
 ## Fired
 

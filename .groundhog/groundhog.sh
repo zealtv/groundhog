@@ -36,7 +36,8 @@ die() {
 resolve_paths() {
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  GH_DIR="$script_dir/.groundhog"
+  [[ "$(basename "$script_dir")" == ".groundhog" ]] || die "groundhog.sh must live inside a .groundhog/ directory"
+  GH_DIR="$script_dir"
   SCHED="$GH_DIR/schedule"
   OUT="$GH_DIR/out"
   FIRED="$GH_DIR/fired"
@@ -44,7 +45,6 @@ resolve_paths() {
 
 require_root() {
   resolve_paths
-  [[ -d "$GH_DIR" ]] || die "expected .groundhog/ beside groundhog.sh — run init first"
 }
 
 ensure_dirs() {
