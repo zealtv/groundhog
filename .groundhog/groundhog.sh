@@ -17,12 +17,13 @@ usage:
 notes:
   - this script operates on the .groundhog/ directory beside it
   - <when> is the schedule path under schedule/:
-      daily, daily/09,
-      weekly, weekly/mon, weekly/mon/09,
-      monthly, monthly/1, monthly/15/09,
-      yearly, yearly/03-15, yearly/03-15/09,
-      once, once/2026-05-01
-  - hour is optional and always the innermost axis (00..23)
+      daily, daily/09, daily/09-30,
+      weekly, weekly/mon, weekly/mon/09, weekly/mon/09-30,
+      monthly, monthly/1, monthly/15/09, monthly/15/09-30,
+      yearly, yearly/03-15, yearly/03-15/09, yearly/03-15/09-30,
+      once, once/2026-05-01, once/2026-05-01/09-30
+  - time is optional and always the innermost axis: HH (00..23) or HH-MM
+  - HH-MM is forbidden at yearly root (would collide with MM-DD shape)
   - root items default to: weekly→Mon, monthly→1st, yearly→Jan 1, once→next tick
   - item contents are opaque to groundhog
 USAGE
@@ -52,10 +53,27 @@ ensure_dirs() {
 }
 
 is_hh()  { [[ "$1" =~ ^([01][0-9]|2[0-3])$ ]]; }
+is_hm()  { [[ "$1" =~ ^([01][0-9]|2[0-3])-[0-5][0-9]$ ]]; }
 is_dow() { [[ "$1" =~ ^(mon|tue|wed|thu|fri|sat|sun)$ ]]; }
 is_dom() { [[ "$1" =~ ^([1-9]|[12][0-9]|3[01])$ ]]; }
 is_md()  { [[ "$1" =~ ^(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$ ]]; }
 is_ymd() { [[ "$1" =~ ^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])$ ]]; }
+
+# Selector → minutes-since-midnight. Nonzero exit means "not a time selector."
+selector_minutes() {
+  if is_hh "$1"; then echo $((10#$1 * 60)); return 0; fi
+  if is_hm "$1"; then
+    local hh="${1%-*}" mm="${1#*-}"
+    echo $((10#$hh * 60 + 10#$mm))
+    return 0
+  fi
+  return 1
+}
+# Yearly-root variant: HH-MM there would collide with MM-DD shape, so forbid it.
+selector_minutes_hh_only() {
+  is_hh "$1" || return 1
+  echo $((10#$1 * 60))
+}
 
 is_id() {
   local v="$1"
@@ -83,7 +101,7 @@ validate_when() {
     daily/*)
       local hh="${when#daily/}"
       [[ "$hh" != */* ]] || die "too many components in '$when'"
-      is_hh "$hh" || die "expected hour 00..23 in '$when'"
+      is_hh "$hh" || is_hm "$hh" || die "expected HH or HH-MM in '$when'"
       ;;
     weekly/*)
       local rest="${when#weekly/}"
@@ -92,7 +110,7 @@ validate_when() {
       if [[ "$rest" == */* ]]; then
         local hh="${rest#*/}"
         [[ "$hh" != */* ]] || die "too many components in '$when'"
-        is_hh "$hh" || die "expected hour 00..23 in '$when'"
+        is_hh "$hh" || is_hm "$hh" || die "expected HH or HH-MM in '$when'"
       fi
       ;;
     monthly/*)
@@ -102,7 +120,7 @@ validate_when() {
       if [[ "$rest" == */* ]]; then
         local hh="${rest#*/}"
         [[ "$hh" != */* ]] || die "too many components in '$when'"
-        is_hh "$hh" || die "expected hour 00..23 in '$when'"
+        is_hh "$hh" || is_hm "$hh" || die "expected HH or HH-MM in '$when'"
       fi
       ;;
     yearly/*)
@@ -112,13 +130,18 @@ validate_when() {
       if [[ "$rest" == */* ]]; then
         local hh="${rest#*/}"
         [[ "$hh" != */* ]] || die "too many components in '$when'"
-        is_hh "$hh" || die "expected hour 00..23 in '$when'"
+        is_hh "$hh" || is_hm "$hh" || die "expected HH or HH-MM in '$when'"
       fi
       ;;
     once/*)
-      local ymd="${when#once/}"
-      [[ "$ymd" != */* ]] || die "too many components in '$when'"
+      local rest="${when#once/}"
+      local ymd="${rest%%/*}"
       is_ymd "$ymd" || die "expected date YYYY-MM-DD in '$when'"
+      if [[ "$rest" == */* ]]; then
+        local hh="${rest#*/}"
+        [[ "$hh" != */* ]] || die "too many components in '$when'"
+        is_hh "$hh" || is_hm "$hh" || die "expected HH or HH-MM in '$when'"
+      fi
       ;;
     *)
       die "unknown axis in '$when' (expected daily, weekly, monthly, yearly, once)"
@@ -130,34 +153,36 @@ now_today() { date +%Y-%m-%d; }
 now_dow()   { date +%a | tr '[:upper:]' '[:lower:]'; }
 now_dom()   { echo $((10#$(date +%d))); }
 now_hh()    { echo $((10#$(date +%H))); }
+now_mm()    { echo $((10#$(date +%M))); }
 now_md()    { date +%m-%d; }
 
 # Emits one tab-separated row per due item:
 #   <item-name>\t<source-path>\t<is-once>
 walk_due() {
   shopt -s nullglob
-  local now_t now_d now_dom_v now_hh_v now_md_v
+  local now_t now_d now_dom_v now_hh_v now_mm_v now_md_v now_min_total
   now_t="$(now_today)"
   now_d="$(now_dow)"
   now_dom_v="$(now_dom)"
   now_hh_v="$(now_hh)"
+  now_mm_v="$(now_mm)"
   now_md_v="$(now_md)"
+  now_min_total=$(( now_hh_v * 60 + now_mm_v ))
 
-  # Walks <parent>/* where children are either <HH>/<item>/ or <item>/.
-  # Used both for explicit sub-axis dirs (weekly/mon, monthly/15, …)
-  # and — via emit_axis_root — for the root of an axis after filtering
-  # out the sub-axis selectors.
-  emit_with_optional_hour() {
+  # Walks <parent>/* where children are either <time>/<item>/ or <item>/.
+  # `time_fn` decides what counts as a time selector and yields minutes-since-midnight
+  # (selector_minutes everywhere except yearly root, which uses selector_minutes_hh_only).
+  emit_with_optional_time() {
     local parent="$1"
-    local is_once="$2"
+    local time_fn="$2"
+    local is_once="$3"
     [[ -d "$parent" ]] || return 0
-    local entry name
+    local entry name mins
     for entry in "$parent"/*; do
       [[ -d "$entry" ]] || continue
       name="$(basename "$entry")"
-      if is_hh "$name"; then
-        local hh=$((10#$name))
-        (( now_hh_v >= hh )) || continue
+      if mins=$("$time_fn" "$name"); then
+        (( now_min_total >= mins )) || continue
         local sub
         for sub in "$entry"/*; do
           [[ -d "$sub" ]] || continue
@@ -175,16 +200,16 @@ walk_due() {
   emit_axis_root() {
     local parent="$1"
     local sub_check="$2"
-    local is_once="$3"
+    local time_fn="$3"
+    local is_once="$4"
     [[ -d "$parent" ]] || return 0
-    local entry name
+    local entry name mins
     for entry in "$parent"/*; do
       [[ -d "$entry" ]] || continue
       name="$(basename "$entry")"
       "$sub_check" "$name" && continue
-      if is_hh "$name"; then
-        local hh=$((10#$name))
-        (( now_hh_v >= hh )) || continue
+      if mins=$("$time_fn" "$name"); then
+        (( now_min_total >= mins )) || continue
         local sub
         for sub in "$entry"/*; do
           [[ -d "$sub" ]] || continue
@@ -196,36 +221,56 @@ walk_due() {
     done
   }
 
+  # Past one-shots fire regardless of inner time — the day is already gone.
+  emit_past_once() {
+    local parent="$1" entry name sub
+    for entry in "$parent"/*; do
+      [[ -d "$entry" ]] || continue
+      name="$(basename "$entry")"
+      if is_hh "$name" || is_hm "$name"; then
+        for sub in "$entry"/*; do
+          [[ -d "$sub" ]] || continue
+          printf '%s\t%s\t1\n' "$(basename "$sub")" "$sub"
+        done
+      else
+        printf '%s\t%s\t1\n' "$name" "$entry"
+      fi
+    done
+  }
+
   # daily: every day
-  emit_with_optional_hour "$SCHED/daily" 0
+  emit_with_optional_time "$SCHED/daily" selector_minutes 0
 
   # weekly: explicit dow + Monday default at root
-  emit_with_optional_hour "$SCHED/weekly/$now_d" 0
-  [[ "$now_d" == "mon" ]] && emit_axis_root "$SCHED/weekly" is_dow 0
+  emit_with_optional_time "$SCHED/weekly/$now_d" selector_minutes 0
+  [[ "$now_d" == "mon" ]] && emit_axis_root "$SCHED/weekly" is_dow selector_minutes 0
 
   # monthly: explicit dom + 1st default at root
-  emit_with_optional_hour "$SCHED/monthly/$now_dom_v" 0
-  [[ "$now_dom_v" == "1" ]] && emit_axis_root "$SCHED/monthly" is_dom 0
+  emit_with_optional_time "$SCHED/monthly/$now_dom_v" selector_minutes 0
+  [[ "$now_dom_v" == "1" ]] && emit_axis_root "$SCHED/monthly" is_dom selector_minutes 0
 
-  # yearly: explicit MM-DD + Jan 1 default at root
-  emit_with_optional_hour "$SCHED/yearly/$now_md_v" 0
-  [[ "$now_md_v" == "01-01" ]] && emit_axis_root "$SCHED/yearly" is_md 0
+  # yearly: explicit MM-DD + Jan 1 default at root.
+  # At yearly root, HH-MM would collide with MM-DD shape, so root accepts HH only.
+  emit_with_optional_time "$SCHED/yearly/$now_md_v" selector_minutes 0
+  [[ "$now_md_v" == "01-01" ]] && emit_axis_root "$SCHED/yearly" is_md selector_minutes_hh_only 0
 
   # once: explicit YYYY-MM-DD on/before today + next-tick default at root
   if [[ -d "$SCHED/once" ]]; then
-    local date_dir entry d
+    local date_dir d
     for date_dir in "$SCHED/once"/*; do
       [[ -d "$date_dir" ]] || continue
       d="$(basename "$date_dir")"
       is_ymd "$d" || continue
-      [[ "$d" > "$now_t" ]] && continue
-      for entry in "$date_dir"/*; do
-        [[ -d "$entry" ]] || continue
-        printf '%s\t%s\t1\n' "$(basename "$entry")" "$entry"
-      done
+      if [[ "$d" > "$now_t" ]]; then
+        continue
+      elif [[ "$d" == "$now_t" ]]; then
+        emit_with_optional_time "$date_dir" selector_minutes 1
+      else
+        emit_past_once "$date_dir"
+      fi
     done
   fi
-  emit_axis_root "$SCHED/once" is_ymd 1
+  emit_axis_root "$SCHED/once" is_ymd selector_minutes 1
 
   shopt -u nullglob
 }
@@ -303,10 +348,14 @@ cmd_tick() {
     fi
     if [[ "$is_once" == "1" ]]; then
       rm -rf -- "$src"
-      date_dir="$(dirname "$src")"
-      if [[ "$date_dir" != "$SCHED/once" ]]; then
-        rmdir "$date_dir" 2>/dev/null || true
-      fi
+      # Walk up removing now-empty schedule dirs (e.g. <date>/<HH-MM>/, then <date>/),
+      # but never the once axis root itself.
+      local parent
+      parent="$(dirname "$src")"
+      while [[ "$parent" != "$SCHED/once" && "$parent" == "$SCHED/once/"* ]]; do
+        rmdir "$parent" 2>/dev/null || break
+        parent="$(dirname "$parent")"
+      done
     fi
   done < <(walk_due)
 }
@@ -364,37 +413,37 @@ lint_walk() {
 
     case "$state" in
       axis-daily)
-        if   is_hh "$name"; then lint_walk "$entry" "item-only"
+        if   is_hh "$name" || is_hm "$name"; then lint_walk "$entry" "item-only"
         elif is_id "$name"; then : # item; opaque below
         else LINT_ORPHANS+=("$entry"); fi
         ;;
       axis-weekly)
         if   is_dow "$name"; then lint_walk "$entry" "weekly-dow"
-        elif is_hh  "$name"; then lint_walk "$entry" "item-only"
+        elif is_hh  "$name" || is_hm "$name"; then lint_walk "$entry" "item-only"
         elif is_id  "$name"; then :
         else LINT_ORPHANS+=("$entry"); fi
         ;;
       axis-monthly)
         if   is_dom "$name"; then lint_walk "$entry" "param-with-hour-or-item"
-        elif is_hh  "$name"; then lint_walk "$entry" "item-only"
+        elif is_hh  "$name" || is_hm "$name"; then lint_walk "$entry" "item-only"
         elif is_id  "$name"; then :
         else LINT_ORPHANS+=("$entry"); fi
         ;;
       axis-yearly)
+        # HH-MM forbidden at yearly root — would collide with MM-DD shape.
         if   is_md "$name"; then lint_walk "$entry" "param-with-hour-or-item"
         elif is_hh "$name"; then lint_walk "$entry" "item-only"
         elif is_id "$name"; then :
         else LINT_ORPHANS+=("$entry"); fi
         ;;
       axis-once)
-        # once supports YYYY-MM-DD or root-with-optional-HH; no HH below a date
-        if   is_ymd "$name"; then lint_walk "$entry" "item-only"
-        elif is_hh  "$name"; then lint_walk "$entry" "item-only"
+        if   is_ymd "$name"; then lint_walk "$entry" "param-with-hour-or-item"
+        elif is_hh  "$name" || is_hm "$name"; then lint_walk "$entry" "item-only"
         elif is_id  "$name"; then :
         else LINT_ORPHANS+=("$entry"); fi
         ;;
       weekly-dow|param-with-hour-or-item)
-        if   is_hh "$name"; then lint_walk "$entry" "item-only"
+        if   is_hh "$name" || is_hm "$name"; then lint_walk "$entry" "item-only"
         elif is_id "$name"; then :
         else LINT_ORPHANS+=("$entry"); fi
         ;;

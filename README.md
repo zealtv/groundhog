@@ -61,23 +61,30 @@ An item is a directory under a known schedule path.
 
 The path *above* the item is its schedule. The path table:
 
-| Path under `schedule/`              | Fires                              |
-|-------------------------------------|------------------------------------|
-| `daily/<item>/`                     | every day                          |
-| `daily/<HH>/<item>/`                | every day at or after hour `HH`    |
-| `weekly/<item>/`                    | every Monday (default)             |
-| `weekly/<dow>/<item>/`              | weekly on `<dow>` (mon..sun)       |
-| `weekly/<dow>/<HH>/<item>/`         | weekly at or after hour `HH`       |
-| `monthly/<item>/`                   | the 1st of every month (default)   |
-| `monthly/<dom>/<item>/`             | monthly on day-of-month `<dom>`    |
-| `monthly/<dom>/<HH>/<item>/`        | monthly at or after hour `HH`      |
-| `yearly/<item>/`                    | Jan 1 each year (default)          |
-| `yearly/<MM-DD>/<item>/`            | yearly on that date                |
-| `yearly/<MM-DD>/<HH>/<item>/`       | yearly at or after hour `HH`       |
-| `once/<item>/`                      | next tick, then source removed     |
-| `once/<YYYY-MM-DD>/<item>/`         | one-shot on that date; source removed after firing |
+| Path under `schedule/`                  | Fires                                  |
+|-----------------------------------------|----------------------------------------|
+| `daily/<item>/`                         | every day                              |
+| `daily/<HH>/<item>/`                    | every day at or after hour `HH`        |
+| `daily/<HH-MM>/<item>/`                 | every day at or after `HH:MM`          |
+| `weekly/<item>/`                        | every Monday (default)                 |
+| `weekly/<dow>/<item>/`                  | weekly on `<dow>` (mon..sun)           |
+| `weekly/<dow>/<HH>/<item>/`             | weekly at or after hour `HH`           |
+| `weekly/<dow>/<HH-MM>/<item>/`          | weekly at or after `HH:MM`             |
+| `monthly/<item>/`                       | the 1st of every month (default)       |
+| `monthly/<dom>/<item>/`                 | monthly on day-of-month `<dom>`        |
+| `monthly/<dom>/<HH>/<item>/`            | monthly at or after hour `HH`          |
+| `monthly/<dom>/<HH-MM>/<item>/`         | monthly at or after `HH:MM`            |
+| `yearly/<item>/`                        | Jan 1 each year (default)              |
+| `yearly/<MM-DD>/<item>/`                | yearly on that date                    |
+| `yearly/<MM-DD>/<HH>/<item>/`           | yearly at or after hour `HH`           |
+| `yearly/<MM-DD>/<HH-MM>/<item>/`        | yearly at or after `HH:MM`             |
+| `once/<item>/`                          | next tick, then source removed         |
+| `once/<YYYY-MM-DD>/<item>/`             | one-shot on that date; source removed after firing |
+| `once/<YYYY-MM-DD>/<HH-MM>/<item>/`     | one-shot at or after `HH:MM` on that date |
 
-Hour is optional and always the innermost axis.
+Time is optional and always the innermost axis: bare `<HH>` (00..23) or `<HH-MM>` (e.g. `09-30`). They coexist — pick whichever reads better. `HH-MM` is forbidden directly under `yearly/` because it would collide with the `MM-DD` shape; if you want a yearly time, write the date out (`yearly/01-01/09-30/<item>/`).
+
+A past-dated one-shot with an inner `<HH-MM>` fires on the next tick regardless — the day is already gone, so the time is moot.
 
 An item placed at the *root* of an axis fires on the first slot of the cycle: Mon for weekly, the 1st for monthly, Jan 1 for yearly. The exception is `once/<item>/`, which fires on the very next tick — a one-shot you don't have to date.
 
@@ -94,7 +101,7 @@ The file system is the protocol.
 ## Tick loop
 
 1. Read every item directory at the expected depth under each schedule axis.
-2. For each, decide whether today (and the current hour, if specified) matches its path.
+2. For each, decide whether today (and the current time, if `<HH>` or `<HH-MM>` is specified) matches its path.
 3. If due and `fired/<today>/<item-name>` does not exist: copy to `out/<item-name>-<today>/`, then `touch fired/<today>/<item-name>`.
 4. For each one-shot under `once/<past-or-today-date>/`, remove the source after firing.
 
@@ -130,6 +137,15 @@ Groundhog is passive — `tick` only fires when invoked. To bring the schedule t
 
 ```
 while sleep 60; do ./groundhog.sh tick; done
+```
+
+If you use minute-grained schedules (`<HH-MM>`), align the heartbeat to the wall-clock minute so items fire near `:00` of their target minute:
+
+```
+while :; do
+  sleep $(( 60 - $(date +%s) % 60 ))
+  ./groundhog.sh tick
+done
 ```
 
 Run it in a tmux pane, background it, or wrap it in launchd / systemd / cron — groundhog itself doesn't care. `sleep` is interruptible by Ctrl-C. `tick` already prints a line per firing, so piping the loop to a log gives you a free audit trail.
@@ -168,4 +184,4 @@ Old `fired/<date>/` directories are pruned by `sweep` on the same retention as `
 ./groundhog.sh sweep [days]             # remove out/ entries older than N days (default 14)
 ```
 
-`<when>` is the schedule path: `daily`, `daily/09`, `weekly`, `weekly/mon`, `weekly/mon/09`, `monthly`, `monthly/1`, `monthly/15/09`, `yearly`, `yearly/03-15`, `once`, `once/2026-05-01`. A bare axis (`weekly`, `monthly`, `yearly`, `once`) takes the default slot.
+`<when>` is the schedule path: `daily`, `daily/09`, `daily/09-30`, `weekly`, `weekly/mon`, `weekly/mon/09`, `weekly/mon/09-30`, `monthly`, `monthly/1`, `monthly/15/09`, `monthly/15/09-30`, `yearly`, `yearly/03-15`, `yearly/03-15/09-30`, `once`, `once/2026-05-01`, `once/2026-05-01/09-30`. A bare axis (`weekly`, `monthly`, `yearly`, `once`) takes the default slot.
