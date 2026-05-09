@@ -84,6 +84,8 @@ The path *above* the item is its schedule. The path table:
 
 Time is optional and always the innermost axis: bare `<HH>` (00..23) or `<HH-MM>` (e.g. `09-30`). They coexist — pick whichever reads better. `HH-MM` is forbidden directly under `yearly/` because it would collide with the `MM-DD` shape; if you want a yearly time, write the date out (`yearly/01-01/09-30/<item>/`).
 
+Any path component may carry a `.paused` suffix to take that subtree off the schedule (`daily/foo.paused/`, `weekly/mon.paused/`, `once/2026-05-01.paused/`, even `weekly.paused/`). Toggle by rename: `mv schedule/daily/foo schedule/daily/foo.paused` and back. See Rule 6 below.
+
 A past-dated one-shot with an inner `<HH-MM>` fires on the next tick regardless — the day is already gone, so the time is moot.
 
 An item placed at the *root* of an axis fires on the first slot of the cycle: Mon for weekly, the 1st for monthly, Jan 1 for yearly. The exception is `once/<item>/`, which fires on the very next tick — a one-shot you don't have to date.
@@ -95,6 +97,7 @@ An item placed at the *root* of an axis fires on the first slot of the cycle: Mo
 3. Each firing is recorded by `touch fired/<YYYY-MM-DD>/<item-name>`. An item with a marker for today will not fire again that day.
 4. One-shots remove themselves from `schedule/once/<date>/` after firing.
 5. Item contents are opaque. Groundhog only reads paths.
+6. A `.paused` suffix on any path component excludes that subtree. `due` and `tick` skip it; `list` shows it tagged `[paused]`; `lint` accepts it. Pausing cascades — `weekly/mon.paused/` pauses every item beneath. A paused `once/<date>/` does not auto-fire and is not removed when its date passes; it fires on the next tick after unpause.
 
 The file system is the protocol.
 

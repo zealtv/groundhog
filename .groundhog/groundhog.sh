@@ -52,6 +52,8 @@ ensure_dirs() {
   mkdir -p "$SCHED" "$OUT" "$FIRED"
 }
 
+is_paused() { [[ "$1" == *.paused ]]; }
+
 is_hh()  { [[ "$1" =~ ^([01][0-9]|2[0-3])$ ]]; }
 is_hm()  { [[ "$1" =~ ^([01][0-9]|2[0-3])-[0-5][0-9]$ ]]; }
 is_dow() { [[ "$1" =~ ^(mon|tue|wed|thu|fri|sat|sun)$ ]]; }
@@ -181,12 +183,15 @@ walk_due() {
     for entry in "$parent"/*; do
       [[ -d "$entry" ]] || continue
       name="$(basename "$entry")"
+      is_paused "$name" && continue
       if mins=$("$time_fn" "$name"); then
         (( now_min_total >= mins )) || continue
-        local sub
+        local sub sub_name
         for sub in "$entry"/*; do
           [[ -d "$sub" ]] || continue
-          printf '%s\t%s\t%s\n' "$(basename "$sub")" "$sub" "$is_once"
+          sub_name="$(basename "$sub")"
+          is_paused "$sub_name" && continue
+          printf '%s\t%s\t%s\n' "$sub_name" "$sub" "$is_once"
         done
       else
         printf '%s\t%s\t%s\n' "$name" "$entry" "$is_once"
@@ -207,13 +212,16 @@ walk_due() {
     for entry in "$parent"/*; do
       [[ -d "$entry" ]] || continue
       name="$(basename "$entry")"
+      is_paused "$name" && continue
       "$sub_check" "$name" && continue
       if mins=$("$time_fn" "$name"); then
         (( now_min_total >= mins )) || continue
-        local sub
+        local sub sub_name
         for sub in "$entry"/*; do
           [[ -d "$sub" ]] || continue
-          printf '%s\t%s\t%s\n' "$(basename "$sub")" "$sub" "$is_once"
+          sub_name="$(basename "$sub")"
+          is_paused "$sub_name" && continue
+          printf '%s\t%s\t%s\n' "$sub_name" "$sub" "$is_once"
         done
       else
         printf '%s\t%s\t%s\n' "$name" "$entry" "$is_once"
@@ -223,14 +231,17 @@ walk_due() {
 
   # Past one-shots fire regardless of inner time — the day is already gone.
   emit_past_once() {
-    local parent="$1" entry name sub
+    local parent="$1" entry name sub sub_name
     for entry in "$parent"/*; do
       [[ -d "$entry" ]] || continue
       name="$(basename "$entry")"
+      is_paused "$name" && continue
       if is_hh "$name" || is_hm "$name"; then
         for sub in "$entry"/*; do
           [[ -d "$sub" ]] || continue
-          printf '%s\t%s\t1\n' "$(basename "$sub")" "$sub"
+          sub_name="$(basename "$sub")"
+          is_paused "$sub_name" && continue
+          printf '%s\t%s\t1\n' "$sub_name" "$sub"
         done
       else
         printf '%s\t%s\t1\n' "$name" "$entry"
@@ -260,6 +271,7 @@ walk_due() {
     for date_dir in "$SCHED/once"/*; do
       [[ -d "$date_dir" ]] || continue
       d="$(basename "$date_dir")"
+      is_paused "$d" && continue
       is_ymd "$d" || continue
       if [[ "$d" > "$now_t" ]]; then
         continue
@@ -373,14 +385,21 @@ print_tree() {
   local count="${#entries[@]}" i=0
   for entry in "${entries[@]}"; do
     i=$((i + 1))
-    local name branch child_prefix
+    local name branch child_prefix tag display
     name="$(basename "$entry")"
     if (( i == count )); then
       branch="└──"; child_prefix="    "
     else
       branch="├──"; child_prefix="│   "
     fi
-    printf '%s%s %s\n' "$prefix" "$branch" "$name"
+    if is_paused "$name"; then
+      display="${name%.paused}"
+      tag=" [paused]"
+    else
+      display="$name"
+      tag=""
+    fi
+    printf '%s%s %s%s\n' "$prefix" "$branch" "$display" "$tag"
     print_tree "$entry" "$prefix$child_prefix"
   done
 }
@@ -410,6 +429,7 @@ lint_walk() {
   for entry in "$dir"/*; do
     [[ -d "$entry" ]] || continue
     name="$(basename "$entry")"
+    is_paused "$name" && continue
 
     case "$state" in
       axis-daily)
@@ -464,6 +484,7 @@ cmd_lint() {
   for axis_dir in "$SCHED"/*; do
     [[ -d "$axis_dir" ]] || continue
     name="$(basename "$axis_dir")"
+    is_paused "$name" && continue
     case "$name" in
       daily)   lint_walk "$axis_dir" "axis-daily"   ;;
       weekly)  lint_walk "$axis_dir" "axis-weekly"  ;;
@@ -494,7 +515,7 @@ cmd_drop() {
   while IFS= read -r p; do
     [[ -n "$p" ]] || continue
     matches+=("$p")
-  done < <(find "$SCHED" -type d -name "$id")
+  done < <(find "$SCHED" -type d \( -name "$id" -o -name "$id.paused" \))
   if (( ${#matches[@]} == 0 )); then
     die "item '$id' not found under schedule/"
   fi
