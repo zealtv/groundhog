@@ -49,14 +49,19 @@ An item is a directory under a known schedule path.
     once/
       2026-05-01/
         follow-up/
+    every/
+      15m/
+        heartbeat/
   out/
     morning-nudge-2026-04-25/
       note.md
     follow-up-2026-04-25/
+    heartbeat-2026-04-25-09-15/
   fired/
     2026-04-25/
       morning-nudge
       follow-up
+      every/15m/heartbeat/09-15
 ```
 
 The path *above* the item is its schedule. The path table:
@@ -81,6 +86,8 @@ The path *above* the item is its schedule. The path table:
 | `once/<item>/`                          | next tick, then source removed         |
 | `once/<YYYY-MM-DD>/<item>/`             | one-shot on that date; source removed after firing |
 | `once/<YYYY-MM-DD>/<HH-MM>/<item>/`     | one-shot at or after `HH:MM` on that date |
+| `every/<N>m/<item>/`                    | every `N` minutes, anchored to 00:00   |
+| `every/<N>h/<item>/`                    | every `N` hours, anchored to 00:00     |
 
 Time is optional and always the innermost axis: bare `<HH>` (00..23) or `<HH-MM>` (e.g. `09-30`). They coexist — pick whichever reads better. `HH-MM` is forbidden directly under `yearly/` because it would collide with the `MM-DD` shape; if you want a yearly time, write the date out (`yearly/01-01/09-30/<item>/`).
 
@@ -90,10 +97,12 @@ A past-dated one-shot with an inner `<HH-MM>` fires on the next tick regardless 
 
 An item placed at the *root* of an axis fires on the first slot of the cycle: Mon for weekly, the 1st for monthly, Jan 1 for yearly. The exception is `once/<item>/`, which fires on the very next tick — a one-shot you don't have to date.
 
+`every/` is the other exception. It has no canonical interval, so a bucket like `15m` or `3h` is required — `every/<item>/` on its own is rejected by `add` and flagged by `lint`.
+
 ## Rules
 
 1. The schedule is the path. Move an item under `schedule/` to reschedule it.
-2. Materialize by copy: a due item is `cp -r`'d to `out/<item-name>-<YYYY-MM-DD>/`.
+2. Materialize by copy: a due item is `cp -r`'d to `out/<item-name>-<YYYY-MM-DD>/`. Sub-day items under `every/` extend the name with their slot: `out/<item-name>-<YYYY-MM-DD>-<HH-MM>/`, so multiple firings in a day don't collide.
 3. Each firing is recorded by `touch fired/<YYYY-MM-DD>/<item-name>`. An item with a marker for today will not fire again that day.
 4. One-shots remove themselves from `schedule/once/<date>/` after firing.
 5. Item contents are opaque. Groundhog only reads paths.
@@ -114,15 +123,27 @@ The file system is the protocol.
 
 Missed days are missed. If a tick doesn't run on Monday, Monday's daily and weekly items are gone for that cycle — the next cycle brings fresh ones. Recurrence beats fidelity.
 
+The same rule governs `every/`: missed sub-day slots are gone. A tick running mid-slot fires only that current slot, never backfilling earlier ones — the next slot is what matters.
+
 One-shots wait. A `once/2026-05-01/<item>/` whose date has passed fires on the next tick regardless. A scheduled date should not be missed just because the tick was late.
 
 ### Short-month days
 
 `monthly/29/`, `monthly/30/`, and `monthly/31/` only fire when that day-of-month actually exists. February has no 29..31 in non-leap years; April, June, September, and November have no 31. **There is no end-of-month fallback.** If you want "always the last day of the month," use `monthly/28/` (which exists every month) and accept the early trigger, or schedule the item explicitly with `once/<YYYY-MM-DD>/` entries generated for each month you care about. Keep the protocol simple; let the schedule express the truth.
 
+### Intervals
+
+`every/<N>m/` and `every/<N>h/` are calendar-orthogonal: they walk forward by `N` from 00:00 local each day. `every/15m/` fires at 00:00, 00:15, 00:30, …, 23:45. `every/3h/` fires at 00, 03, 06, 09, 12, 15, 18, 21.
+
+When `N` doesn't divide evenly into the day, the last slot is short and the leftover is dropped — `every/7m/` walks 00:00, 00:07, …, 23:55 and the next slot (24:01) is past midnight, so it doesn't fire. Same spirit as the short-month rule: keep the protocol simple and let the schedule express the truth.
+
+Each slot is journaled separately: `fired/<YYYY-MM-DD>/every/<bucket>/<item>/<HH-MM>`. To rearm a slot you accidentally tended, remove its marker (e.g. `rm .groundhog/fired/$(date +%Y-%m-%d)/every/15m/foo/14-30`).
+
 ### Daylight saving time
 
 Groundhog reads local time. On the spring-forward day, an item at `daily/02/<item>/` may never fire — the local clock skips from 01:59 directly to 03:00. On the autumn-back day, the same item may fire twice if you tick during the doubled hour. **The tick is "the agent ran groundhog at this wall-clock moment," not "groundhog scheduled an event."** If precision-at-an-hour matters more than precision-at-a-day, prefer hour buckets that don't sit on the DST boundary.
+
+The same applies to `every/`: spring-forward simply has no 02:xx slots that day; on fall-back a slot inside the doubled hour can fire twice if a tick lands in both repeats. Documented, not engineered around.
 
 ## Out
 
@@ -187,4 +208,4 @@ Old `fired/<date>/` directories are pruned by `sweep` on the same retention as `
 ./groundhog.sh sweep [days]             # remove out/ entries older than N days (default 14)
 ```
 
-`<when>` is the schedule path: `daily`, `daily/09`, `daily/09-30`, `weekly`, `weekly/mon`, `weekly/mon/09`, `weekly/mon/09-30`, `monthly`, `monthly/1`, `monthly/15/09`, `monthly/15/09-30`, `yearly`, `yearly/03-15`, `yearly/03-15/09-30`, `once`, `once/2026-05-01`, `once/2026-05-01/09-30`. A bare axis (`weekly`, `monthly`, `yearly`, `once`) takes the default slot.
+`<when>` is the schedule path: `daily`, `daily/09`, `daily/09-30`, `weekly`, `weekly/mon`, `weekly/mon/09`, `weekly/mon/09-30`, `monthly`, `monthly/1`, `monthly/15/09`, `monthly/15/09-30`, `yearly`, `yearly/03-15`, `yearly/03-15/09-30`, `once`, `once/2026-05-01`, `once/2026-05-01/09-30`, `every/15m`, `every/3h`. A bare axis (`weekly`, `monthly`, `yearly`, `once`) takes the default slot. `every/` has no default — the bucket is required.
