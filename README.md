@@ -194,6 +194,22 @@ The next tick will refire it. Groundhog has no other override; the journal is th
 
 Old `fired/<date>/` directories are pruned by `sweep` on the same retention as `out/`.
 
+## Vendoring
+
+To add groundhog to another project, copy `groundhog.sh` and `README.md`
+into the project's `.groundhog/` directory, then run
+`./.groundhog/groundhog.sh init` to seed the trays:
+
+```sh
+mkdir -p <project>/.groundhog
+cp groundhog.sh README.md <project>/.groundhog/
+<project>/.groundhog/groundhog.sh init
+```
+
+`init` creates `schedule/`, `out/`, and `fired/` next to itself.
+`groundhog.sh` operates on the `.groundhog/` directory it lives in, so
+each vendored copy is self-contained.
+
 ## Commands
 
 ```
