@@ -2,6 +2,11 @@
 
 A tiny, file-based protocol for recurring items.
 
+The script remains passive: it materializes deliveries when explicitly ticked.
+The [optional runtime contract](docs/runtime-contract.md) proposes supervision,
+ownership, pause and consumer handoff. That design is **unimplemented** and
+awaiting acceptance; its commands are not available in this version.
+
 An *item* is a directory. Its position under `schedule/` is when it returns. Each time it's due, a fresh copy lands in `out/`.
 
 When you open `.groundhog/schedule/`, you are looking at the things that come around again.
@@ -47,7 +52,7 @@ An item is a directory under a known schedule path.
       03-15/
         anniversary/
     once/
-      2026-05-01/
+      2026-04-25/
         follow-up/
     every/
       15m/
@@ -59,8 +64,8 @@ An item is a directory under a known schedule path.
     heartbeat-2026-04-25-09-15/
   fired/
     2026-04-25/
-      morning-nudge
-      follow-up
+      daily/morning-nudge
+      once/2026-04-25/follow-up
       every/15m/heartbeat/09-15
 ```
 
@@ -103,7 +108,7 @@ An item placed at the *root* of an axis fires on the first slot of the cycle: Mo
 
 1. The schedule is the path. Move an item under `schedule/` to reschedule it.
 2. Materialize by copy: a due item is `cp -r`'d to `out/<item-name>-<YYYY-MM-DD>/`. Sub-day items under `every/` extend the name with their slot: `out/<item-name>-<YYYY-MM-DD>-<HH-MM>/`, so multiple firings in a day don't collide.
-3. Each firing is recorded by `touch fired/<YYYY-MM-DD>/<item-name>`. An item with a marker for today will not fire again that day.
+3. Each firing is recorded by `touch fired/<YYYY-MM-DD>/<schedule-relative-path>` (with a slot suffix for `every/`). An occurrence with a marker will not fire again for that date and slot.
 4. One-shots remove themselves from `schedule/once/<date>/` after firing.
 5. Item contents are opaque. Groundhog only reads paths.
 6. A `.paused` suffix on any path component excludes that subtree. `due` and `tick` skip it; `list` shows it tagged `[paused]`; `lint` accepts it. Pausing cascades — `weekly/mon.paused/` pauses every item beneath. A paused `once/<date>/` does not auto-fire and is not removed when its date passes; it fires on the next tick after unpause.
@@ -114,7 +119,7 @@ The file system is the protocol.
 
 1. Read every item directory at the expected depth under each schedule axis.
 2. For each, decide whether today (and the current time, if `<HH>` or `<HH-MM>` is specified) matches its path.
-3. If due and `fired/<today>/<item-name>` does not exist: copy to `out/<item-name>-<today>/`, then `touch fired/<today>/<item-name>`.
+3. If due and its schedule-relative marker under `fired/<today>/` does not exist: copy to `out/<item-name>-<today>/`, then touch that marker.
 4. For each one-shot under `once/<past-or-today-date>/`, remove the source after firing.
 
 `fired/` is groundhog's only memory. The path encodes the schedule; the journal encodes what's done. That's all the state groundhog needs.
@@ -141,9 +146,9 @@ Each slot is journaled separately: `fired/<YYYY-MM-DD>/every/<bucket>/<item>/<HH
 
 ### Daylight saving time
 
-Groundhog reads local time. On the spring-forward day, an item at `daily/02/<item>/` may never fire — the local clock skips from 01:59 directly to 03:00. On the autumn-back day, the same item may fire twice if you tick during the doubled hour. **The tick is "the agent ran groundhog at this wall-clock moment," not "groundhog scheduled an event."** If precision-at-an-hour matters more than precision-at-a-day, prefer hour buckets that don't sit on the DST boundary.
+Groundhog reads local time and treats explicit times as "at or after" thresholds. On the spring-forward day, `daily/02/<item>/` can fire at a tick after the clock jumps to 03:00, provided a tick runs later that same day. On the autumn-back day, a marker already written for that date prevents a second firing during the repeated hour. Missed days still are not backfilled.
 
-The same applies to `every/`: spring-forward simply has no 02:xx slots that day; on fall-back a slot inside the doubled hour can fire twice if a tick lands in both repeats. Documented, not engineered around.
+For `every/`, spring-forward skips slots that no tick observes. During fall-back, an already journaled date/slot does not fire again; the slot key does not distinguish the two occurrences of a repeated wall-clock time. Groundhog does not promise elapsed-time intervals across clock changes.
 
 ## Out
 
