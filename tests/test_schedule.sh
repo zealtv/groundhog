@@ -77,6 +77,33 @@ for p in schedule/daily/13/d-late schedule/daily/12-01/d-1201 schedule/weekly/w-
   assert_eq "$p has no candidate marker" null "$(field "$p" fired_marker)"
 done
 
+# Cadence: structured, from the grammar walk, with root defaults marked.
+cad() { # PATH EXPECTED-JSON
+  assert_eq "cadence of $1" "$2" "$(field "$1" cadence)"
+}
+cad schedule/daily/d-plain       '{"axis":"daily","day":null,"date":null,"time":null,"interval":null,"defaulted":false}'
+cad schedule/daily/09/d-nine     '{"axis":"daily","day":null,"date":null,"time":"09:00","interval":null,"defaulted":false}'
+cad schedule/daily/09-30/d-0930  '{"axis":"daily","day":null,"date":null,"time":"09:30","interval":null,"defaulted":false}'
+cad schedule/weekly/w-root       '{"axis":"weekly","day":"mon","date":null,"time":null,"interval":null,"defaulted":true}'
+cad schedule/weekly/sun/w-sun    '{"axis":"weekly","day":"sun","date":null,"time":null,"interval":null,"defaulted":false}'
+cad schedule/weekly/sun/11/w-sun11 '{"axis":"weekly","day":"sun","date":null,"time":"11:00","interval":null,"defaulted":false}'
+cad schedule/monthly/m-root      '{"axis":"monthly","day":"1","date":null,"time":null,"interval":null,"defaulted":true}'
+cad schedule/monthly/15/m-15     '{"axis":"monthly","day":"15","date":null,"time":null,"interval":null,"defaulted":false}'
+cad schedule/monthly/15/13/m-15-13 '{"axis":"monthly","day":"15","date":null,"time":"13:00","interval":null,"defaulted":false}'
+cad schedule/yearly/y-root       '{"axis":"yearly","day":null,"date":"01-01","time":null,"interval":null,"defaulted":true}'
+cad schedule/yearly/11-15/y-1115 '{"axis":"yearly","day":null,"date":"11-15","time":null,"interval":null,"defaulted":false}'
+cad schedule/yearly/01-01/09/y-jan1-nine '{"axis":"yearly","day":null,"date":"01-01","time":"09:00","interval":null,"defaulted":false}'
+cad schedule/once/o-root         '{"axis":"once","day":null,"date":null,"time":null,"interval":null,"defaulted":true}'
+cad schedule/once/2026-11-14/o-past '{"axis":"once","day":null,"date":"2026-11-14","time":null,"interval":null,"defaulted":false}'
+cad schedule/once/2026-11-15/13-00/o-today-late '{"axis":"once","day":null,"date":"2026-11-15","time":"13:00","interval":null,"defaulted":false}'
+cad schedule/every/15m/e-15      '{"axis":"every","day":null,"date":null,"time":null,"interval":"15m","defaulted":false}'
+cad schedule/every/3h/e-3h       '{"axis":"every","day":null,"date":null,"time":null,"interval":"3h","defaulted":false}'
+# Paused components keep their cadence; unrecognized-but-fired items have none.
+cad schedule/daily/09.paused/p-timed '{"axis":"daily","day":null,"date":null,"time":"09:00","interval":null,"defaulted":false}'
+cad schedule/weekly.paused/sun/p-axis '{"axis":"weekly","day":"sun","date":null,"time":null,"interval":null,"defaulted":false}'
+cad schedule/once/2026-11-15.paused/p-once '{"axis":"once","day":null,"date":"2026-11-15","time":null,"interval":null,"defaulted":false}'
+cad "schedule/daily/odd name é" null
+
 # Identity is the schedule-relative path; item_id is only the leaf.
 assert_eq "twin at daily/ has id twin" '"twin"' "$(field schedule/daily/twin item_id)"
 assert_eq "twin at weekly/sun/ has id twin" '"twin"' "$(field schedule/weekly/sun/twin item_id)"
