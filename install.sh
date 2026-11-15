@@ -4,8 +4,10 @@
 # install for scopes not delivered by any bundle. Idempotent: re-running
 # repairs groundhog.sh and README.md and re-seeds missing trays (via
 # groundhog.sh init); it never touches schedule/out/fired contents or
-# runtime/. Stop any runner first: replacing the script under a live one is
-# unsafe.
+# runtime/. The script is replaced by a temp file plus rename, so a process
+# already running keeps the old file (bash reads its script lazily); only a
+# runner started afterwards uses the new one. Stopping a runner first remains
+# the way to be sure which version runs.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,8 +16,11 @@ target="${1:?usage: install.sh <host-dir>}"
 
 dest="$target/.groundhog"
 mkdir -p "$dest"
-cp -f "$REPO_DIR/.groundhog/groundhog.sh" "$dest/groundhog.sh"
-chmod +x "$dest/groundhog.sh"
+tmp="$(mktemp "$dest/.groundhog.sh.XXXXXX")"
+trap 'rm -f "$tmp"' EXIT
+cp -f "$REPO_DIR/.groundhog/groundhog.sh" "$tmp"
+chmod 755 "$tmp"
+mv -f "$tmp" "$dest/groundhog.sh"
 cp -f "$REPO_DIR/README.md" "$dest/README.md"
 # An owned instance refuses `init` (exit 3): its trays already exist and its
 # owner's runner is the only writer. Leave them alone; any other failure stops us.
