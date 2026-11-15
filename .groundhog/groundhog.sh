@@ -2964,7 +2964,7 @@ tick_fire() {
   ix_set -1
   rm -f "$RT_DIR/prepared/$id.json"
   if [[ "$is_once" == "1" ]]; then once_remove "$src" "$gen"; fi
-  printf 'fired %s -> %s\n' "$name" "$dst"
+  printf 'fired %s -> %s\n' "$name" "$dst" 2>/dev/null || runner_output_gone
   return 0
 }
 
@@ -2996,10 +2996,13 @@ consumer_start() {
         # setsid(2) makes the child its own session and process group leader,
         # so Ctrl-C on the runner's terminal cannot reach it. A background job
         # of a non-interactive shell starts with SIGINT and SIGQUIT ignored;
-        # restore them. The indirect-object exec never goes through a shell.
-        exec "$GH_PERL_BIN" -MPOSIX -e '$SIG{INT} = "DEFAULT"; $SIG{QUIT} = "DEFAULT"; POSIX::setsid() or do { print STDERR "groundhog: setsid failed: $!\n"; POSIX::_exit(126) }; exec { $ARGV[0] } @ARGV; print STDERR "groundhog: cannot execute $ARGV[0]: $!\n"; POSIX::_exit(127)' -- "${CFG_ARGV[@]}" "$delivery"
+        # restore them. The runner ignores SIGPIPE (see cmd_run) and an ignored
+        # signal survives exec, so the consumer gets the default disposition
+        # back. The indirect-object exec never goes through a shell.
+        exec "$GH_PERL_BIN" -MPOSIX -e '$SIG{INT} = "DEFAULT"; $SIG{QUIT} = "DEFAULT"; $SIG{PIPE} = "DEFAULT"; POSIX::setsid() or do { print STDERR "groundhog: setsid failed: $!\n"; POSIX::_exit(126) }; exec { $ARGV[0] } @ARGV; print STDERR "groundhog: cannot execute $ARGV[0]: $!\n"; POSIX::_exit(127)' -- "${CFG_ARGV[@]}" "$delivery"
         ;;
       setsid)
+        trap - PIPE
         exec "$GH_SETSID_BIN" -w "${CFG_ARGV[@]}" "$delivery"
         ;;
     esac
@@ -3274,7 +3277,34 @@ RUNNER_STOP=0            # a stop request was seen
 GH_SIGNALED=0
 RUNNER_PAUSE_LOGGED=0
 
-runner_log() { echo "groundhog: $*" >&2; }
+# The runner ignores SIGPIPE (cmd_run), so a lost output stream shows up as a
+# failed write. Every line the runner prints is best-effort: the first failure
+# points both streams at /dev/null for good (consumers started afterwards
+# inherit that instead of a dead pipe) and sets RUNNER_OUTPUT_LOST; the cycle
+# loop then records runner.last_error once.
+RUNNER_OUTPUT_LOST=0
+RUNNER_OUTPUT_RECORDED=0
+# The builtin keeps the bytes of a failed write in its stdio buffer and flushes
+# them into the next successful write, which could be a command substitution
+# that captures stdout. Pointing both streams at /dev/null and then writing
+# nothing through the builtin flushes that leftover into /dev/null.
+runner_output_gone() { RUNNER_OUTPUT_LOST=1; exec >/dev/null 2>/dev/null; echo -n ''; return 0; }
+runner_log() { echo "groundhog: $*" >&2 || runner_output_gone; return 0; }
+
+# runner_record_output_lost — once, outside any lock: note in
+# runner.last_error that the output stream went away. The runner keeps
+# running; state stays "running" and a later clean stop keeps the error.
+runner_record_output_lost() {
+  (( RUNNER_OUTPUT_LOST && ! RUNNER_OUTPUT_RECORDED )) || return 0
+  RUNNER_OUTPUT_RECORDED=1
+  lock_mutation || return 0
+  if rt_load && [[ "$R_RUNNER_ID" == "$RUNNER_ID" ]]; then
+    S_RUNNER_ERROR='{"code":"output_lost","message":"the runner'"'"'s stdout or stderr was closed; it keeps running and no longer logs","path":null}'
+    rt_save || true
+  fi
+  unlock_mutation
+  return 0
+}
 
 # runner_fail EXIT_CODE CODE MESSAGE — record a structured error and exit
 # nonzero. The EXIT trap writes runner.state=failed; ownership and pause stay.
@@ -3305,7 +3335,9 @@ runner_record_exit() {
   if (( ! held )); then lock_mutation || return 1; fi
   if rt_load && [[ "$R_RUNNER_ID" == "$RUNNER_ID" ]]; then
     S_RUNNER_STATE="$outcome"
-    if [[ "$outcome" == failed ]]; then
+    if (( RUNNER_OUTPUT_RECORDED )) && [[ "$outcome" != failed ]]; then
+      :  # keep the output_lost error already recorded
+    elif [[ "$outcome" == failed ]]; then
       code="${RUNNER_ERR_CODE:-runner_exited}"
       message="${RUNNER_ERR_MSG:-the runner exited unexpectedly (status $rc)}"
       json_str "$code"; local c="$JSTR"
@@ -3435,6 +3467,10 @@ cmd_run() {
   (( rc == 0 )) || rt_die 6 "run: cannot take the runner lock"
 
   trap 'GH_SIGNALED=1' INT TERM HUP
+  # A supervisor that exits can close a pipe the runner writes to. Ignore
+  # SIGPIPE so that costs the runner its log lines, not its life (or the
+  # consumer's); the consumer helper restores the default for the child.
+  trap '' PIPE
   trap runner_on_exit EXIT
   rand_hex 8 || rt_die 6 "run: cannot read random bytes"
   RUNNER_ID="r-$RAND"
@@ -3468,6 +3504,7 @@ cmd_run() {
   while :; do
     cycle_start=$SECONDS
     runner_cycle
+    runner_record_output_lost
     if (( GH_SIGNALED || RUNNER_STOP )); then break; fi
     next=$((cycle_start + interval))
     while (( next <= SECONDS )); do next=$((next + interval)); done   # missed cycles are skipped
