@@ -1439,17 +1439,19 @@ inspect_consumer() {
 # that CLAIMED, a US-delimited list of out/ paths, does not name, each as
 # US out/NAME US. One sort and one comm instead of a substring search per entry
 # (that search grows with the square of the journal). A name holding a newline
-# cannot travel through those tools and is checked the slow way.
+# cannot travel through those tools and is checked the slow way, as is every
+# name on a host without comm or sort: slower, never wrong.
 UNCL_SET=""
 out_unclaimed() {
-  local entry name cand="" line
+  local entry name cand="" line fast=1
   UNCL_SET=""
+  if ! command -v comm >/dev/null 2>&1 || ! command -v sort >/dev/null 2>&1 || ! command -v tr >/dev/null 2>&1; then fast=0; fi
   shopt -s nullglob
   for entry in "$OUT"/*; do
     [[ -d "$entry" ]] || continue
     name="${entry##*/}"
     [[ "$name" == *.landing ]] && continue
-    if [[ "$name" == *$'\n'* ]]; then
+    if (( ! fast )) || [[ "$name" == *$'\n'* ]]; then
       if [[ "$1" != *"$US""out/$name""$US"* ]]; then UNCL_SET+="$US""out/$name""$US"; fi
       continue
     fi
@@ -2841,7 +2843,7 @@ DN_LISTING_BAD=0              # the listing of done/ disagrees with the director
 # into trusted (DN_*), to-parse (DN_TODO) or duplicate (DN_DUP). A scan equal
 # to the previous one reuses the previous arrays untouched.
 done_classify() {
-  local scan="" joined="" idx key ino size mtime mode xi xs xm xo xstate xpath xview sig f n_dir=0 n_scan=0 n_join=0
+  local scan="" joined="" idx key ino size mtime mode xi xs xm xo xstate xpath xview sig f line n_dir=0 n_scan=0 n_join=0
   DN_LISTING_BAD=0
   if [[ ! -d "$DN_DIR" ]]; then
     DN_KEY=(); DN_SIG=(); DN_STATE=(); DN_PATH=(); DN_VIEW=(); DN_TODO=(); DN_TODO_SIG=(); DN_DUP=()
@@ -2871,10 +2873,12 @@ done_classify() {
   joined="$( LC_ALL=C join -t "$US" -a 1 -e '' -o 1.1,1.2,1.3,1.4,1.5,2.2,2.3,2.4,2.5,2.6,2.7,2.8 <(printf '%s\n' "$scan") "$idx" 2>/dev/null )" || joined=""
   n_join="$(printf '%s\n' "$joined" | wc -l)"
   if (( n_scan != n_join )); then
-    # join lost a line (an index it could not merge): trust nothing from it
-    joined="$( LC_ALL=C join -t "$US" -a 1 -e '' -o 1.1,1.2,1.3,1.4,1.5,2.2,2.3,2.4,2.5,2.6,2.7,2.8 <(printf '%s\n' "$scan") /dev/null 2>/dev/null )" || joined=""
-    n_join="$(printf '%s\n' "$joined" | wc -l)"
-    if (( n_scan != n_join )); then DN_LISTING_BAD=1; DN_LAST=""; return 0; fi
+    # join is missing, or lost a line (an index it could not merge): trust
+    # nothing from the index and give every listed file an empty index half.
+    joined=""
+    while IFS= read -r line; do
+      joined+="$line$US$US$US$US$US$US$US"$'\n'
+    done <<< "$scan"
   fi
   while IFS="$US" read -r key ino size mtime mode xi xs xm xo xstate xpath xview; do
     [[ -n "$key" ]] || continue

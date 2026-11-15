@@ -205,6 +205,27 @@ assert_contains "...and the runner says why" "$(cat "$RUN_ERR")" "could not list
 run_once 2.5
 assert_eq "once the listing works the waiting entry is imported and handed off" 1 "$(lines "$INST/calls.txt")"
 
+# A host without comm and join (both POSIX, so unusual): slower, never different.
+plain_consumer "$FAST"
+make_records runtime/deliveries 5 accepted
+run_once
+assert_true "five records are filed" done_is 5
+mkdir -p "$GHD/out/stray-one"; echo s > "$GHD/out/stray-one/f"
+status_to "$out"
+with_tools="$(deliveries_sum "$out")"
+nocomm="$T_TMP/nocomm-path"; mkdir -p "$nocomm"
+for tool in date cat cp mv rm mkdir rmdir touch find grep sort basename dirname tr sed ls awk head wc od sleep ps sync chmod stat cksum sha256sum shasum openssl env perl flock; do
+  src="$(command -v "$tool" 2>/dev/null)" || continue
+  ln -s "$src" "$nocomm/$tool"
+done
+assert_false "the reduced PATH has no comm" test -e "$nocomm/comm"
+assert_false "...and no join" test -e "$nocomm/join"
+PATH="$nocomm" "$TEST_BASH" "$GHD/groundhog.sh" status --json > "$out" 2>"$out.err" || true
+assert_eq "status without comm and join lists the same deliveries" "$with_tools" "$(deliveries_sum "$out")"
+assert_eq "...and prints nothing on stderr" "" "$(cat "$out.err")"
+assert_eq "...including the unregistered entry" 1 "$(jq_py where "$out" deliveries reason '"unregistered"' path | wc -l | tr -d ' ')"
+rm -rf "$GHD/out/stray-one"
+
 # release refuses on an unreadable filed record (unreadable evidence is never "resolved")
 plain_consumer "$FAST"
 make_records runtime/deliveries 2 accepted
