@@ -311,6 +311,29 @@ A state file that still says `running` but whose recorded process is gone (a
 crash) shows the runner as `unknown` with a `runner_not_observed` diagnostic;
 status takes no locks and repairs nothing. The owner stays.
 
+### The runner's output streams
+
+`run` writes its log lines (`groundhog: …`) to stderr and a `fired …` line to
+stdout, and a consumer inherits both streams. **A supervisor should give `run`
+stdout and stderr that outlive it, such as a regular file, not a pipe it may
+close.** A supervisor that reads the runner's output through a pipe and then
+exits (quits, crashes or is killed) leaves the runner and its consumer writing
+into a pipe with no reader. The consumer, which runs with the default SIGPIPE
+disposition, is then killed by SIGPIPE at its next write to the closed stream
+and the delivery is recorded `failed`. With a regular file, a consumer
+survives its supervisor's exit and its output stays readable.
+
+The runner survives a closed pipe on its own side. It ignores SIGPIPE, treats
+every log line and `fired` line as best-effort, and on the first failed write
+points its own stdout and stderr at `/dev/null` (consumers it starts afterwards
+inherit that), keeps running, and records `runner.last_error` with code
+`output_lost` once. `runner.state` stays `running`; a later `stop` still exits
+0 with state `stopped`, and the `output_lost` error remains in the state file
+until the next `run` clears it. Nothing else changes: ticks, handoffs and the
+recording of each consumer's result go on, but the runner no longer logs
+anything. A consumer that was already writing to the closed pipe still dies of
+SIGPIPE; that is the reason to prefer a file.
+
 ### Locks
 
 Exclusion uses `flock(2)` advisory locks, so the operating system releases them
@@ -351,6 +374,11 @@ Older copies of this script know nothing about the locks or the pause and can
 bypass both. Stop other tick loops before enrolling an instance.
 
 ### State written under `runtime/`
+
+`.groundhog/runtime/` holds machine-specific state (absolute paths, the owner
+label and the token verifier, delivery records, lock files). It belongs in the
+project's VCS ignore list (for git, a `.groundhog/runtime/` line in
+`.gitignore`); `install.sh` writes no ignore file.
 
 `state.json` is replaced atomically (temp file in the same directory, fsync,
 rename, fsync of the directory) with `revision` + 1. Besides the fields
@@ -428,7 +456,9 @@ GROUNDHOG_ATTEMPT_ID=a-…
 The owner token and the token file's path never reach it. It inherits no lock
 descriptor, so a consumer that outlives a crashed runner cannot hold the runner's
 locks. `argv`, `env` and the consumer's output never appear in `status`;
-stdout and stderr go to the runner's own streams.
+stdout and stderr go to the runner's own streams. The consumer runs with the
+default SIGPIPE disposition, although the runner itself ignores SIGPIPE (see
+[The runner's output streams](#the-runners-output-streams)).
 
 **Its own session.** A consumer must survive Ctrl-C on the runner's terminal.
 bash 3.2 on macOS has no `setsid(1)`, so the runner starts the consumer through
@@ -650,8 +680,13 @@ Replacing `.groundhog/groundhog.sh` (and `README.md`), by hand or with
   delivery record. An instance that was enrolled stays enrolled, and the
   installer leaves it alone (`init` on an owned instance exits 3, which
   `install.sh` reports as a note).
-* **Stop the runner first.** bash reads a script lazily, so replacing it under
-  a live `run` is unsafe. Restart it afterwards with the same token.
+* **Replaces the script by rename.** `install.sh` copies the new script to a
+  temporary file in `.groundhog/` and renames it over the old one, so a runner
+  or consumer that is already running keeps reading the old file (bash reads a
+  script lazily, which makes an in-place overwrite unsafe). Only a runner
+  started afterwards runs the new version, so to be sure which version runs,
+  `stop` the runner and start it again with the same token. A by-hand `cp` over
+  the script does not have this property: stop the runner first.
 * **Old copies elsewhere** (other projects, other worktrees) stay old: they ignore
   the lock, owner and pause.
 
@@ -782,7 +817,8 @@ simulates a host with no lock helper. Hosts that lack the runner's tools skip th
 runner tests. `test_e2e.sh` is one readable walk of the operator's path (tick-only use, the
 upgrade, recurring and overdue delivery, ownership, pause, synchronous and
 asynchronous consumers, shutdown, token reuse, release); `test_collisions.sh`
-covers [Output name collisions](#output-name-collisions). The consumer tests
+covers [Output name collisions](#output-name-collisions); `test_streams.sh` closes
+the runner's output pipes while a consumer runs. The consumer tests
 (`test_consumer.sh`, `test_delivery.sh`, `test_journal.sh`) use plain `/bin/sh` consumers that write marker files, kill
 the runner with `kill -9` or signal its process group while a consumer sleeps,
 hand-write delivery and prepared records for crashes that cannot be timed from
