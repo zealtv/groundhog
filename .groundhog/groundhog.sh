@@ -444,6 +444,7 @@ tick_body() {
       printf 'warning: %s already exists in out/; recording firing without overwrite\n' "$(basename "$dst")" >&2
       mkdir -p "$(dirname "$marker")"
       touch "$marker"
+      legacy_note_collision "out/$(basename "$dst")" "${src#"$GH_DIR"/}" "$now_t" "$slot"
     else
       tmp="${dst}.landing"
       [[ -e "$tmp" ]] && rm -rf -- "$tmp"
@@ -2828,6 +2829,28 @@ recon_legacy_import() {
   return 0
 }
 RECON_CLAIMED=""
+
+# legacy_note_collision OUT_REL SRC_REL DATE SLOT — the standalone tick found
+# out/ NAME already taken. On an instance that has delivery records (it was
+# supervised once), attach the same out_collision the runner would, so status
+# shows the lost firing instead of leaving it to one line on stderr. Never
+# fails the tick; an instance without records is left exactly as before.
+legacy_note_collision() {
+  local f
+  [[ -d "$RT_DIR/deliveries" && -n "$GH_LOCK_HELPER" && -z "$GH_RT_MISSING" ]] || return 0
+  shopt -s nullglob
+  for f in "$RT_DIR"/deliveries/*.json; do
+    drec_load "$f" || continue
+    [[ "$D_PATH" == "$1" && "$D_STATE" != missing ]] || continue
+    if (( ${#D_COLL[@]} < 20 )); then
+      D_COLL+=("$3$US$4$US$2")
+      drec_save || echo "warning: could not record the out_collision for $1" >&2
+    fi
+    break
+  done
+  shopt -u nullglob
+  return 0
+}
 
 # --- the journaled tick --------------------------------------------------------
 # Same schedule semantics as tick_body, but every firing is journaled and every
