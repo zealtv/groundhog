@@ -1435,6 +1435,35 @@ inspect_consumer() {
   return 0
 }
 
+# out_unclaimed CLAIMED — sets UNCL_SET to the out/ directories (not .landing)
+# that CLAIMED, a US-delimited list of out/ paths, does not name, each as
+# US out/NAME US. One sort and one comm instead of a substring search per entry
+# (that search grows with the square of the journal). A name holding a newline
+# cannot travel through those tools and is checked the slow way.
+UNCL_SET=""
+out_unclaimed() {
+  local entry name cand="" line
+  UNCL_SET=""
+  shopt -s nullglob
+  for entry in "$OUT"/*; do
+    [[ -d "$entry" ]] || continue
+    name="${entry##*/}"
+    [[ "$name" == *.landing ]] && continue
+    if [[ "$name" == *$'\n'* ]]; then
+      if [[ "$1" != *"$US""out/$name""$US"* ]]; then UNCL_SET+="$US""out/$name""$US"; fi
+      continue
+    fi
+    cand+="out/$name"$'\n'
+  done
+  if [[ -n "$cand" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      UNCL_SET+="$US$line$US"
+    done < <( LC_ALL=C comm -23 <(printf '%s' "$cand" | LC_ALL=C sort) <(printf '%s' "$1" | tr "$US" '\n' | LC_ALL=C sort -u) )
+  fi
+  return 0
+}
+
 # --- deliveries --------------------------------------------------------------
 DELIVERIES=()
 REG_LIST=""      # US-separated out/ paths that a record claims
@@ -1620,6 +1649,7 @@ inspect_deliveries() {
 
   # Entries in out/ that no record claims: read-only legacy deliveries.
   # They are not registered here; status never writes.
+  out_unclaimed "$REG_LIST"
   for entry in "$OUT"/*; do
     [[ -e "$entry" || -L "$entry" ]] || continue
     name="${entry##*/}"
@@ -1628,7 +1658,7 @@ inspect_deliveries() {
       diag_add out_entry_not_directory "out/$name is not a directory, so it is not listed as a delivery" "out/$name"
       continue
     fi
-    [[ "$REG_LIST" == *"$US""out/$name""$US"* ]] && continue
+    [[ "$UNCL_SET" == *"$US""out/$name""$US"* ]] || continue
     if ! utf8_valid "$name"; then
       diag_add out_entry_name_not_utf8 "out/$name has a name that is not valid UTF-8, so the runner does not import or hand it off; rename it" "out/$name"
       continue
@@ -2403,13 +2433,15 @@ cmd_release() {
 # retry and recovery.
 #
 # Delivery records live in runtime/deliveries/<id>.json (one file per delivery,
-# replaced atomically). A firing the runner makes is first written to
+# replaced atomically); the runner files accepted and missing ones under
+# runtime/deliveries/done/ (see "terminal records" below). A firing the runner makes is first written to
 # runtime/prepared/<id>.json, copied into runtime/staging/<id>/, renamed into
 # out/, marked in fired/, recorded as a delivery, and only then is the prepared
 # record removed; every step can be redone or finished by the next run. While a
 # runner is live it is the only writer of delivery records (retry, recover,
 # release and sweep all refuse or wait for a stopped runner), so it keeps an
-# in-memory index (IX_*) of them for a cycle.
+# in-memory index (IX_*) of them for a cycle and reads them without the mutation
+# lock, taking the lock only for the writes (recon_scan, recon_apply).
 # ---------------------------------------------------------------------------
 
 now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -2894,6 +2926,9 @@ done_file_one() {
   local f="$1" base sig=""
   base="${f##*/}"
   mkdir -p "$DN_DIR" 2>/dev/null || return 1
+  # A copy already filed under this id is evidence, not something to replace;
+  # the scan has counted it, so admission stays blocked until it is dealt with.
+  if [[ -e "$DN_DIR/$base" || -L "$DN_DIR/$base" ]]; then return 0; fi
   mv -f -- "$f" "$DN_DIR/$base" 2>/dev/null || return 1
   DN_FILED=1
   if done_cacheable; then
@@ -3080,11 +3115,13 @@ recon_scan() {
   # origin legacy_out and an unknown occurrence (metadata only: nothing is
   # marked handed off). A name that is not valid UTF-8 would be stored lossily
   # and imported again every cycle, so it is reported and left alone.
+  out_unclaimed "$RECON_CLAIMED"
   for entry in "$OUT"/*; do
+    [[ -n "$UNCL_SET" ]] || break
     [[ -d "$entry" ]] || continue
     name="${entry##*/}"
     [[ "$name" == *.landing ]] && continue
-    [[ "$RECON_CLAIMED" == *"$US""out/$name""$US"* ]] && continue
+    [[ "$UNCL_SET" == *"$US""out/$name""$US"* ]] || continue
     if ! utf8_valid "$name"; then
       if [[ "$UTF8_LOGGED" != *"$US$name$US"* ]]; then
         UTF8_LOGGED+="$US$name$US"
