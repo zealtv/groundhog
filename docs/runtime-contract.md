@@ -1,15 +1,20 @@
 # Optional runtime contract — accepted v1 design
 
 **Design accepted by Bob on 2026-11-15; partly implemented.** As of the
-`gh-inspection-api` stitch (2026-11-15), `groundhog.sh capabilities --json` and
-`groundhog.sh status --json` exist and advertise `status-json-v1` only. Every
-other command and runtime file specified here, and the other five capabilities,
-remain unimplemented. Each schedule record of `status --json` also carries an
+`gh-runner-lifecycle` stitch (2026-11-15), `capabilities --json`, `status --json`,
+`enroll`, `run`, `pause`, `resume`, `stop` and `release` exist, and the upgraded
+`tick`, `init`, `add`, `drop` and `sweep` follow the lock, ownership and pause
+rules here. `capabilities` advertises `status-json-v1` everywhere and
+`ownership-v1`, `runner-v1` and `pause-v1` only on hosts with the locking and
+durability tools described in [README.md](../README.md#runner-ownership-and-pause).
+Consumer configuration and invocation, the delivery journal, `retry`, `recover`
+and the `consumer-v1` and `delivery-v1` capabilities remain unimplemented, so
+this script still does not satisfy "all six capabilities" for supervised control.
+Each schedule record of `status --json` also carries an
 additive `cadence` object (see [README.md](../README.md#inspection)); clients
 ignore unknown fields, so the contract's required fields are unchanged. This
-document records the accepted interface; it does not
-enable a runner. The existing commands in [README.md](../README.md) remain the
-current passive interface. Basis: the source `groundhog.sh` and Easyhog's
+document records the accepted interface. The existing commands in
+[README.md](../README.md) remain the passive interface. Basis: the source `groundhog.sh` and Easyhog's
 `docs/design.md` and ownership/ordinary-consumer findings, read on 2026-11-15.
 Design acceptance does not authorize dependent runtime implementation.
 
