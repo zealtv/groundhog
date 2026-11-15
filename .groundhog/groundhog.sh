@@ -380,6 +380,9 @@ cmd_add() {
   local path="$SCHED/$when/$id"
   [[ ! -e "$path" ]] || die "item already exists: $path"
   mkdir -p "$path"
+  LINT_INCLUDE_PAUSED=0
+  lint_scan
+  note_shared_names "$id"
   echo "$path"
 }
 
@@ -642,10 +645,35 @@ lint_scan() {
   shopt -u nullglob
 }
 
+# note_shared_names [ID] — after lint_scan: a note on stderr for every item id
+# (or only ID) that exists at more than one schedule path. A firing lands in
+# out/<id>-<date>[-<slot>], so two such items that fire on the same date share
+# one out name: the later firing is recorded in fired/ but not delivered (and a
+# one-shot is still removed). Advisory only; it changes no output or exit code.
+note_shared_names() {
+  local id ids p list n
+  if (( ${#LINT_ITEMS[@]} == 0 )); then return 0; fi
+  if [[ -n "${1:-}" ]]; then ids="$1"
+  else ids="$(printf '%s\n' "${LINT_ITEMS[@]}" | sed 's#.*/##' | LC_ALL=C sort | uniq -d)"; fi
+  [[ -n "$ids" ]] || return 0
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    list=""; n=0
+    for p in "${LINT_ITEMS[@]}"; do
+      if [[ "${p##*/}" == "$id" ]]; then list+="${list:+, }${p#"$GH_DIR"/}"; n=$((n + 1)); fi
+    done
+    if (( n > 1 )); then
+      printf "note: item id '%s' exists at %d schedule paths (%s); firings on one date share out/%s-<date>[-<slot>], and only the first is delivered\n" "$id" "$n" "$list" "$id" >&2
+    fi
+  done <<< "$ids"
+  return 0
+}
+
 cmd_lint() {
   require_root
   LINT_INCLUDE_PAUSED=0
   lint_scan
+  note_shared_names
 
   if (( ${#LINT_ORPHANS[@]} == 0 )); then
     echo "schedule is clean"

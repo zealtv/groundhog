@@ -30,7 +30,7 @@ gh add daily foo >/dev/null; echo d > "$GHD/schedule/daily/foo/n.txt"
 enroll_ok; gh resume --token-file "$TOK" >/dev/null
 run_once
 gh release --token-file "$TOK" >/dev/null 2>&1
-gh add "weekly/$dow" foo >/dev/null; echo w > "$GHD/schedule/weekly/$dow/foo/n.txt"
+gh add "weekly/$dow" foo >/dev/null 2>&1; echo w > "$GHD/schedule/weekly/$dow/foo/n.txt"
 err="$(gh tick 2>&1 >/dev/null)"
 assert_contains "the standalone tick still warns on stderr" "$err" "already exists in out/"
 assert_eq "...and did not overwrite the delivery" d "$(cat "$GHD/out/foo-$td/n.txt")"
@@ -72,5 +72,21 @@ write_config /bin/sh "$CONS"
 run_once 3
 assert_eq "reused path: the new delivery is handed off exactly once" 1 "$(lines "$INST/calls.txt")"
 assert_eq "...the old accepted record is untouched" '"accepted"' "$(jq_py dget "$(status_to "$out"; echo "$out")" id "$old" state)"
+
+# --- 4. lint and add say when two items would share an out name --------------------
+new_instance; gh init >/dev/null
+gh add daily/09 foo >/dev/null 2>&1
+err="$(gh add daily/17 foo 2>&1 >/dev/null)"; rc=$?
+assert_eq "add of a second foo succeeds" 0 "$rc"
+assert_contains "...and notes the clash on stderr" "$err" "item id 'foo' exists at 2 schedule paths"
+assert_contains "...naming both paths" "$err" "schedule/daily/09/foo, schedule/daily/17/foo"
+assert_eq "...stdout stays the path alone" "$GHD/schedule/weekly/$dow/foo" "$(gh add weekly/$dow foo 2>/dev/null)"
+gh add daily bar >/dev/null
+assert_eq "an id used once draws no note" "" "$(gh add monthly bar2 2>&1 >/dev/null)"
+lerr="$(gh lint 2>&1 >/dev/null)"; lrc=0; gh lint >/dev/null 2>&1 || lrc=$?
+lout="$(gh lint 2>/dev/null)"
+assert_contains "lint notes the shared id on stderr" "$lerr" "item id 'foo' exists at 3 schedule paths"
+assert_not_contains "...once, for foo only" "$lerr" "'bar'"
+assert_eq "...and its stdout and exit status are unchanged" "schedule is clean 0" "$lout $lrc"
 
 t_finish
