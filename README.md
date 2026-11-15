@@ -196,7 +196,7 @@ This single loop is the heartbeat for any system built on these protocols. Anyth
 
 ## Fired
 
-`fired/<YYYY-MM-DD>/<schedule-relative-path>` is an empty file recording that the item fired on that date. The marker mirrors the schedule subtree, so `weekly/sat/foo` and `monthly/25/foo` get distinct markers and neither is silently swallowed. Groundhog writes it; nothing else should. Three useful things fall out:
+`fired/<YYYY-MM-DD>/<schedule-relative-path>` is a file recording that the item fired on that date. It is empty, except that when a supervised runner fires a one-shot it writes the one-shot's source generation (inode and mtime of the directory it copied) into the marker, so a later tick removes that source and never a replacement put there the same day (see *The journal* under [Consumers and deliveries](#consumers-and-deliveries)). Only the marker's existence means "fired". The marker mirrors the schedule subtree, so `weekly/sat/foo` and `monthly/25/foo` get distinct markers and neither is silently swallowed. Groundhog writes it; nothing else should. Three useful things fall out:
 
 * **Idempotency**, even if the consumer takes items immediately.
 * **History**: `find fired/2026-04-25 -type f` answers "what fired that day?" forever, regardless of whether the items have been collected.
@@ -495,6 +495,15 @@ into `out/`, marked in `fired/`, recorded as a pending delivery, and only then
 is the prepared record removed. Each step can be redone or finished by the next
 `run`. The `.landing` names of the passive tick never appear for these.
 Standalone `tick` keeps its legacy behavior.
+
+A fired one-shot's marker records the source generation, and the journaled tick
+removes a one-shot whose marker exists only if its directory still has that
+generation. Say a crash left the marker without the removal and the operator then
+put a new `schedule/once/<item>/` in place the same day: the recovery step and
+every later tick leave the replacement alone (the runner logs it once). A marker
+without a recorded generation (the standalone tick's, or one written before this
+was recorded) keeps the legacy rule, so its one-shot is removed. The standalone
+tick itself is unchanged.
 
 **Terminal records and the lock (implementation reading).** Not part of the
 accepted contract's interface; `status --json` shows the same deliveries as

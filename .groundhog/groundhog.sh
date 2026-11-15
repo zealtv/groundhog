@@ -3034,13 +3034,25 @@ once_remove() {
   return 0
 }
 
+# marker_write MARKER ONCE GEN — the fired marker. A one-shot's marker records
+# the generation of the source that was copied (inode and mtime, as in the
+# prepared record), so a later tick removes only that source, never a
+# replacement. Other markers stay empty, as the standalone tick writes them.
+marker_write() {
+  if [[ "$2" == true || "$2" == 1 ]] && [[ -n "$3" ]]; then
+    rt_atomic_write "$1" "$3"
+  else
+    touch "$1"
+  fi
+}
+
 # firing_complete — finish a firing whose out/ entry exists: marker, delivery
 # record, one-shot removal, then forget the prepared record. Safe to repeat.
 # Uses P_*. Returns 1 on an I/O failure.
 firing_complete() {
   local markerp="$GH_DIR/$P_MARKER" rec="$RT_DIR/deliveries/$P_ID.json" rc=0
   mkdir -p "$(dirname "$markerp")" || return 1
-  [[ -e "$markerp" ]] || touch "$markerp" || return 1
+  [[ -e "$markerp" ]] || marker_write "$markerp" "$P_ONCE" "$P_GEN" || return 1
   if [[ ! -e "$rec" ]]; then
     drec_reset
     D_ID="$P_ID"; D_PATH="$P_OUT"; D_ORIGIN=runtime; D_SCHED="$P_SCHED"; D_HASOCC=1
@@ -3309,20 +3321,38 @@ tick_item() {
     runner_log "skipped $src_rel: an unreconciled firing blocks this occurrence (see status)"
     return 0
   fi
+  local recorded=""
   if [[ -e "$marker" ]]; then
-    :   # already fired for this occurrence
+    # Already fired for this occurrence. A one-shot's marker records the
+    # generation of the source that was fired (see marker_write); a source of
+    # another generation is a replacement and is not removed. A marker without
+    # one (the standalone tick's, or one from before this was recorded) keeps
+    # the legacy rule: the one-shot goes.
+    if [[ "$is_once" == "1" && -d "$src" ]] && read_text "$marker"; then
+      recorded="${TEXT%$'\n'}"
+    fi
   elif [[ -e "$dst" || -L "$dst" ]]; then
     runner_log "warning: out/${dst##*/} already exists; recording the firing of $src_rel without overwrite (out_collision)"
     mkdir -p "$(dirname "$marker")" || return 1
-    touch "$marker" || return 1
+    marker_write "$marker" "$is_once" "$(src_generation "$src")" || return 1
     tick_note_collision "$out_rel" "$src_rel" "$now_t" "$slot" || return 1
   else
     tick_fire "$name" "$src" "$is_once" "$slot" "$dst" "$marker" "$now_t" "$out_rel" "$marker_rel" "$src_rel" || return 1
     return 0
   fi
-  if [[ "$is_once" == "1" ]]; then once_remove "$src" ""; fi
+  if [[ "$is_once" == "1" ]]; then
+    if [[ -n "$recorded" && "$(src_generation "$src")" != "$recorded" ]]; then
+      if [[ "$ONCE_KEPT_LOGGED" != *"$US$src$US"* ]]; then
+        ONCE_KEPT_LOGGED+="$US$src$US"
+        runner_log "left $src_rel in place: it is not the one-shot that fired today (replaced since)"
+      fi
+      return 0
+    fi
+    once_remove "$src" ""
+  fi
   return 0
 }
+ONCE_KEPT_LOGGED=""
 
 # tick_note_collision OUT_REL SRC_REL DATE SLOT — attach an out_collision
 # diagnostic to the delivery that owns the existing out/ entry. No second
@@ -3355,7 +3385,7 @@ tick_fire() {
   mv -- "$RT_DIR/staging/$id" "$dst" || return 1
   rt_fsync "$OUT" || return 1
   mkdir -p "$(dirname "$marker")" || return 1
-  touch "$marker" || return 1
+  marker_write "$marker" "$is_once" "$gen" || return 1
   drec_reset
   D_ID="$id"; D_PATH="$out_rel"; D_ORIGIN=runtime; D_SCHED="$src_rel"; D_HASOCC=1
   D_DATE="$now_t"; D_SLOT="$slot"; D_STATE=pending; D_REGAT="$(now_utc)"; D_MARKER="$marker_rel"

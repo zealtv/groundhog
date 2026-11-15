@@ -175,6 +175,34 @@ assert_true "(c) a replacement one-shot (another generation) is left alone" test
 assert_contains "(c) ...and the runner says so" "$(cat "$RUN_ERR")" "changed since"
 assert_eq "(c) both firings are deliveries" '"pending"' "$(dstate "uno-$(today)")"
 
+# (c2) The same crash with the instance running (not paused). The firing wrote
+# the generation of the source it copied into the marker; the journaled tick that
+# follows removes only a source of that generation. A replacement one-shot (as
+# the operator might put there the same day) stays, a marker with no recorded
+# generation keeps the legacy removal, and a firing that really happens records
+# the generation.
+fresh_consumer "$FAST"; rm -f "$GHD/runtime/config.json"
+mkdir -p "$GHD/fired/$(today)/once"
+for n in uno dos tres; do
+  mkdir -p "$GHD/schedule/once/$n" "$GHD/out/$n-$(today)"
+  echo "$n" > "$GHD/schedule/once/$n/note.txt"; cp "$GHD/schedule/once/$n/note.txt" "$GHD/out/$n-$(today)/"
+  put_record "d-$n" "$n-$(today)" pending "" "fired/$(today)/once/$n"
+done
+gen_of "$GHD/schedule/once/uno" > "$GHD/fired/$(today)/once/uno"      # the generation that fired
+echo "1 1" > "$GHD/fired/$(today)/once/dos"                           # a source since replaced
+: > "$GHD/fired/$(today)/once/tres"                                    # no generation recorded
+mkdir -p "$GHD/schedule/once/solo"; echo solo > "$GHD/schedule/once/solo/note.txt"
+solo_gen="$(gen_of "$GHD/schedule/once/solo")"
+run_once
+assert_false "(c2) unpaused: the one-shot that fired is removed" test -e "$GHD/schedule/once/uno"
+assert_true "(c2) unpaused: a replacement one-shot (another generation) is not removed" test -d "$GHD/schedule/once/dos"
+assert_contains "(c2) ...and the runner says so" "$(cat "$RUN_ERR")" "replaced since"
+assert_false "(c2) a marker without a recorded generation keeps the legacy removal" test -e "$GHD/schedule/once/tres"
+assert_false "(c2) a one-shot that fires now is removed after its firing" test -e "$GHD/schedule/once/solo"
+assert_eq "(c2) ...and its marker records the generation that was copied" "$solo_gen" "$(cat "$GHD/fired/$(today)/once/solo")"
+assert_eq "(c2) ...the replacement is left once per runner, not once per cycle" 1 "$(grep -c 'replaced since' "$RUN_ERR")"
+assert_eq "(c2) a recurring item's marker stays empty" 0 "$(wc -c < "$GHD/fired/$(today)/daily/nudge" | tr -d ' ')"
+
 # (d) conflicting or corrupt evidence is reported and blocks, never guessed at.
 fresh_consumer "$FAST"; rm -f "$GHD/runtime/config.json"
 mkdir -p "$GHD/fired/$(today)/daily"; touch "$GHD/fired/$(today)/daily/nudge"      # marker, but no out entry
