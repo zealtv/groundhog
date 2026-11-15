@@ -5,7 +5,11 @@ A tiny, file-based protocol for recurring items.
 The script remains passive: it materializes deliveries when explicitly ticked.
 The [optional runtime contract](docs/runtime-contract.md) proposes supervision,
 ownership, pause and consumer handoff. That design is **unimplemented** and
-awaiting acceptance; its commands are not available in this version.
+awaiting acceptance; its commands are not available in this version. Groundhog
+works with or without AI. The proposal supports ordinary scripts through literal
+argv, a documented cwd, an absolute delivery path and ordinary exit status. A
+script can finish its work synchronously and exit 0; no SDK, queue, model or AI
+account is required. Without a configured consumer, it remains delivery-only.
 
 An *item* is a directory. Its position under `schedule/` is when it returns. Each time it's due, a fresh copy lands in `out/`.
 

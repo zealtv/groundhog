@@ -5,7 +5,8 @@ runtime files specified here exists in the current script. This document
 settles a proposed interface for later implementation; it does not enable a
 runner. The existing commands in [README.md](../README.md) remain the current
 passive interface. Basis: the source `groundhog.sh` and Easyhog's `docs/design.md`
-and ownership finding, read on 2026-11-15. Bob's design acceptance is pending.
+and ownership/ordinary-consumer findings, read on 2026-11-15. Bob's design
+acceptance is pending.
 
 ## Boundaries and vocabulary
 
@@ -20,14 +21,22 @@ a repository name, PID, hostname or supervising application.
   ID distinguishes generations even when an out path is reused.
 - **Handoff** invokes the configured consumer for that delivery. Acceptance
   records the consumer's acknowledgement; it does not prove work completed.
-- **Execution** belongs to the consumer or the agent it launches. v1 reports
-  execution as `unknown`; it never infers success from a firing or handoff.
+- **Execution** belongs to the consumer itself or any independent process it
+  launches. A synchronous consumer may complete useful work before returning.
+  v1 still reports execution as `unknown`: it records the handoff result, not
+  an independently verified outcome of the consumer's work.
 - **Enrollment** assigns persistent control ownership to a supervisor session.
   A runner's activity and ownership are separate facts.
 
 Inspection never enrolls, ticks, dispatches, creates directories, repairs state,
 loads a consumer, or evaluates payload contents. Discovery grants inspection
 only. No application names, hostnames or live-PID heuristics grant control.
+Groundhog works with or without AI. Any ordinary configured executable or script
+uses the same argv, cwd, delivery-path and exit-status interface below. No queue,
+SDK, model, AI account, prompt schema or separate acknowledgement service is
+required. Runtime behavior must not branch on runner, consumer, model, project
+or host identity; application-specific payload interpretation belongs entirely
+to external consumers.
 
 ## Commands and negotiation
 
@@ -73,8 +82,8 @@ Synthetic capability response (not output from today's script):
 Protocol version is an integer for incompatible changes; implementation version
 is informational. Additive fields may appear. Clients ignore unknown fields
 and decline unknown enum values for control. All six capabilities and version
-1 are required for Easyhog Play/Pause. An old script returns its existing
-unknown-command error: inspect its files as legacy, mark control unsupported,
+1 are required for supervised control under this contract. An old script
+returns its existing unknown-command error: inspect its files as legacy, mark control unsupported,
 and do not probe by running `run`, `tick` or `init`. Capability discovery invokes
 only the deliberately selected instance's script; it is not a payload sandbox.
 
@@ -192,25 +201,30 @@ change, process-name match or stopped external supervisor transfers ownership.
 An unenrolled instance has no owner and cannot run. Enrollment does not remove
 pause or adopt pending out entries as accepted.
 
-Easyhog creates a new session token only on explicit Play of an unowned,
-compatible selected instance. It can then resume and run under that token.
-For its own paused instance, explicit Play resumes it. Reopening Easyhog starts
-with no enrollments and must not silently use persisted tokens. An external
-owner remains external even when stopped. Do not offer Play/Pause/release for
-an owner whose token this supervisor session does not hold.
+A supervisor creates a new session token only on an explicit user request to
+enroll an unowned, compatible selected instance. It may then explicitly resume
+and run under that token. For its own paused instance, an explicit start action
+may resume it. Reopening a supervisor must not silently enroll, reuse persisted
+tokens or start work. An external owner remains external even when stopped.
+Control actions require this supervisor session to hold the matching token;
+discovery or recognized application identity grants no exception.
 
-On clean Easyhog Quit: stop each owned runner, wait for the stop barrier, then
-release ownership and delete its session token. Do not clear persistent pause.
-If stop/release fails, report the retained owner and keep its token instead of
-claiming cleanup. An uncertain enrollment likewise retains its token until the
-read-only reconciliation above establishes its disposition.
+On clean supervisor shutdown: stop each owned runner, wait for the stop barrier,
+then release ownership and delete its session token. Do not clear persistent
+pause. If stop/release fails, report the retained owner and keep its token
+instead of claiming cleanup. An uncertain enrollment likewise retains its token
+until read-only reconciliation above establishes its disposition.
 A crash leaves ownership retained and must be shown as owned with liveness
 unknown or stopped. A supervisor that still holds the matching token may stop,
 recover outstanding attempts and release. Lost-token ownership requires a
 separate, explicit offline operator repair: stop all writers, preserve a backup,
 resolve ambiguous attempts, invalidate the old owner and advance generation.
-There is deliberately no automatic takeover command in v1 and no Easyhog MVP
-repair action. Never delete a lock file merely because a PID looks absent.
+There is deliberately no automatic takeover command in v1. Never delete a lock
+file merely because a PID looks absent.
+
+Easyhog is one ordinary client of these rules: its explicit Play, Pause and Quit
+actions map to the same enrollment, resume/run, pause and shutdown protocol.
+It receives no extra authority or lifecycle exemption.
 
 Use OS-released advisory exclusion, with one runner lock held for the runner's
 lifetime and a separate short-lived mutation lock serializing all upgraded
@@ -231,7 +245,8 @@ outside v1. Cooperative single-host use is the supported runtime scope.
 Mutations revalidate token/generation under lock. Stop prevents new admissions
 before releasing runner exclusion; pause commits under the same mutation lock
 used to admit firings and handoffs. Work admitted before the pause barrier may
-finish. A parent exiting does not send termination signals to accepted agents.
+finish. A parent exiting does not send termination signals to independent
+consumer work.
 Runner PID/start ID and heartbeat are diagnostics only. A read reports
 `unknown` if it cannot establish local activity; it never repairs stale state.
 
@@ -268,7 +283,9 @@ the barrier; pause cannot withdraw work they already took.
 
 No conventional `consume.sh` is auto-discovered. An executable file appearing
 in a schedule or instance cannot enable execution. Only an explicitly written
-`runtime/config.json` opts into handoff; discovery never creates it. Example:
+`runtime/config.json` opts into handoff; discovery never creates it. A plain
+script and an asynchronous adapter use exactly the same configuration shape.
+Example of an optional asynchronous adapter:
 
 ```json
 {
@@ -282,8 +299,12 @@ in a schedule or instance cannot enable execution. Only an explicitly written
 ```
 
 `argv` is a nonempty array of literal strings, never shell text. Element zero
-must be an absolute executable path. `cwd` is required, resolved relative to
-the canonical instance (here its parent), canonicalized and required to exist.
+must be an absolute executable path. For an executable script this can be the
+script's path. A non-executable readable script is also valid with an explicit
+interpreter, for example `argv:["/bin/sh", "/example/project/copy-note.sh"]`;
+Groundhog executes the interpreter and appends the delivery path in the same way.
+`cwd` is required, resolved relative to the canonical instance (here its parent),
+canonicalized and required to exist.
 All relative consumer resources resolve there. Append exactly one argument,
 the canonical absolute delivery directory, after the configured argv.
 No shell expansion, PATH search, payload sourcing or implicit stdin input;
@@ -314,6 +335,58 @@ Without configuration, cycles still fire deliveries into `out/`, mark them
 configuration plus run makes those pending deliveries eligible. An invalid or
 missing executable/cwd is a visible configuration failure, not no-consumer.
 
+## Synchronous script example and delivery-only setup
+
+This portable shell consumer copies a synthetic `note.txt` to `received-note.txt`
+in its configured cwd, then returns normally. Save it as
+`/example/project/copy-note.sh` (it need not be executable when invoked via
+`/bin/sh`). Its payload filename is an example's private convention, not a core
+field or schema.
+
+```sh
+#!/bin/sh
+set -eu
+[ "$#" -eq 1 ] || exit 2
+delivery=$1
+case "$delivery" in
+  /*) ;;
+  *) exit 2 ;;
+esac
+cat "$delivery/note.txt" > received-note.txt
+exit 0
+```
+
+Corresponding proposed `/example/project/.groundhog/runtime/config.json`:
+
+```json
+{
+  "schema_version": 1,
+  "consumer": {
+    "argv": ["/bin/sh", "/example/project/copy-note.sh"],
+    "cwd": "..",
+    "env": {}
+  }
+}
+```
+
+Given synthetic delivery `/example/project/.groundhog/out/note-demo` containing
+`note.txt`, the runtime invokes `/bin/sh` with the script path and then that
+absolute delivery path, from `/example/project`. On successful copy it records
+`pending → in_flight → accepted`; the output file contains the note and the
+original delivery remains unchanged. No queue or background worker is involved.
+Groundhog reports `execution:unknown` even though this particular script has
+finished its copy. A write/read error returns nonzero and records `failed`;
+partial output is possible. This minimal example does not promise atomic output
+or exactly-once effects: reconcile such output before an explicit retry.
+
+For delivery-only operation, leave `runtime/config.json` absent. An explicitly
+enrolled, enabled runner still ticks and registers deliveries as
+`pending/no_consumer`, invoking nothing. Inspection alone never enrolls or runs
+it. Ordinary unowned standalone `tick` remains passive too and does not invoke
+consumers even if a config file exists. Later explicit configuration and run
+make pending deliveries eligible, subject to pause and unresolved-attempt
+barriers. No automatic script discovery or AI setup is needed in either case.
+
 ## Delivery journal, acknowledgement and retry
 
 Legacy names and payloads stay intact. Runtime records live outside the payload.
@@ -337,16 +410,24 @@ Immediately before invocation, persist an attempt as `in_flight`. Run only one
 consumer call at a time per instance, including across stop/crash/restart.
 While a call is in flight, no other consumer may be admitted. If its result is
 lost, the persisted unresolved in-flight/uncertain attempt blocks all subsequent
-consumer admissions until recovery, even for other deliveries. Accepted agents
-may keep executing independently after their consumer handoff invocation has returned;
-that execution is outside consumer-call serialization. Exit 0 is the complete
-v1 acknowledgement: `accepted` means the consumer durably accepted responsibility before returning.
-No stdout acknowledgement JSON is parsed. Nonzero exit, signal or exec failure
-records `failed` with exit/signal/error information. A consumer that launches
-an agent must return only after durable acceptance and preserve a usable prompt
-path; queueing an agent does not report its final execution outcome. Consumers
-must not move, delete or mutate the original delivery directory. They may copy
-it into a durable queue, keyed by delivery ID for deduplication.
+consumer admissions until recovery, even for other deliveries. Independent work
+may keep executing after its consumer handoff invocation has returned; that
+execution is outside consumer-call serialization.
+
+Exit 0 is the complete v1 acknowledgement: `accepted` means the consumer has
+accepted responsibility before returning, either by completing its synchronous
+work or by durably accepting responsibility for asynchronous work. No stdout
+acknowledgement JSON is parsed and no separate acknowledgement call is needed.
+A synchronous script can do useful non-AI work and exit 0 without launching an
+independent worker. An asynchronous consumer must return success only after its
+acceptance is durable and any resources needed by independent work remain
+usable; merely starting a process is not durable acceptance. Either way, status
+keeps `execution:unknown` because Groundhog cannot verify application-specific
+success from the exit status alone. Nonzero exit, signal or exec failure records
+`failed` with exit/signal/error information, even if some useful work occurred.
+Consumers must not move, delete or mutate the original delivery directory. They
+may read it synchronously or copy it into durable storage, using delivery IDs
+for deduplication where needed.
 
 Accepted and failed deliveries remain in `out/` for inspection. Accepted is
 terminal for automatic handoff even if the runner restarts. Failed does not
@@ -363,13 +444,14 @@ that to `uncertain` and does not replay it. All subsequent consumer admissions
 remain blocked, including other pending deliveries. After stopping the runner,
 the operator must establish that the original consumer handoff invocation has
 finished before recording either recovery decision. This does not require an
-accepted agent's independent execution to finish. If the operator cannot
+accepted independent process's execution to finish. If the operator cannot
 establish invocation completion, the barrier and ownership stay retained; a
 runner lock, runner death or apparent PID absence is insufficient evidence.
 
 The token holder then uses `recover --decision accept` only after confirming
-durable acceptance, or `recover --decision retry` after reconciling side effects
-to make the delivery pending. Recovery records the operator's decision with the
+synchronous completion or durable asynchronous acceptance, or
+`recover --decision retry` after reconciling side effects to make the delivery
+pending. Recovery records the operator's decision with the
 attempt; it does not automatically detect or terminate a detached consumer.
 An abandoned `in_flight` attempt may be reconciled to `uncertain` by recover
 under the same stopped-runner rules. If any other attempt remains unresolved,
@@ -403,18 +485,19 @@ Runtime journals do not retroactively make legacy tick copy/marker operations
 transactional. Ambiguous unjournaled legacy evidence remains diagnostic.
 
 SIGINT/SIGTERM and `stop` close admission, interrupt sleep, and detach from an
-already admitted consumer call without killing it or its launched agents. If its
-result cannot be collected before runner exit, record/retain `uncertain` and
-require recovery; never report accepted merely because shutdown succeeded.
+already admitted consumer call without killing it or any independent processes
+it launched. If its result cannot be collected before runner exit, record/retain
+`uncertain` and require recovery; never report accepted merely because shutdown succeeded.
 Runner exit and stop success do not establish that this invocation finished.
 On restart the durable barrier blocks all new consumer invocations until the
 operator establishes completion and records recovery. Release fails while an
 unresolved attempt remains. A hanging consumer therefore cannot silently lose
-its delivery, and Quit can leave retained ownership with an actionable error. Stop returns once runner exclusion is released; it does
-not prove a detached handoff invocation ended or wait for independent agent
-execution. A runner failure sets a structured runner error and exits nonzero,
-retaining ownership and pause. Unsupported or malformed state fails closed for execution; read-only inspection remains available with
-diagnostics where possible.
+its delivery, and supervisor shutdown can leave retained ownership with an
+actionable error. Stop returns once runner exclusion is released; it does not
+prove a detached handoff invocation ended or wait for independent execution.
+A runner failure sets a structured runner error and exits nonzero, retaining
+ownership and pause. Unsupported or malformed state fails closed for execution;
+read-only inspection remains available with diagnostics where possible.
 
 ## Read-only JSON projection
 
@@ -531,15 +614,16 @@ GH=/example/project/.groundhog/groundhog.sh
 | Pause with d-demo-1 pending | Global pause true; no handoff; out and fired unchanged. |
 | Stop, configure consumer, run while paused | Runner running but idle; pending remains pending. |
 | Resume, consumer exits 0 | pending → in_flight → accepted; original out path retained; execution unknown. |
+| Synchronous script completes but runner dies before recording exit | in_flight → uncertain on next run; establish invocation finished and verify completed work before recover accept; no automatic replay. |
 | Consumer exits 7 for d-demo-2 | in_flight → failed; later cycles do not retry. |
 | Stop, retry d-demo-2, run | failed → pending → new in_flight attempt; delivery ID unchanged. |
 | Stop detaches d-demo-3 consumer A, explicit restart while A may still act | in_flight → uncertain; consumer B and all other consumer admissions blocked, including with new config; enabled ticks may add pending deliveries. |
 | Crash during d-demo-3 invocation, explicit restart | Same barrier; runner exclusion does not establish that A ended. |
 | Stop, cannot establish A finished | No accept/retry recovery decision; barrier and ownership retained; release fails. |
-| Stop, establish A finished and durable acceptance, recover d-demo-3 with decision accept | uncertain → accepted with decision, no consumer invocation; independent accepted agent may continue; next explicit run can admit B if no other unresolved attempt. |
+| Stop, establish A finished and durable acceptance, recover d-demo-3 with decision accept | uncertain → accepted with decision, no consumer invocation; accepted independent work may continue; next explicit run can admit B if no other unresolved attempt. |
 | Stop, establish A finished and reconcile side effects, recover d-demo-3 with decision retry | uncertain → pending; next explicit run may create a new attempt if no other unresolved invocation. |
 | External supervisor stops without release | owner retained, runner stopped; other supervisor enroll fails 3. |
-| Quit cleanly, reopen viewer | No owner, runner stopped, pause retained; no auto-enrollment or start. |
+| Supervisor shuts down cleanly, reopen viewer | No owner, runner stopped, pause retained; no auto-enrollment or start. |
 
 Enrollment failure examples (no new command is needed):
 
@@ -570,8 +654,8 @@ must not reuse those directory-creating code paths for inspection.
 
 Decisions for Bob before implementation: persistent ownership with manual
 lost-token repair; explicit configured argv rather than an automatic hook;
-exit-zero durable acceptance rather than stdout JSON; retained payloads and
-manual retries/recovery; cooperative local locking and no mixed-version pause
+exit-zero acceptance (synchronous completion or durable delegation) rather than
+stdout JSON; retained payloads and manual retries/recovery; cooperative local locking and no mixed-version pause
 guarantee; upgraded standalone tick refusal while owned; and clean supervisor
 release only after unresolved handoffs have been reconciled. No dependent
 runtime implementation is authorized by this document.
