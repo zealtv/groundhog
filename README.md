@@ -236,9 +236,111 @@ each vendored copy is self-contained.
 ./groundhog.sh sweep [days]             # remove out/ entries older than N days (default 14)
 ./groundhog.sh capabilities --json      # which runtime capabilities this script implements (read-only)
 ./groundhog.sh status --json            # one JSON snapshot of schedule, state and deliveries (read-only)
+./groundhog.sh enroll --owner-label LABEL --token-file ABSENT_ABSOLUTE_PATH
+./groundhog.sh run --token-file PATH [--interval-seconds N]   # foreground heartbeat (default 60)
+./groundhog.sh pause|resume|stop|release --token-file PATH
 ```
 
 `<when>` is the schedule path: `daily`, `daily/09`, `daily/09-30`, `weekly`, `weekly/mon`, `weekly/mon/09`, `weekly/mon/09-30`, `monthly`, `monthly/1`, `monthly/15/09`, `monthly/15/09-30`, `yearly`, `yearly/03-15`, `yearly/03-15/09-30`, `once`, `once/2026-05-01`, `once/2026-05-01/09-30`, `every/15m`, `every/3h`. A bare axis (`weekly`, `monthly`, `yearly`, `once`) takes the default slot. `every/` has no default — the bucket is required.
+
+## Runner, ownership and pause
+
+An instance can opt in to a supervised, foreground heartbeat. This is optional:
+an instance that never runs `enroll` ticks exactly as before. The design is in
+[docs/runtime-contract.md](docs/runtime-contract.md); this section records what
+the script does and what it needs.
+
+```
+$ ./groundhog.sh enroll --owner-label my-session --token-file /private/dir/token
+$ ./groundhog.sh resume --token-file /private/dir/token     # only if paused
+$ ./groundhog.sh run --token-file /private/dir/token --interval-seconds 60
+# from another terminal:
+$ ./groundhog.sh pause --token-file /private/dir/token
+$ ./groundhog.sh stop --token-file /private/dir/token
+$ ./groundhog.sh release --token-file /private/dir/token    # then delete the token file
+```
+
+* **`enroll`** needs an unowned instance and an absent absolute `--token-file`
+  outside the instance, in an existing private directory. It writes a fresh
+  random token there (mode 0600, flushed to disk), then atomically replaces the
+  owner record with the token's verifier. Exit 6 means failure before any owner
+  was committed; exit 7 means the owner record may have been written, so keep the
+  token and reconcile with `status --json`. The secret never goes into argv,
+  `status` or any child's environment.
+* **`run`** takes the runner lock for its lifetime, then repeats a cycle every
+  interval: tick once (unless paused) and, in a later release, reconcile and hand
+  off deliveries. It never enrolls and never clears the pause. A second `run`,
+  even with the same token, exits 4. SIGINT, SIGTERM, SIGHUP and `stop` close
+  admission, interrupt the sleep and exit 0, keeping ownership and pause. A
+  failing tick ends the runner with exit 6 and a `runner.last_error`.
+* **`pause`/`resume`** set the instance-wide pause (idempotently) under the
+  mutation lock. Pause survives stop, restart, release and re-enrollment, and is
+  independent of the `.paused` suffix on schedule components.
+* **`stop`** records a request under the mutation lock, then waits, holding
+  nothing, until the runner has released its lock. With no live runner it returns
+  at once. **`release`** needs a stopped runner and no unresolved delivery
+  attempt; it removes the owner and leaves the pause. The generation counter
+  persists, so the next `enroll` issues generation + 1.
+* **Standalone `tick`** fails 3 while the instance is owned (ownership wins over
+  pause), succeeds without firing while paused, and otherwise ticks as always.
+  `init`, `add`, `drop` and `sweep` also fail 3 while owned. All of them take the
+  mutation lock and fail 4 if it stays busy for about three seconds.
+* Exit codes of the new commands: 0 success, 2 invalid arguments or
+  configuration, 3 ownership conflict or stale token, 4 busy, 5 unsupported or
+  unusable state, 6 I/O failure, 7 enrollment outcome uncertain.
+
+`status --json` reports the real `paused`, `owner` (id, generation, label; never
+the verifier) and `runner` state, and `revision` rises with every protocol write.
+A state file that still says `running` but whose recorded process is gone (a
+crash) shows the runner as `unknown` with a `runner_not_observed` diagnostic;
+status takes no locks and repairs nothing. The owner stays.
+
+### Locks
+
+Exclusion uses `flock(2)` advisory locks, so the operating system releases them
+when the holder dies and no PID is ever consulted. Two lock files live in
+`runtime/locks/` (created on first use, never deleted): `runner.lock`, held for a
+runner's lifetime, and `mutation.lock`, held briefly by every writer. Order is
+runner, then mutation.
+
+bash cannot call `flock(2)` itself. The script opens the lock file on a numbered
+descriptor in the shell (`exec 8>>runner.lock`, `exec 9>>mutation.lock`) and a
+short-lived helper takes the lock on that inherited descriptor: `flock -n FD`
+from util-linux when `flock --version` says so, otherwise
+`perl -MFcntl=:flock` (perl ships with macOS). The lock belongs to the open file
+description, so it stays held by the shell after the helper exits and goes away
+when the shell exits, however it exits (checked with `kill -9`).
+
+The catch: a child that inherits the descriptor keeps the lock alive after its
+parent dies. The runner therefore starts its long-lived children (`sleep`
+between cycles; later, consumers) with `8>&- 9>&-`. Short-lived tools such as
+`cp` hold the descriptors for milliseconds.
+
+**Requirements.** The runner commands and the three capabilities
+`ownership-v1`, `runner-v1` and `pause-v1` appear only when the host has: a lock
+helper (util-linux `flock` or perl with `Fcntl`); a SHA-256 tool (`sha256sum`,
+`shasum` or `openssl`); `perl` with `IO::Handle` or `sync(1)` for durable writes;
+`od` and `/dev/urandom`. Without them `capabilities` lists `status-json-v1` only,
+`enroll`, `run`, `pause`, `resume`, `stop` and `release` exit 5 with a message,
+and every legacy command works as before without taking any lock. Support is
+single host, local filesystem; do not share an instance over a network
+filesystem. On macOS `fsync` does not force the drive's write cache to the
+platter.
+
+Older copies of this script know nothing about the locks or the pause and can
+bypass both. Stop other tick loops before enrolling an instance.
+
+### State written under `runtime/`
+
+`state.json` is replaced atomically (temp file in the same directory, fsync,
+rename, fsync of the directory) with `revision` + 1. Besides the fields
+`status` reads (`schema_version`, `revision`, `paused`, `owner`, `runner`,
+`config_digest`) it records `instance` (the canonical directory; control refuses
+a state bound to another directory), `last_generation`, the owner's
+`token_verifier` (SHA-256 of owner id and token), and runner diagnostics (`id`,
+`pid`, `start_id`, `stop_requested_for`). Diagnostics grant no authority. Unusable
+state makes every control command exit 5 and is never overwritten; `status`
+shows it with `consistent: false`.
 
 ## Inspection
 
@@ -256,12 +358,14 @@ their behavior, including creating the trays.
 
 ```
 $ ./groundhog.sh capabilities --json
-{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1"]}
+{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","ownership-v1","runner-v1","pause-v1"]}
 ```
 
-`capabilities` lists only what this script implements; today that is
-`status-json-v1`. A client needs all six capabilities in the contract before it
-may offer supervised control, so this version supports inspection only. An older
+`capabilities` lists only what this script implements on this host: `status-json-v1`
+always, and `ownership-v1`, `runner-v1` and `pause-v1` where the locking tools
+exist (see [Runner, ownership and pause](#runner-ownership-and-pause)). A client
+needs all six capabilities in the contract before it may offer supervised
+control, and `consumer-v1` and `delivery-v1` are not implemented yet. An older
 script answers `capabilities` with its ordinary `unknown command` error (exit 1).
 
 `status --json` follows the projection in the
@@ -296,9 +400,9 @@ script answers `capabilities` with its ordinary `unknown command` error (exit 1)
 * `owner`, `paused`, `revision`, `runner` and `consumer` come from
   `runtime/state.json` and `runtime/config.json` when they exist, and default
   (`owner: null`, `paused: false`, `revision: 0`, runner `stopped`, consumer not
-  configured) when they do not. Nothing in this version writes those files yet;
-  status parses them so that the later runtime commands and tests have one reader.
-  Secrets (the owner token verifier, consumer argv and environment) are never
+  configured) when they do not. `enroll`, `run`, `pause`, `resume`, `stop` and
+  `release` write `state.json`; nothing writes `config.json` or delivery records
+  yet. Secrets (the owner token verifier, consumer argv and environment) are never
   printed.
 * `consistent` is `false`, with `diagnostics`, when `state.json` or a delivery
   record is unreadable, malformed or of an unsupported `schema_version`, or when
@@ -326,5 +430,10 @@ output (the script itself uses no python) and optionally `jq`, which then parses
 every document as a second opinion. Tests copy the script into temporary
 directories under `$TMPDIR` and never touch a real schedule. To test a chosen
 moment they put a `date` shim first on `PATH`, so the script needs no test hook.
+The runner tests start real `run` processes in the background (own process group,
+short `--interval-seconds`, bounded waits), prove the lock with Python's
+`fcntl.flock`, and fail if a test leaves a runner behind. `test_runtime_gate.sh`
+simulates a host with no lock helper. Hosts that lack the runner's tools skip the
+runner tests.
 New tests: add `tests/test_<area>.sh`, source `tests/lib.sh`, and finish with
 `t_finish`.

@@ -13,8 +13,15 @@ assert_eq "protocol" '"groundhog-runtime"' "$(jget "$out" protocol)"
 assert_eq "protocol_version is the integer 1" '1' "$(jget "$out" protocol_version)"
 assert_eq "implementation_version is a string" 'str' \
   "$(jq_py get "$out" implementation_version | cut -c1 | sed 's/"/str/')"
-# Advertise only what exists: this stitch implements status-json-v1 and nothing else.
-assert_eq "capabilities lists exactly status-json-v1" '["status-json-v1"]' "$(jget "$out" capabilities)"
+# Advertise only what exists. The three runtime capabilities appear exactly on
+# hosts that have the locking, hashing and durability tools the runner needs;
+# consumer-v1 and delivery-v1 belong to a later stitch and never appear here.
+if have_runtime_support; then
+  assert_eq "capabilities on a host with locking" \
+    '["status-json-v1","ownership-v1","runner-v1","pause-v1"]' "$(jget "$out" capabilities)"
+else
+  assert_eq "capabilities on a host without locking" '["status-json-v1"]' "$(jget "$out" capabilities)"
+fi
 
 # It needs no initialized instance and creates nothing.
 assert_eq "an uninitialized instance stays untouched" "groundhog.sh" "$(ls -A "$GHD")"

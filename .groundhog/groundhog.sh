@@ -15,6 +15,12 @@ usage:
   groundhog.sh sweep [days]
   groundhog.sh capabilities --json
   groundhog.sh status --json
+  groundhog.sh enroll --owner-label LABEL --token-file ABSENT_ABSOLUTE_PATH
+  groundhog.sh run --token-file PATH [--interval-seconds N]
+  groundhog.sh pause --token-file PATH
+  groundhog.sh resume --token-file PATH
+  groundhog.sh stop --token-file PATH
+  groundhog.sh release --token-file PATH
 
 notes:
   - this script operates on the .groundhog/ directory beside it
@@ -33,6 +39,9 @@ notes:
   - item contents are opaque to groundhog
   - capabilities and status are strictly read-only and print one JSON object;
     see README.md and docs/runtime-contract.md
+  - enroll, run, pause, resume, stop and release are the optional runner
+    commands; they need the OS-released locking described in README.md, and
+    an owned instance refuses tick, init, add, drop and sweep
 USAGE
 }
 
@@ -347,12 +356,14 @@ walk_due() {
 
 cmd_init() {
   resolve_paths
+  passive_enter init
   ensure_dirs
   echo "initialized $GH_DIR"
 }
 
 cmd_add() {
   require_root
+  passive_enter add
   ensure_dirs
   local when="${1:-}"
   local id="${2:-}"
@@ -395,8 +406,21 @@ cmd_due() {
   done < <(walk_due)
 }
 
+# A standalone tick: serialized with the runtime's writers, refused while the
+# instance is owned (the runner ticks under its token), and a no-op while the
+# instance is globally paused. An unowned, unpaused tick is the legacy tick.
 cmd_tick() {
   require_root
+  passive_enter tick
+  if [[ "$PASSIVE_PAUSED" == true ]]; then
+    echo "tick: the instance is paused; nothing fired" >&2
+    return 0
+  fi
+  tick_body
+}
+
+# The tick itself. The runner calls it too, under its own admission checks.
+tick_body() {
   ensure_dirs
   local now_t
   now_t="$(now_today)"
@@ -628,6 +652,7 @@ cmd_lint() {
 
 cmd_drop() {
   require_root
+  passive_enter drop
   ensure_dirs
   local id="${1:-}"
   [[ -n "$id" ]] || die "drop requires <item-id>"
@@ -676,6 +701,7 @@ sweep_dir() {
 
 cmd_sweep() {
   require_root
+  passive_enter sweep
   ensure_dirs
   local days="${1:-14}"
   [[ "$days" =~ ^[0-9]+$ ]] || die "sweep <days> must be a non-negative integer"
@@ -698,8 +724,9 @@ GH_PROTOCOL="groundhog-runtime"
 GH_PROTOCOL_VERSION=1
 # Informational only; clients must not branch on it.
 GH_IMPLEMENTATION_VERSION="dev"
-# Advertise only what this script implements. Each later runtime stitch adds
-# its own capability names here when (and only when) the commands exist.
+# Advertise only what this script implements here. cmd_capabilities adds
+# ownership-v1, runner-v1 and pause-v1 on hosts where rt_detect finds the locking
+# and durability tools; the consumer stitch adds consumer-v1 and delivery-v1.
 GH_CAPABILITIES=("status-json-v1")
 
 JSON_LOSSY=0        # set when json_str had to replace bytes that are not UTF-8
@@ -1129,6 +1156,31 @@ inspect_state() {
   if ! state_check; then
     diag_add "$VCODE" "runtime/state.json: $VERR" "$rel"
     state_reset_invalid
+  else
+    state_liveness
+  fi
+  return 0
+}
+
+# A state file that says a runner is running or stopping may be left over from
+# a crash. Status holds no locks, so it cannot prove activity; it can only look
+# for the recorded process (a diagnostic, never authority). No matching
+# process: report the runner as unknown and keep ownership as recorded.
+state_liveness() {
+  local pid start cur
+  case "$S_RUNNER_STATE" in running|stopping) ;; *) return 0 ;; esac
+  jp_get "${US}runner${US}pid"
+  [[ "$JP_GT" == n && "$JP_GV" =~ ^[0-9]{1,9}$ ]] || return 0
+  pid="$JP_GV"
+  jp_get "${US}runner${US}start_id"
+  start=""
+  [[ "$JP_GT" == s ]] && start="$JP_GV"
+  # If ps cannot even see this shell, it cannot answer for the recorded pid.
+  [[ -n "$(proc_start_id $$)" ]] || return 0
+  cur="$(proc_start_id "$pid")"
+  if [[ -z "$cur" || ( -n "$start" && "$cur" != "$start" ) ]]; then
+    diag_add runner_not_observed "runtime/state.json records a $S_RUNNER_STATE runner but no matching process was found; ownership is retained" "runtime/state.json"
+    S_RUNNER_STATE=unknown
   fi
   return 0
 }
@@ -1529,6 +1581,10 @@ json_only_args() {
 cmd_capabilities() {
   json_only_args capabilities "$@"
   local caps="" c
+  rt_detect
+  if [[ -z "$GH_RT_MISSING" ]]; then
+    GH_CAPABILITIES+=("ownership-v1" "runner-v1" "pause-v1")
+  fi
   for c in "${GH_CAPABILITIES[@]}"; do
     json_str "$c"
     caps+="${caps:+,}$JSTR"
@@ -1579,6 +1635,708 @@ cmd_status() {
     "$C_CONFIGURED" "$C_VALID" "$S_DIGEST" "$schedule" "$deliveries" "$diags"
 }
 
+# ---------------------------------------------------------------------------
+# Runtime: ownership, the runner, persistent pause, and the locks beneath them.
+#
+# Everything here is optional state under .groundhog/runtime/. Locks are
+# flock(2) advisory locks on files in runtime/locks/. A flock(2) lock belongs
+# to an open file description: this shell opens the lock file on a numbered fd
+# (8 = runner lock, 9 = mutation lock) and a short-lived helper (util-linux
+# flock(1), else perl) takes the lock on that inherited fd. The lock outlives
+# the helper and the OS releases it when the last holder of the description
+# dies, so a crashed runner frees it and no PID is ever consulted. The flip
+# side: any child that inherits the fd keeps the lock alive after the holder
+# dies, so every long-lived child (sleep, later a consumer) must be started
+# with `8>&- 9>&-`. Lock files are never deleted.
+# ---------------------------------------------------------------------------
+
+LOCK_FD_RUNNER=8
+LOCK_FD_MUTATION=9
+GH_LOCK_HELPER=""      # flock | perl | empty (no locking available)
+GH_HASH_TOOL=""        # sha256sum | shasum | openssl
+GH_SYNC_TOOL=""        # perl | sync
+GH_RT_MISSING=""       # what the host lacks for ownership-v1/runner-v1/pause-v1
+GH_RT_DETECTED=0
+MUT_HELD=0
+PASSIVE_PAUSED=false
+
+# rt_detect — decide what this host can do. Nothing is created or run beyond
+# version probes, so `capabilities` stays read-only.
+rt_detect() {
+  (( GH_RT_DETECTED )) && return 0
+  GH_RT_DETECTED=1
+  local v missing=""
+  if command -v flock >/dev/null 2>&1; then
+    v="$(flock --version 2>&1 || true)"
+    [[ "$v" == *util-linux* ]] && GH_LOCK_HELPER=flock
+  fi
+  if [[ -z "$GH_LOCK_HELPER" ]] && command -v perl >/dev/null 2>&1 \
+     && perl -MFcntl=:flock -e 'exit 0' >/dev/null 2>&1; then
+    GH_LOCK_HELPER=perl
+  fi
+  [[ -n "$GH_LOCK_HELPER" ]] || missing+="${missing:+, }flock(1) from util-linux or perl with Fcntl"
+  if command -v sha256sum >/dev/null 2>&1; then GH_HASH_TOOL=sha256sum
+  elif command -v shasum >/dev/null 2>&1; then GH_HASH_TOOL=shasum
+  elif command -v openssl >/dev/null 2>&1; then GH_HASH_TOOL=openssl
+  else missing+="${missing:+, }sha256sum, shasum or openssl"; fi
+  if command -v perl >/dev/null 2>&1 && perl -MIO::Handle -e 'exit 0' >/dev/null 2>&1; then GH_SYNC_TOOL=perl
+  elif command -v sync >/dev/null 2>&1; then GH_SYNC_TOOL=sync
+  else missing+="${missing:+, }perl or sync(1) for durable writes"; fi
+  [[ -r /dev/urandom ]] || missing+="${missing:+, }/dev/urandom"
+  command -v od >/dev/null 2>&1 || missing+="${missing:+, }od"
+  GH_RT_MISSING="$missing"
+  return 0
+}
+
+rt_die() { echo "error: $2" >&2; exit "$1"; }
+
+RT_DIR=""; RT_LOCKS=""; RT_STATE=""; RT_ERR=""
+
+rt_paths() {
+  RT_DIR="$GH_DIR/runtime"
+  RT_LOCKS="$RT_DIR/locks"
+  RT_STATE="$RT_DIR/state.json"
+  INSTANCE="$(cd "$GH_DIR" && pwd -P)"
+}
+
+# rt_begin CMD — common start of the new runtime commands.
+rt_begin() {
+  GH_BAD_INSTALL_EXIT=2
+  resolve_paths
+  rt_paths
+  rt_detect
+  if [[ -n "$GH_RT_MISSING" ]]; then
+    rt_die 5 "$1: this host lacks what the runner needs ($GH_RT_MISSING); see README.md. Ownership, runner and pause are not offered here."
+  fi
+  mkdir -p "$RT_LOCKS" 2>/dev/null || rt_die 6 "$1: cannot create $RT_LOCKS"
+}
+
+# --- locks -------------------------------------------------------------------
+# lock_open FD FILE — open FILE (created if absent) on FD. Return 0, or 2.
+lock_open() {
+  { eval "exec $1>>\"\$2\""; } 2>/dev/null || return 2
+}
+
+# lock_try FD — one nonblocking exclusive attempt on the open FD.
+# Returns 0 acquired, 1 busy, 2 helper error.
+lock_try() {
+  local rc=0
+  case "$GH_LOCK_HELPER" in
+    flock) flock -n "$1" || rc=$? ;;
+    perl)  perl -MFcntl=:flock -e 'open(my $f, ">&=", $ARGV[0]) or exit 2; flock($f, LOCK_EX|LOCK_NB) or exit 1' "$1" || rc=$? ;;
+    *)     rc=2 ;;
+  esac
+  (( rc <= 1 )) || rc=2
+  return "$rc"
+}
+
+# lock_runner_try — take runner exclusion without waiting. 0 / 1 busy / 2 error.
+lock_runner_try() {
+  local rc=0
+  lock_open "$LOCK_FD_RUNNER" "$RT_LOCKS/runner.lock" || return 2
+  lock_try "$LOCK_FD_RUNNER" || rc=$?
+  if (( rc != 0 )); then exec 8>&-; fi
+  return "$rc"
+}
+unlock_runner() { exec 8>&-; }
+
+# lock_mutation — take the short-lived mutation lock, waiting up to about
+# three seconds. 0 / 1 busy / 2 error.
+lock_mutation() {
+  local tries=0 rc
+  lock_open "$LOCK_FD_MUTATION" "$RT_LOCKS/mutation.lock" || return 2
+  while :; do
+    rc=0
+    lock_try "$LOCK_FD_MUTATION" || rc=$?
+    if (( rc == 0 )); then MUT_HELD=1; return 0; fi
+    if (( rc != 1 )); then exec 9>&-; return 2; fi
+    tries=$((tries + 1))
+    if (( tries >= 30 )); then exec 9>&-; return 1; fi
+    sleep 0.1 8>&- 9>&-
+  done
+}
+unlock_mutation() { exec 9>&-; MUT_HELD=0; }
+
+# lock_mutation_or_die CMD
+lock_mutation_or_die() {
+  local rc=0
+  lock_mutation || rc=$?
+  case "$rc" in
+    0) ;;
+    1) rt_die 4 "$1: the instance is busy (another writer holds the mutation lock)" ;;
+    *) rt_die 6 "$1: cannot take the mutation lock" ;;
+  esac
+}
+
+# --- small tools -------------------------------------------------------------
+RAND=""
+rand_hex() { # BYTES — sets RAND
+  RAND="$(od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n')"
+  [[ ${#RAND} -eq $(( $1 * 2 )) ]]
+}
+
+HASH=""
+sha256_text() { # TEXT — sets HASH; the text goes in by stdin, never argv
+  case "$GH_HASH_TOOL" in
+    sha256sum) HASH="$(printf '%s' "$1" | sha256sum | awk '{print $1}')" ;;
+    shasum)    HASH="$(printf '%s' "$1" | shasum -a 256 | awk '{print $1}')" ;;
+    openssl)   HASH="$(printf '%s' "$1" | openssl dgst -sha256 | awk '{print $NF}')" ;;
+    *)         return 1 ;;
+  esac
+  [[ "$HASH" =~ ^[0-9a-f]{64}$ ]]
+}
+
+# rt_fsync PATH — flush a file or directory to stable storage where the host
+# allows (fsync on macOS does not force the drive cache; see README.md).
+rt_fsync() {
+  case "$GH_SYNC_TOOL" in
+    perl) perl -MIO::Handle -e 'open(my $f, "<", $ARGV[0]) or exit 1; $f->sync or exit 1; close($f) or exit 1' "$1" ;;
+    sync) sync ;;
+    *)    return 1 ;;
+  esac
+}
+
+# proc_start_id PID — a normalized process start time, or empty.
+proc_start_id() {
+  LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//' || true
+}
+
+# --- state -------------------------------------------------------------------
+# R_* hold what the status reader drops: the verifier, the raw label, the
+# generation counter and the runner's diagnostics. S_* (shared with status)
+# hold revision, pause, runner state and last_error.
+R_OWNER_ID=""; R_OWNER_GEN=0; R_OWNER_LABEL=""; R_VERIFIER=""; R_LASTGEN=0
+R_RUNNER_ID=""; R_RUNNER_PID=""; R_RUNNER_START=""; R_STOPREQ=""
+
+state_defaults() {
+  S_REV=0; S_PAUSED=false; S_OWNER=null; S_OWNER_PRESENT=0
+  S_RUNNER_STATE=stopped; S_RUNNER_ERROR=null; S_DIGEST=null; S_VALID=1
+  R_OWNER_ID=""; R_OWNER_GEN=0; R_OWNER_LABEL=""; R_VERIFIER=""; R_LASTGEN=0
+  R_RUNNER_ID=""; R_RUNNER_PID=""; R_RUNNER_START=""; R_STOPREQ=""
+}
+
+# rt_load — read runtime/state.json for a control command. Absent means
+# defaults. Returns 1 with RT_ERR set when the file is unusable: control
+# commands fail closed (exit 5) and never overwrite it.
+rt_load() {
+  state_defaults
+  RT_ERR=""
+  [[ -e "$RT_STATE" || -L "$RT_STATE" ]] || return 0
+  if ! read_text "$RT_STATE"; then RT_ERR="runtime/state.json exists but is not a readable regular file"; return 1; fi
+  if ! jp_parse "$TEXT"; then RT_ERR="runtime/state.json is not valid JSON ($JP_ERR)"; return 1; fi
+  if ! state_check; then RT_ERR="runtime/state.json: $VERR"; return 1; fi
+  jp_get "${US}instance"
+  if [[ "$JP_GT" == s && "$JP_GV" != "$INSTANCE" ]]; then
+    RT_ERR="runtime/state.json is bound to a different instance directory"; return 1
+  fi
+  if (( S_OWNER_PRESENT )); then
+    jp_get "${US}owner${US}id";             R_OWNER_ID="$JP_GV"
+    jp_get "${US}owner${US}generation";     R_OWNER_GEN="$JP_GV"
+    jp_get "${US}owner${US}label";          [[ "$JP_GT" == s ]] && R_OWNER_LABEL="$JP_GV"
+    jp_get "${US}owner${US}token_verifier"
+    if [[ "$JP_GT" != s || -z "$JP_GV" ]]; then RT_ERR="runtime/state.json: owner has no verifier"; return 1; fi
+    R_VERIFIER="$JP_GV"
+  fi
+  jp_get "${US}last_generation"
+  if [[ "$JP_GT" == n && "$JP_GV" =~ ^[0-9]{1,15}$ ]]; then R_LASTGEN="$JP_GV"; fi
+  if (( R_OWNER_GEN > R_LASTGEN )); then R_LASTGEN="$R_OWNER_GEN"; fi
+  jp_get "${US}runner${US}id";                 [[ "$JP_GT" == s ]] && R_RUNNER_ID="$JP_GV"
+  jp_get "${US}runner${US}pid";                [[ "$JP_GT" == n && "$JP_GV" =~ ^[0-9]{1,9}$ ]] && R_RUNNER_PID="$JP_GV"
+  jp_get "${US}runner${US}start_id";           [[ "$JP_GT" == s ]] && R_RUNNER_START="$JP_GV"
+  jp_get "${US}runner${US}stop_requested_for"; [[ "$JP_GT" == s ]] && R_STOPREQ="$JP_GV"
+  return 0
+}
+
+str_or_null() { # TEXT — sets JR to a JSON string, or null for empty
+  if [[ -z "$1" ]]; then JR=null; else json_str "$1"; JR="$JSTR"; fi
+}
+
+# rt_save — write state from S_*/R_* with revision + 1, atomically: temp file
+# in the same directory, fsync, rename, fsync the directory.
+# Returns 0; 1 = failed before the replacement (state.json untouched);
+# 2 = the replacement was attempted, so the outcome is uncertain.
+rt_save() {
+  local rev=$((S_REV + 1)) inst owner id pid start stopreq label tmp doc
+  json_str "$INSTANCE"; inst="$JSTR"
+  if (( S_OWNER_PRESENT )); then
+    json_str "$R_OWNER_ID"; id="$JSTR"
+    str_or_null "$R_OWNER_LABEL"; label="$JR"
+    json_str "$R_VERIFIER"; owner="{\"id\":$id,\"generation\":$R_OWNER_GEN,\"label\":$label,\"token_verifier\":$JSTR}"
+  else
+    owner=null
+  fi
+  str_or_null "$R_RUNNER_ID"; id="$JR"
+  pid="${R_RUNNER_PID:-null}"
+  str_or_null "$R_RUNNER_START"; start="$JR"
+  str_or_null "$R_STOPREQ"; stopreq="$JR"
+  doc="{\"schema_version\":1,\"revision\":$rev,\"instance\":$inst,\"paused\":$S_PAUSED,\"last_generation\":$R_LASTGEN,\"owner\":$owner,\"runner\":{\"state\":\"$S_RUNNER_STATE\",\"last_error\":$S_RUNNER_ERROR,\"id\":$id,\"pid\":$pid,\"start_id\":$start,\"stop_requested_for\":$stopreq},\"config_digest\":$S_DIGEST}"
+  tmp="$RT_DIR/.state.json.$$.tmp"
+  rm -f "$tmp"
+  if ! printf '%s\n' "$doc" > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  if ! rt_fsync "$tmp"; then rm -f "$tmp"; return 1; fi
+  if ! mv -f "$tmp" "$RT_STATE" 2>/dev/null; then rm -f "$tmp"; return 2; fi
+  S_REV="$rev"
+  rt_fsync "$RT_DIR" || return 2
+  return 0
+}
+
+# rt_save_or_die CMD — for commands whose failure is a plain I/O error.
+rt_save_or_die() {
+  local rc=0
+  rt_save || rc=$?
+  if (( rc != 0 )); then rt_die 6 "$1: could not write runtime/state.json (it may or may not have changed; run status to see)"; fi
+}
+
+# --- tokens ------------------------------------------------------------------
+TOK_SECRET=""; TOK_OWNER_ID=""; TOK_GEN=""; TOK_VERIFIER=""
+
+# token_read FILE — load the private token file. Exits 2 for an unusable file
+# and 3 for a token that belongs to another instance. The secret stays in shell
+# variables: never exported, never in argv, never printed.
+token_read() {
+  local f="$1" inst
+  if ! read_text "$f"; then rt_die 2 "the token file is missing or not a readable file"; fi
+  if ! jp_parse "$TEXT"; then TEXT=""; rt_die 2 "the token file is not valid JSON"; fi
+  jp_get "${US}schema_version"; [[ "$JP_GT" == n && "$JP_GV" == 1 ]] || { TEXT=""; rt_die 2 "the token file has an unsupported schema_version"; }
+  jp_get "${US}token";       [[ "$JP_GT" == s && -n "$JP_GV" ]] || { TEXT=""; rt_die 2 "the token file has no token"; }
+  TOK_SECRET="$JP_GV"
+  jp_get "${US}instance";    [[ "$JP_GT" == s && -n "$JP_GV" ]] || { TEXT=""; rt_die 2 "the token file names no instance"; }
+  inst="$JP_GV"
+  jp_get "${US}owner_id";    [[ "$JP_GT" == s && -n "$JP_GV" ]] || { TEXT=""; rt_die 2 "the token file has no owner_id"; }
+  TOK_OWNER_ID="$JP_GV"
+  jp_get "${US}generation";  [[ "$JP_GT" == n && "$JP_GV" =~ ^[0-9]{1,15}$ ]] || { TEXT=""; rt_die 2 "the token file has no generation"; }
+  TOK_GEN="$JP_GV"
+  TEXT=""; JP_S=""; JP_K=(); JP_T=(); JP_V=()
+  if [[ "$inst" != "$INSTANCE" ]]; then rt_die 3 "the token belongs to a different instance"; fi
+  sha256_text "$TOK_OWNER_ID"$'\n'"$TOK_SECRET" || rt_die 6 "cannot hash the token"
+  TOK_VERIFIER="sha256:$HASH"
+}
+
+# token_verify — after rt_load: does the token match the current owner?
+token_verify() {
+  (( S_OWNER_PRESENT )) || return 1
+  [[ "$R_OWNER_ID" == "$TOK_OWNER_ID" && "$R_OWNER_GEN" == "$TOK_GEN" && "$R_VERIFIER" == "$TOK_VERIFIER" ]]
+}
+
+# control_open CMD — under the mutation lock: load state, check the token.
+# Exits 5 (unusable state) or 3 (stale token / not owned). Caller holds the lock.
+control_check() {
+  rt_load || { unlock_mutation; rt_die 5 "$1: $RT_ERR"; }
+  token_verify || { unlock_mutation; rt_die 3 "$1: the token does not match the current owner (not owned, or a stale token)"; }
+}
+
+# --- options -----------------------------------------------------------------
+OPT_TOKEN_FILE=""; OPT_LABEL=""; OPT_INTERVAL=""
+# parse_opts CMD ALLOWED… -- ARGS… — every option takes one value and may
+# appear once. Unknown options and stray arguments exit 2.
+parse_opts() {
+  local cmd="$1" allowed=" " name
+  shift
+  while [[ "$1" != -- ]]; do allowed+="$1 "; shift; done
+  shift
+  OPT_TOKEN_FILE=""; OPT_LABEL=""; OPT_INTERVAL=""
+  while (( $# )); do
+    case "$1" in
+      --token-file|--owner-label|--interval-seconds)
+        name="${1#--}"
+        [[ "$allowed" == *" $name "* ]] || rt_die 2 "$cmd: unknown option '$1'"
+        (( $# >= 2 )) && [[ -n "$2" ]] || rt_die 2 "$cmd: $1 needs a value"
+        case "$name" in
+          token-file)       [[ -z "$OPT_TOKEN_FILE" ]] || rt_die 2 "$cmd: --token-file given more than once"; OPT_TOKEN_FILE="$2" ;;
+          owner-label)      [[ -z "$OPT_LABEL" ]]      || rt_die 2 "$cmd: --owner-label given more than once"; OPT_LABEL="$2" ;;
+          interval-seconds) [[ -z "$OPT_INTERVAL" ]]   || rt_die 2 "$cmd: --interval-seconds given more than once"; OPT_INTERVAL="$2" ;;
+        esac
+        shift 2
+        ;;
+      *) rt_die 2 "$cmd: unknown option or argument '$1'" ;;
+    esac
+  done
+}
+
+# --- passive callers ---------------------------------------------------------
+# passive_enter CMD — for tick, init, add, drop and sweep. Where locking exists:
+# take the mutation lock (held until this process exits), refuse while the
+# instance is owned (exit 3) or its state is unusable (exit 5), and note the
+# global pause for tick. Without locking the legacy behavior is unchanged.
+passive_enter() {
+  rt_paths
+  rt_detect
+  [[ -n "$GH_LOCK_HELPER" ]] || return 0
+  mkdir -p "$RT_LOCKS" 2>/dev/null || rt_die 6 "$1: cannot create $RT_LOCKS"
+  lock_mutation_or_die "$1"
+  rt_load || rt_die 5 "$1: $RT_ERR"
+  if (( S_OWNER_PRESENT )); then
+    rt_die 3 "$1: this instance is owned; its runner ticks under the owner's token, and v1 has no supervised schedule edit"
+  fi
+  PASSIVE_PAUSED="$S_PAUSED"
+}
+
+# --- enroll, pause, resume, stop, release -----------------------------------
+cmd_enroll() {
+  parse_opts enroll token-file owner-label -- "$@"
+  [[ -n "$OPT_LABEL" ]]      || rt_die 2 "enroll: --owner-label is required"
+  [[ -n "$OPT_TOKEN_FILE" ]] || rt_die 2 "enroll: --token-file is required"
+  [[ "$OPT_TOKEN_FILE" == /* ]] || rt_die 2 "enroll: --token-file must be an absolute path"
+  (( ${#OPT_LABEL} <= 256 )) || rt_die 2 "enroll: --owner-label is longer than 256 characters"
+  rt_begin enroll
+
+  local tdir="${OPT_TOKEN_FILE%/*}" tdir_real
+  [[ -n "$tdir" ]] || tdir=/
+  [[ -d "$tdir" ]] || rt_die 2 "enroll: the token file's directory must already exist"
+  tdir_real="$(cd "$tdir" && pwd -P)"
+  case "$tdir_real/" in
+    "$INSTANCE"/*) rt_die 2 "enroll: the token file must live outside the instance" ;;
+  esac
+  if [[ -e "$OPT_TOKEN_FILE" || -L "$OPT_TOKEN_FILE" ]]; then
+    rt_die 2 "enroll: the token file already exists; enroll needs an absent path"
+  fi
+
+  lock_mutation_or_die enroll
+  rt_load || { unlock_mutation; rt_die 5 "enroll: $RT_ERR"; }
+  if (( S_OWNER_PRESENT )); then
+    unlock_mutation
+    rt_die 3 "enroll: the instance already has an owner (id $R_OWNER_ID); stopped or not, only its token can control it"
+  fi
+
+  local gen=$((R_LASTGEN + 1)) oid secret verifier doc
+  rand_hex 8  || { unlock_mutation; rt_die 6 "enroll: cannot read random bytes"; }
+  oid="o-$RAND"
+  rand_hex 32 || { unlock_mutation; rt_die 6 "enroll: cannot read random bytes"; }
+  secret="$RAND"
+  sha256_text "$oid"$'\n'"$secret" || { unlock_mutation; rt_die 6 "enroll: cannot hash the token"; }
+  verifier="sha256:$HASH"
+
+  # 1. The complete usable token file, durably, mode 0600, before any owner.
+  json_str "$INSTANCE"
+  doc="{\"schema_version\":1,\"token\":\"$secret\",\"instance\":$JSTR,\"owner_id\":\"$oid\",\"generation\":$gen}"
+  if ! ( umask 077; set -C; printf '%s\n' "$doc" > "$OPT_TOKEN_FILE" ) 2>/dev/null; then
+    unlock_mutation; rt_die 6 "enroll: cannot create the token file (no ownership was granted)"
+  fi
+  doc=""
+  if ! chmod 600 "$OPT_TOKEN_FILE" 2>/dev/null || ! rt_fsync "$OPT_TOKEN_FILE" || ! rt_fsync "$tdir_real"; then
+    rm -f "$OPT_TOKEN_FILE"
+    unlock_mutation; rt_die 6 "enroll: cannot make the token file durable (no ownership was granted)"
+  fi
+
+  # 2. The owner record, by atomic replacement.
+  S_OWNER_PRESENT=1
+  R_OWNER_ID="$oid"; R_OWNER_GEN="$gen"; R_OWNER_LABEL="$OPT_LABEL"; R_VERIFIER="$verifier"; R_LASTGEN="$gen"
+  local rc=0
+  rt_save || rc=$?
+  unlock_mutation
+  if (( rc == 1 )); then
+    rm -f "$OPT_TOKEN_FILE"
+    rt_die 6 "enroll: could not write runtime/state.json; no ownership was granted"
+  elif (( rc != 0 )); then
+    echo "error: enroll: the owner record may have been written; keep the token file ($OPT_TOKEN_FILE), start nothing, and reconcile with 'status --json' (owner id $oid, generation $gen)" >&2
+    exit 7
+  fi
+  echo "enrolled: owner $oid, generation $gen"
+}
+
+cmd_setpause() { # true|false
+  local want="$1" cmd=pause
+  [[ "$want" == false ]] && cmd=resume
+  parse_opts "$cmd" token-file -- "${@:2}"
+  [[ -n "$OPT_TOKEN_FILE" ]] || rt_die 2 "$cmd: --token-file is required"
+  rt_begin "$cmd"
+  token_read "$OPT_TOKEN_FILE"
+  lock_mutation_or_die "$cmd"
+  control_check "$cmd"
+  if [[ "$S_PAUSED" != "$want" ]]; then
+    S_PAUSED="$want"
+    rt_save_or_die "$cmd"
+  fi
+  unlock_mutation
+  if [[ "$want" == true ]]; then echo "paused"; else echo "resumed"; fi
+}
+
+cmd_stop() {
+  parse_opts stop token-file -- "$@"
+  [[ -n "$OPT_TOKEN_FILE" ]] || rt_die 2 "stop: --token-file is required"
+  rt_begin stop
+  token_read "$OPT_TOKEN_FILE"
+  local rc
+  while :; do
+    # Write the request under mutation, holding nothing else...
+    lock_mutation_or_die stop
+    control_check stop
+    case "$S_RUNNER_STATE" in
+      running|stopping)
+        if [[ -n "$R_RUNNER_ID" && "$R_STOPREQ" != "$R_RUNNER_ID" ]]; then
+          R_STOPREQ="$R_RUNNER_ID"
+          S_RUNNER_STATE=stopping
+          rt_save_or_die stop
+        fi
+        ;;
+    esac
+    unlock_mutation
+    # ...then wait, without holding mutation, for runner exclusion to be free.
+    rc=0
+    lock_runner_try || rc=$?
+    if (( rc == 0 )); then
+      # No runner is alive. Settle the record (runner, then mutation).
+      lock_mutation_or_die stop
+      control_check stop
+      case "$S_RUNNER_STATE" in
+        running|stopping|unknown)
+          S_RUNNER_STATE=stopped
+          R_RUNNER_ID=""; R_RUNNER_PID=""; R_RUNNER_START=""; R_STOPREQ=""
+          rt_save_or_die stop
+          ;;
+        *)
+          if [[ -n "$R_STOPREQ" ]]; then R_STOPREQ=""; rt_save_or_die stop; fi
+          ;;
+      esac
+      unlock_mutation
+      unlock_runner
+      echo "stopped"
+      return 0
+    elif (( rc != 1 )); then
+      rt_die 6 "stop: cannot test the runner lock"
+    fi
+    sleep 0.2 8>&- 9>&-
+  done
+}
+
+# Placeholder for the delivery journal (gh-consumer-dispatch): true when an
+# attempt is still unresolved (in_flight or uncertain), or a record cannot be
+# read. Today nothing writes delivery records, so this reads an empty journal.
+unresolved_attempt_exists() {
+  local f
+  shopt -s nullglob
+  for f in "$RT_DIR"/deliveries/*.json; do
+    if ! read_text "$f" || ! jp_parse "$TEXT"; then shopt -u nullglob; return 0; fi
+    jp_get "${US}state"
+    case "$JP_GV" in in_flight|uncertain) shopt -u nullglob; return 0 ;; esac
+  done
+  shopt -u nullglob
+  return 1
+}
+
+cmd_release() {
+  parse_opts release token-file -- "$@"
+  [[ -n "$OPT_TOKEN_FILE" ]] || rt_die 2 "release: --token-file is required"
+  rt_begin release
+  token_read "$OPT_TOKEN_FILE"
+  local rc=0
+  lock_runner_try || rc=$?
+  if (( rc == 1 )); then rt_die 4 "release: a runner is still alive; stop it first"; fi
+  (( rc == 0 )) || rt_die 6 "release: cannot test the runner lock"
+  lock_mutation_or_die release
+  control_check release
+  if unresolved_attempt_exists; then
+    unlock_mutation
+    rt_die 5 "release: a delivery attempt is unresolved (in flight or uncertain); recover it first. Ownership is retained."
+  fi
+  S_OWNER_PRESENT=0
+  R_OWNER_ID=""; R_OWNER_GEN=0; R_OWNER_LABEL=""; R_VERIFIER=""
+  S_RUNNER_STATE=stopped; S_RUNNER_ERROR=null
+  R_RUNNER_ID=""; R_RUNNER_PID=""; R_RUNNER_START=""; R_STOPREQ=""
+  rt_save_or_die release
+  unlock_mutation
+  unlock_runner
+  echo "released; delete the token file, which no longer authorizes anything"
+}
+
+# --- the runner --------------------------------------------------------------
+RUNNER_ID=""
+RUNNER_RECORDED=0
+RUNNER_OUTCOME=""        # stopped | failed, set before a deliberate exit
+RUNNER_ERR_CODE=""
+RUNNER_ERR_MSG=""
+RUNNER_STOP=0            # a stop request was seen
+GH_SIGNALED=0
+RUNNER_PAUSE_LOGGED=0
+
+runner_log() { echo "groundhog: $*" >&2; }
+
+# runner_fail EXIT_CODE CODE MESSAGE — record a structured error and exit
+# nonzero. The EXIT trap writes runner.state=failed; ownership and pause stay.
+runner_fail() {
+  RUNNER_OUTCOME=failed
+  RUNNER_ERR_CODE="$2"
+  RUNNER_ERR_MSG="$3"
+  runner_log "$3"
+  exit "$1"
+}
+
+# EXIT trap: leave the state file saying what happened.
+runner_on_exit() {
+  local rc=$?
+  trap '' INT TERM HUP
+  if (( RUNNER_RECORDED )); then
+    runner_record_exit "$rc" || true
+  fi
+  exit "$rc"
+}
+
+runner_record_exit() {
+  local rc="$1" outcome="$RUNNER_OUTCOME" held=$MUT_HELD code message
+  if [[ -z "$outcome" ]]; then
+    if (( rc == 0 )); then outcome=stopped; else outcome=failed; fi
+  fi
+  if (( ! held )); then lock_mutation || return 1; fi
+  if rt_load && [[ "$R_RUNNER_ID" == "$RUNNER_ID" ]]; then
+    S_RUNNER_STATE="$outcome"
+    if [[ "$outcome" == failed ]]; then
+      code="${RUNNER_ERR_CODE:-runner_exited}"
+      message="${RUNNER_ERR_MSG:-the runner exited unexpectedly (status $rc)}"
+      json_str "$code"; local c="$JSTR"
+      json_str "$message"; S_RUNNER_ERROR="{\"code\":$c,\"message\":$JSTR,\"path\":null}"
+    else
+      S_RUNNER_ERROR=null
+    fi
+    R_RUNNER_ID=""; R_RUNNER_PID=""; R_RUNNER_START=""; R_STOPREQ=""
+    rt_save || true
+  fi
+  unlock_mutation
+  return 0
+}
+
+# runner_poll_stop — cheap, lock-free look for a stop request addressed to this
+# runner (state.json is replaced atomically, so a read is always whole).
+runner_poll_stop() {
+  read_text "$RT_STATE" || return 1
+  if [[ "$TEXT" == *"\"stop_requested_for\":\"$RUNNER_ID\""* ]]; then
+    RUNNER_STOP=1
+    return 0
+  fi
+  return 1
+}
+
+# runner_wait_until SECONDS-TARGET — sleep in one-second slices until
+# $SECONDS reaches the target, a signal arrives or a stop is requested. The
+# sleep runs with the lock fds closed so it can never keep a dead runner's
+# locks alive, and `wait` returns the moment a trapped signal arrives.
+runner_wait_until() {
+  local target="$1" spid
+  while (( SECONDS < target )); do
+    if (( GH_SIGNALED || RUNNER_STOP )); then return 0; fi
+    sleep 1 8>&- 9>&- &
+    spid=$!
+    wait "$spid" 2>/dev/null || true
+    kill "$spid" 2>/dev/null || true
+    wait "$spid" 2>/dev/null || true
+    if (( GH_SIGNALED )); then return 0; fi
+    runner_poll_stop || true
+  done
+  return 0
+}
+
+# One cycle: reconcile deliveries, tick once if enabled, hand off pending
+# deliveries. Cycles run strictly one after another.
+runner_cycle() {
+  runner_reconcile_deliveries
+  runner_tick
+  runner_handoff_pending
+}
+
+# gh-consumer-dispatch fills these two. Both belong under the mutation lock,
+# check pause and the stop request before admitting anything, and must start
+# any consumer child with `8>&- 9>&-` so it cannot inherit the locks.
+runner_reconcile_deliveries() { :; }   # abandoned in_flight -> uncertain; prepared firings
+runner_handoff_pending() { :; }        # serial consumer calls for eligible pending deliveries
+
+# runner_tick — the firing admission. Under the mutation lock: revalidate the
+# token, honor a stop request, honor the global pause, then tick once.
+runner_tick() {
+  local rc=0 status=0
+  if (( GH_SIGNALED )); then RUNNER_STOP=1; return 0; fi
+  lock_mutation || rc=$?
+  if (( rc != 0 )); then
+    runner_log "cycle skipped: the mutation lock is busy"
+    return 0
+  fi
+  if ! rt_load; then
+    unlock_mutation
+    runner_fail 5 state_invalid "$RT_ERR; the runner stops and ownership is retained"
+  fi
+  if ! token_verify; then
+    unlock_mutation
+    runner_fail 3 owner_changed "the owner record no longer matches this runner's token; the runner stops"
+  fi
+  if [[ "$R_STOPREQ" == "$RUNNER_ID" ]]; then
+    RUNNER_STOP=1; unlock_mutation; return 0
+  fi
+  if [[ "$S_PAUSED" == true ]]; then
+    if (( ! RUNNER_PAUSE_LOGGED )); then runner_log "paused: nothing is admitted until resume"; RUNNER_PAUSE_LOGGED=1; fi
+    unlock_mutation
+    return 0
+  fi
+  RUNNER_PAUSE_LOGGED=0
+  # errexit must be live inside the tick but must not end the runner: run it
+  # in a subshell, with errexit off around the call.
+  set +e
+  ( set -e; tick_body )
+  status=$?
+  set -e
+  unlock_mutation
+  if (( status != 0 )); then
+    runner_fail 6 tick_failed "tick failed (exit $status); ownership and pause are retained"
+  fi
+}
+
+# runner_config_check — startup validation of runtime/config.json. Structure
+# only; the consumer stitch adds executable and cwd checks.
+runner_config_check() {
+  local f="$RT_DIR/config.json"
+  [[ -e "$f" || -L "$f" ]] || return 0
+  if ! read_text "$f"; then echo "runtime/config.json exists but is not a readable regular file"; return 1; fi
+  if ! jp_parse "$TEXT"; then echo "runtime/config.json is not valid JSON ($JP_ERR)"; return 1; fi
+  if ! config_check; then echo "runtime/config.json: $VERR"; return 1; fi
+  return 0
+}
+
+cmd_run() {
+  parse_opts run token-file interval-seconds -- "$@"
+  [[ -n "$OPT_TOKEN_FILE" ]] || rt_die 2 "run: --token-file is required"
+  local interval=60
+  if [[ -n "$OPT_INTERVAL" ]]; then
+    [[ "$OPT_INTERVAL" =~ ^[1-9][0-9]{0,8}$ ]] || rt_die 2 "run: --interval-seconds must be a positive integer"
+    interval="$OPT_INTERVAL"
+  fi
+  rt_begin run
+  token_read "$OPT_TOKEN_FILE"
+
+  local rc=0 cerr
+  lock_runner_try || rc=$?
+  if (( rc == 1 )); then rt_die 4 "run: another runner already holds this instance"; fi
+  (( rc == 0 )) || rt_die 6 "run: cannot take the runner lock"
+
+  trap 'GH_SIGNALED=1' INT TERM HUP
+  trap runner_on_exit EXIT
+  rand_hex 8 || rt_die 6 "run: cannot read random bytes"
+  RUNNER_ID="r-$RAND"
+
+  lock_mutation_or_die run
+  control_check run
+  if ! cerr="$(runner_config_check)"; then
+    unlock_mutation
+    rt_die 2 "run: $cerr; nothing was ticked"
+  fi
+  R_RUNNER_ID="$RUNNER_ID"; R_RUNNER_PID="$$"; R_RUNNER_START="$(proc_start_id $$)"; R_STOPREQ=""
+  S_RUNNER_STATE=running; S_RUNNER_ERROR=null
+  rt_save_or_die run
+  RUNNER_RECORDED=1
+  unlock_mutation
+  runner_log "runner $RUNNER_ID started (interval ${interval}s)"
+
+  local cycle_start next
+  while :; do
+    cycle_start=$SECONDS
+    runner_cycle
+    if (( GH_SIGNALED || RUNNER_STOP )); then break; fi
+    next=$((cycle_start + interval))
+    while (( next <= SECONDS )); do next=$((next + interval)); done   # missed cycles are skipped
+    runner_wait_until "$next"
+    if (( GH_SIGNALED || RUNNER_STOP )); then break; fi
+  done
+  RUNNER_OUTCOME=stopped
+  runner_log "runner $RUNNER_ID stopping; ownership and pause are retained"
+  exit 0
+}
+
 main() {
   local cmd="${1:-}"
   case "$cmd" in
@@ -1593,6 +2351,12 @@ main() {
     sweep) shift; cmd_sweep "$@" ;;
     capabilities) shift; cmd_capabilities "$@" ;;
     status) shift; cmd_status "$@" ;;
+    enroll)  shift; cmd_enroll  "$@" ;;
+    run)     shift; cmd_run     "$@" ;;
+    pause)   shift; cmd_setpause true  "$@" ;;
+    resume)  shift; cmd_setpause false "$@" ;;
+    stop)    shift; cmd_stop    "$@" ;;
+    release) shift; cmd_release "$@" ;;
     -h|--help|help|"") usage ;;
     *) die "unknown command '$cmd'" ;;
   esac

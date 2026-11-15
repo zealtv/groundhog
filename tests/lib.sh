@@ -23,7 +23,12 @@ T_REAL_DATE="$(command -v date)"
 T_HAVE_JQ=0
 command -v jq >/dev/null 2>&1 && T_HAVE_JQ=1
 
+# Runner processes the test started; t_finish and t_cleanup make sure none outlives it.
+T_PIDS=""
+
 t_cleanup() {
+  local p
+  for p in $T_PIDS; do kill -9 "$p" 2>/dev/null || true; done
   chmod -R u+rwx "$T_TMP" 2>/dev/null || true
   rm -rf "$T_TMP"
 }
@@ -57,6 +62,10 @@ assert_not_contains() { # DESC HAYSTACK NEEDLE
 }
 
 t_finish() {
+  local p
+  for p in $T_PIDS; do
+    if kill -0 "$p" 2>/dev/null; then t_fail "the test left a runner process behind (pid $p)"; kill -9 "$p" 2>/dev/null || true; fi
+  done
   printf '%s: %d passed, %d failed, %d skipped\n' "$(basename "$0")" "$T_PASS" "$T_FAIL" "$T_SKIP"
   [ "$T_FAIL" -eq 0 ]
 }
@@ -173,3 +182,122 @@ tree_hash() {
 age_tree() {
   find "$1" -exec touch -h -t 202001010000 {} + 2>/dev/null || find "$1" -exec touch -t 202001010000 {} + 2>/dev/null
 }
+
+# --- runtime support ---------------------------------------------------------
+# have_runtime_support — does this host have what the script needs for the
+# runner (a lock helper, a hash tool, durable writes)? Mirrors rt_detect.
+have_runtime_support() {
+  local lock=0 hash=0 sync=0 v
+  if command -v flock >/dev/null 2>&1; then
+    v="$(flock --version 2>&1 || true)"; case "$v" in *util-linux*) lock=1 ;; esac
+  fi
+  if [ "$lock" -eq 0 ] && command -v perl >/dev/null 2>&1 && perl -MFcntl=:flock -e 'exit 0' >/dev/null 2>&1; then lock=1; fi
+  for v in sha256sum shasum openssl; do command -v "$v" >/dev/null 2>&1 && hash=1; done
+  if command -v perl >/dev/null 2>&1 && perl -MIO::Handle -e 'exit 0' >/dev/null 2>&1; then sync=1
+  elif command -v sync >/dev/null 2>&1; then sync=1; fi
+  [ "$lock" -eq 1 ] && [ "$hash" -eq 1 ] && [ "$sync" -eq 1 ] && [ -r /dev/urandom ]
+}
+
+# --- runners, tokens and locks -----------------------------------------------
+T_RUNS=0
+RUNNER_PID=""
+RUN_OUT=""
+RUN_ERR=""
+T_TOKDIR="$T_TMP/tokens"
+mkdir -p "$T_TOKDIR"
+chmod 700 "$T_TOKDIR"
+T_TOKENS=0
+
+# new_token_path — sets TOK to a fresh absent path in the private token directory.
+new_token_path() {
+  T_TOKENS=$((T_TOKENS + 1))
+  TOK="$T_TOKDIR/token$T_TOKENS"
+}
+
+# enroll_ok [LABEL] — enroll the current instance; sets TOK.
+enroll_ok() {
+  new_token_path
+  gh enroll --owner-label "${1:-test-session}" --token-file "$TOK" >/dev/null 2>"$T_TMP/enroll.err" \
+    || { t_fail "enroll_ok failed" "$(cat "$T_TMP/enroll.err")"; return 1; }
+}
+
+# start_runner ARGS… — `run` in the background of the current instance. Sets
+# RUNNER_PID, RUN_OUT, RUN_ERR. Job control gives it its own process group and
+# default signal handling, so INT reaches it as it would from a terminal (a
+# plain background job of a non-interactive shell ignores SIGINT).
+start_runner() {
+  T_RUNS=$((T_RUNS + 1))
+  RUN_OUT="$T_TMP/runner$T_RUNS.out"
+  RUN_ERR="$T_TMP/runner$T_RUNS.err"
+  set -m
+  "$TEST_BASH" "$GHD/groundhog.sh" run "$@" > "$RUN_OUT" 2> "$RUN_ERR" &
+  RUNNER_PID=$!
+  set +m
+  T_PIDS="$T_PIDS $RUNNER_PID"
+}
+
+# wait_for DESC TRIES COMMAND… — poll every 0.1s, up to TRIES times.
+wait_for() {
+  local desc="$1" tries="$2" i=0
+  shift 2
+  while [ "$i" -lt "$tries" ]; do
+    if "$@" 2>/dev/null; then t_ok; return 0; fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  t_fail "timed out waiting for: $desc"
+  return 1
+}
+
+# wait_exit DESC TRIES PID — wait for a process to end; sets WAIT_RC.
+WAIT_RC=""
+wait_exit() {
+  local desc="$1" tries="$2" pid="$3" i=0
+  while [ "$i" -lt "$tries" ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      WAIT_RC=0; wait "$pid" 2>/dev/null || WAIT_RC=$?
+      t_ok; return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  t_fail "timed out waiting for exit: $desc"
+  kill -9 "$pid" 2>/dev/null || true
+  WAIT_RC=""
+  return 1
+}
+
+# runner_state — the runner state `status` reports right now.
+runner_state() { status_to "$T_TMP/rs.json" && jget "$T_TMP/rs.json" runner.state; }
+runner_is() { [ "$(runner_state)" = "\"$1\"" ]; }
+
+# lock_is_free FILE — can another process take the lock right now? (flock(2),
+# the same family the script uses.)
+lock_is_free() {
+  python3 -I -c 'import fcntl,sys
+f=open(sys.argv[1],"a")
+try:
+    fcntl.flock(f, fcntl.LOCK_EX|fcntl.LOCK_NB)
+except OSError:
+    sys.exit(1)' "$1"
+}
+
+# hold_lock FILE SECONDS — hold the lock from a background process. Sets
+# HOLD_PID after the lock is taken.
+HOLD_PID=""
+hold_lock() {
+  local ready="$T_TMP/hold.ready"
+  rm -f "$ready"
+  python3 -I -c 'import fcntl,sys,time
+f=open(sys.argv[1],"a")
+fcntl.flock(f, fcntl.LOCK_EX)
+open(sys.argv[3],"w").write("x")
+time.sleep(float(sys.argv[2]))' "$1" "$2" "$ready" &
+  HOLD_PID=$!
+  T_PIDS="$T_PIDS $HOLD_PID"
+  wait_for "lock holder ready" 50 test -e "$ready"
+}
+
+# out_count — number of entries in the instance's out/.
+out_count() { find "$GHD/out" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '; }
+out_is() { [ "$(out_count)" = "$1" ]; }
