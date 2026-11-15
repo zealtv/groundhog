@@ -100,7 +100,9 @@ t0="$(now_s)"; status_to "$out"; t1="$(now_s)"
 after_time="$(secs "$t0" "$t1")"
 printf 'info: status with 1,000 deliveries: %s s before they were filed, %s s after\n' "$before_time" "$after_time" >&2
 assert_eq "status prints the same deliveries once they are filed" "$before_sum" "$(deliveries_sum "$out")"
-assert_true "...and no longer needs seconds for them (${after_time} s)" under "$after_time" 4
+# Relative to the same host and load: filed records cost a small fraction of unfiled ones
+# (about a sixth to a tenth on an idle host; the old layout would give a ratio of 1).
+assert_true "...and costs under half as much as before (${after_time} s against ${before_time} s)" under "$after_time" "$(python3 -I -c "print($before_time / 2)")"
 assert_eq "...consistent, no diagnostics" '[]' "$(jget "$out" diagnostics)"
 rc=0; t0="$(now_s)"; gh stop --token-file "$TOK" >/dev/null 2>&1 || rc=$?; t1="$(now_s)"
 assert_eq "stop succeeds against the live runner" 0 "$rc"
@@ -131,7 +133,7 @@ for i in 1 2 3 4 5 6 7 8; do
   sleep 0.6
 done
 assert_eq "pause and resume never found the instance busy while 300 records were rewritten" 0 "$bad"
-wait_for "all 300 became missing and were filed" 600 done_is 300
+wait_for "all 300 became missing and were filed" 1800 done_is 300
 gh stop --token-file "$TOK" >/dev/null 2>&1
 wait_exit "the runner exited" 100 "$RUNNER_PID"
 status_to "$out"

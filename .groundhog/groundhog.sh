@@ -435,10 +435,6 @@ tick_body() {
   local name src is_once slot dst tmp date_dir marker
   while IFS=$'\t' read -r name src is_once slot; do
     [[ -n "$name" ]] || continue
-    if ! utf8_valid "${src#"$GH_DIR"/}"; then
-      printf 'warning: not firing %s: its name is not valid UTF-8\n' "$name" >&2
-      continue
-    fi
     if [[ -n "$slot" ]]; then
       dst="$OUT/${name}-${now_t}-${slot}"
     else
@@ -1780,7 +1776,7 @@ inspect_schedule() {
     p="${item_paths[k]}"
     rel="${p#"$GH_DIR"/}"
     if ! utf8_valid "$rel"; then
-      diag_add schedule_name_not_utf8 "$rel has a name that is not valid UTF-8, so a tick does not fire it; rename it" "$rel"
+      diag_add schedule_name_not_utf8 "$rel has a name that is not valid UTF-8, so the runner does not fire it; rename it" "$rel"
     fi
     paused_json=""
     if [[ -n "${item_pauses[k]}" ]]; then

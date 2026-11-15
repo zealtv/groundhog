@@ -537,8 +537,8 @@ cycle, of `release` and of `status` from growing with every settled delivery:
 
 A name in `out/` or `schedule/` that is not valid UTF-8 (possible on Linux; APFS
 refuses it) cannot round-trip through a record, so it would have been imported
-again every cycle. The runner and `tick` now leave such a schedule item unfired
-and such an `out/` entry unimported; `status` does not list the entry as a
+again every cycle. The runner now leaves such a schedule item unfired
+and such an `out/` entry unimported (the standalone `tick` is unchanged); `status` does not list the entry as a
 delivery and reports `out_entry_name_not_utf8` or `schedule_name_not_utf8` instead.
 
 **Serial handoff.** One consumer call at a time per instance, across stop,
