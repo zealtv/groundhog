@@ -136,4 +136,16 @@ assert_true "...the squatter is untouched" test -L "$GHD/out/foo-$td"
 assert_contains "...status names the entry" "$(jget "$out" diagnostics)" out_entry_not_directory
 assert_contains "...and the runner logged the collision" "$(cat "$RUN_ERR")" "out_collision"
 
+# --- 9. re-arming an occurrence whose entry is still in out/ ---------------------------
+new_instance; gh init >/dev/null
+gh add daily foo >/dev/null; echo d > "$GHD/schedule/daily/foo/n.txt"
+enroll_ok; gh resume --token-file "$TOK" >/dev/null
+run_once
+rm "$GHD/fired/$td/daily/foo"
+run_once
+status_to "$out"
+assert_eq "re-arm: still one delivery for the name" 1 "$(jq_py where "$out" deliveries path "\"out/foo-$td\"" id | wc -l | tr -d ' ')"
+assert_contains "...and the refire is reported as a collision" "$(jget "$out" diagnostics)" out_collision
+assert_true "...with the marker back" test -e "$GHD/fired/$td/daily/foo"
+
 t_finish

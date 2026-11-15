@@ -189,6 +189,9 @@ done
 
 Run it in a tmux pane, background it, or wrap it in launchd / systemd / cron — groundhog itself doesn't care. `sleep` is interruptible by Ctrl-C. `tick` already prints a line per firing, so piping the loop to a log gives you a free audit trail.
 
+To replace a loop like this with the supervised `run`, see
+[Migrating from a tick loop](#migrating-from-a-tick-loop).
+
 This single loop is the heartbeat for any system built on these protocols. Anything else that wants to "come alive" — a tender, an agent, a watcher — can be triggered by a groundhog item firing into its inbox.
 
 ## Fired
@@ -223,7 +226,12 @@ cp groundhog.sh README.md <project>/.groundhog/
 
 `init` creates `schedule/`, `out/`, and `fired/` next to itself.
 `groundhog.sh` operates on the `.groundhog/` directory it lives in, so
-each vendored copy is self-contained.
+each vendored copy is self-contained. `groundhog.sh` is the only file the
+instance needs; `README.md` is documentation (its link to
+`docs/runtime-contract.md` points into this repository and dangles in a
+vendored copy). `./install.sh <host-dir>` does the same copy and runs `init`.
+Neither starts a runner, enrolls an owner or writes a configuration: see
+[Deployment and migration](#deployment-and-migration).
 
 ## Commands
 
@@ -517,6 +525,143 @@ old enough, as do terminal `missing` records. An unreadable record stops the
 sweep before it removes anything. An instance with no runtime state sweeps
 exactly as before.
 
+## Deployment and migration
+
+Written for operators on 2026-11-15, from the behavior this repository's tests
+exercise (`tests/test_e2e.sh` walks the paths below on scratch instances). The
+runtime is optional and opt-in per instance. Nothing in this script, in
+`install.sh` or in an upgrade enables it for an instance that did not ask.
+
+### Tick-only installations keep working
+
+An instance that never runs `enroll` has no owner, no pause and no runner, and
+behaves as before: `tick` copies what is due into `out/` and records it in
+`fired/`, with the same names, markers and one-shot removal. The new script
+differs for such an instance in a few small, visible ways:
+
+* `tick`, `init`, `add`, `drop` and `sweep` take a short mutation lock, which
+  creates `.groundhog/runtime/locks/` (two empty lock files) on first use. They
+  create no other runtime file: no `state.json`, no `config.json`, no delivery
+  records.
+* `help` lists the new commands. `lint` and `add` print a `note:` on stderr when
+  an item id exists at more than one schedule path (see
+  [Output name collisions](#output-name-collisions)); their stdout and exit codes
+  stay the same. `list` no longer fails under bash 3.2 when an item directory has
+  no subdirectories.
+* `capabilities --json` and `status --json` read the instance without writing
+  anything and work before `init`.
+
+No old consumer, tick loop or cron line needs a change. Nothing is discovered:
+a `consume.sh` in an instance or a payload enables nothing, and `run` refuses
+to start without a token from an explicit `enroll`.
+
+### Opting one instance in
+
+Do this per instance, deliberately; discovery or an upgrade never does it for
+you.
+
+1. **Check the host.** `./groundhog.sh capabilities --json` should list all six
+   capabilities (`status-json-v1`, `ownership-v1`, `runner-v1`, `pause-v1`,
+   `consumer-v1`, `delivery-v1`). Without the last two the instance can still be
+   owned, paused and run delivery-only.
+2. **Stop whatever else writes to the instance.** Other `tick` loops, cron lines,
+   and any process that moves entries out of `out/` (see the next section). An
+   older copy of the script, or a loop calling it, knows nothing about the lock,
+   the owner or the pause and can bypass all three.
+3. **Choose where the token lives.** A private directory outside the instance,
+   for example `~/.config/<your-supervisor>/session/`. The token file is the
+   whole credential: whoever can read it controls the instance.
+4. **Enroll.** `./groundhog.sh enroll --owner-label my-service --token-file
+   /private/dir/token`. This writes the token and the owner record and starts
+   nothing. The pause stays off unless you set it.
+5. **Optionally write `runtime/config.json`** (a consumer; see
+   [Consumers and deliveries](#consumers-and-deliveries)). Without one the runner
+   fires deliveries into `out/` and marks them `pending` with reason
+   `no_consumer`. Any entries already in `out/` become pending deliveries on the
+   first `run` and go to the consumer if one is configured, so move aside anything
+   you do not want handed off.
+6. **Run it under a supervisor of your choice.** `run` is a foreground process:
+   a terminal multiplexer pane, a launchd or systemd unit, a `nohup` line, a
+   process manager. Groundhog does not install or start one. Give the service the
+   token file path (and nothing else secret): `./groundhog.sh run --token-file
+   /private/dir/token --interval-seconds 60`.
+7. **Operate it with the same token file**, from any process: `status --json`
+   (no token needed), `pause`, `resume`, `stop`, `retry`, `recover`, `release`.
+
+A service may keep the token across its own restarts and run again without
+re-enrolling: `stop` ends the runner and keeps the owner. `release`, after a
+safe stop and with no unresolved handoff, ends ownership; then delete the token
+file. The runtime has one rule for every supervisor, human or service. A client
+may choose a stricter policy for itself (for example never reusing a stored
+token after a restart); that is its own choice and not a limit of this script.
+
+### Migrating from a tick loop
+
+A hand-rolled loop (`while sleep 60; do ./groundhog.sh tick; done`, a cron line,
+a launchd job) and `run` must not tick at once. The script cannot see the
+loop, so the order matters:
+
+1. **Stop the loop** and confirm nothing else calls it
+   (`pgrep -fl 'groundhog.sh'`; check cron and launchd). If the loop stays
+   alive, a standalone `tick` meets the owner and fails with exit 3, but an older
+   copy of the script will not notice and will fire alongside the runner.
+2. **Decide who consumes `out/`.** If a script moves entries out of `out/`
+   today, either keep the instance unenrolled (nothing changes), or turn that
+   script's per-entry work into a configured consumer (it receives one absolute
+   delivery path and exits 0 to accept) and stop its directory watcher. Do not
+   run a watcher and a configured consumer together: both would take the same
+   entry, and a pending delivery whose directory has been moved away is recorded
+   `missing` and never handed off.
+3. **Leave `fired/` and `schedule/` alone.** Markers carry over, so nothing fires
+   twice. Entries still in `out/` are imported as `legacy_out` pending
+   deliveries and go to the consumer one at a time; drain or move aside what
+   should not.
+4. **Enroll, configure, run** as above.
+
+To go back: `stop`, `release`, delete the token, restart the old loop. Delivery
+records and the pause stay in `runtime/` and are ignored by an older script.
+
+### Upgrading the vendored script
+
+Replacing `.groundhog/groundhog.sh` (and `README.md`), by hand or with
+`./install.sh <host-dir>`:
+
+* **Does:** swap the script and README; run `init`, which only creates missing
+  trays.
+* **Does not:** touch `schedule/`, `out/`, `fired/` or anything in `runtime/`;
+  enroll, configure, start or stop anything; change an existing owner, pause or
+  delivery record. An instance that was enrolled stays enrolled, and the
+  installer leaves it alone (`init` on an owned instance exits 3, which
+  `install.sh` reports as a note).
+* **Stop the runner first.** bash reads a script lazily, so replacing it under
+  a live `run` is unsafe. Restart it afterwards with the same token.
+* **Old copies elsewhere** (other projects, other worktrees) stay old: they ignore
+  the lock, owner and pause.
+
+## Output name collisions
+
+A firing lands in `out/<item-id>-<date>` (`-<HH-MM>` for `every/`). The legacy
+rule, kept by the runtime, never overwrites an existing entry: the occurrence is
+marked fired and, for a one-shot, the source is still removed, but no second
+delivery exists. Two firings can claim one name in these ways. What each leaves
+behind, as of this version:
+
+| Case | Result |
+|---|---|
+| The same item id at two schedule paths, due the same day (`daily/09/foo` and `daily/17/foo`; `daily/foo` and `weekly/sun/foo`) | The first firing (in `due` order) is the delivery. The later one is marked in `fired/` and gets an `out_collision` diagnostic on that delivery in `status`. `lint` and `add` print a `note:` when an id exists at more than one path. |
+| A one-shot and a recurring item with one id | Same, and the one-shot's source is removed even though it was never delivered: only the diagnostic and its marker remain. Keep one-shot ids unique. |
+| The same id in two `every/` buckets (`every/1h/foo`, `every/30m/foo`) at a shared slot | Same as the first row. |
+| Standalone `tick` and `run` mixed on an instance once supervised (after `release`) | A hand-run `tick` that finds the name taken warns on stderr and also attaches the `out_collision` to the delivery's record. An instance that never had delivery records keeps the legacy stderr warning only. |
+| The name exists from another source (a legacy entry, a hand-made directory) | The existing directory becomes the delivery (`legacy_out`); the firing is recorded and not delivered; `out_collision` as above. |
+| A non-directory (file, dangling symlink) squats on the name | No delivery can stand for it. The firing is marked and not delivered; `status` lists the entry as `out_entry_not_directory` and the runner logs `out_collision`; there is no `out_collision` record for it. |
+| The same name on different dates | No collision: the date is part of the name. |
+| A path reused after the first delivery vanished | The old record turns `missing`; the new firing is a new delivery with its own id; a later collision attaches to the live delivery. |
+| An occurrence re-armed by deleting its marker while the entry is still in `out/` | The refire finds the name taken: recorded, not delivered, `out_collision`. |
+
+A collision costs the later occurrence (it is not delivered and not retried);
+the earlier delivery is never overwritten. If two items must both deliver on one
+day, give them different ids.
+
 ## Inspection
 
 `capabilities --json` and `status --json` are the machine-readable view of an
@@ -617,8 +762,11 @@ The runner tests start real `run` processes in the background (own process group
 short `--interval-seconds`, bounded waits), prove the lock with Python's
 `fcntl.flock`, and fail if a test leaves a runner behind. `test_runtime_gate.sh`
 simulates a host with no lock helper. Hosts that lack the runner's tools skip the
-runner tests. The consumer tests (`test_consumer.sh`, `test_delivery.sh`,
-`test_journal.sh`) use plain `/bin/sh` consumers that write marker files, kill
+runner tests. `test_e2e.sh` is one readable walk of the operator's path (tick-only use, the
+upgrade, recurring and overdue delivery, ownership, pause, synchronous and
+asynchronous consumers, shutdown, token reuse, release); `test_collisions.sh`
+covers [Output name collisions](#output-name-collisions). The consumer tests
+(`test_consumer.sh`, `test_delivery.sh`, `test_journal.sh`) use plain `/bin/sh` consumers that write marker files, kill
 the runner with `kill -9` or signal its process group while a consumer sleeps,
 hand-write delivery and prepared records for crashes that cannot be timed from
 outside, and skip on hosts without the lock and process-isolation tools. Run them
