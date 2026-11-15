@@ -196,7 +196,7 @@ This single loop is the heartbeat for any system built on these protocols. Anyth
 
 ## Fired
 
-`fired/<YYYY-MM-DD>/<schedule-relative-path>` is an empty file recording that the item fired on that date. The marker mirrors the schedule subtree, so `weekly/sat/foo` and `monthly/25/foo` get distinct markers and neither is silently swallowed. Groundhog writes it; nothing else should. Three useful things fall out:
+`fired/<YYYY-MM-DD>/<schedule-relative-path>` is a file recording that the item fired on that date. It is empty, except that when a supervised runner fires a one-shot it writes the one-shot's source generation (inode and mtime of the directory it copied) into the marker, so a later tick removes that source and never a replacement put there the same day (see *The journal* under [Consumers and deliveries](#consumers-and-deliveries)). Only the marker's existence means "fired". The marker mirrors the schedule subtree, so `weekly/sat/foo` and `monthly/25/foo` get distinct markers and neither is silently swallowed. Groundhog writes it; nothing else should. Three useful things fall out:
 
 * **Idempotency**, even if the consumer takes items immediately.
 * **History**: `find fired/2026-04-25 -type f` answers "what fired that day?" forever, regardless of whether the items have been collected.
@@ -306,7 +306,9 @@ $ ./groundhog.sh release --token-file /private/dir/token    # then delete the to
   unusable state, 6 I/O failure, 7 enrollment outcome uncertain.
 
 `status --json` reports the real `paused`, `owner` (id, generation, label; never
-the verifier) and `runner` state, and `revision` rises with every protocol write.
+the verifier) and `runner` state, and `revision` rises with every write to
+`state.json` (see [Change tokens](#change-tokens-revision-and-journal_generation)
+for what it does and does not cover).
 A state file that still says `running` but whose recorded process is gone (a
 crash) shows the runner as `unknown` with a `runner_not_observed` diagnostic;
 status takes no locks and repairs nothing. The owner stays.
@@ -407,6 +409,68 @@ so `status` reads the same value from any `TZ`; a runner started by a copy of
 this script from before that change shows `runner_not_observed` until it is
 restarted.
 
+### Change tokens: `revision` and `journal_generation`
+
+`status --json` carries two numbers a client can compare between reads to learn
+whether anything changed. They cover different files, and neither covers
+everything. These readings describe this implementation, as of the change that
+added `journal_generation`:
+
+* **`revision`** is the `revision` in `runtime/state.json`. It rises by one with
+  every write of that file: `enroll`, `run` (start and stop), `pause`, `resume`,
+  `stop`, `release`, and the runner recording `last_error`. It covers ownership,
+  pause, the runner's state and error, and the configuration digest. It does
+  **not** move when a delivery record changes (admit, record, `retry`,
+  `recover`, a firing, reconciliation, filing under `done/`, `sweep`), when
+  `config.json` is edited, or when the schedule, `fired/` or `out/` change by
+  hand or by a plain `tick`.
+* **`journal_generation`** is the number in `runtime/journal.gen` (0 when the
+  file is absent), an additive field on the status object. Every write to the
+  delivery journal moves it, each write in two steps: odd while the write is in
+  progress, even again once it is done. The writes it covers: delivery records
+  (admission of an attempt, recording its result, marking a path missing,
+  reconciliation fixes, imports of legacy `out/` entries, `retry`, `recover`, the
+  runner's finalization of an in-flight attempt, and the `out_collision` the
+  standalone tick attaches to a record); a firing (prepared record, `out/` entry,
+  marker, delivery record, prepared record removed, as one bracket);
+  completing, discarding or setting aside a prepared firing in reconciliation;
+  the move of a settled record under `done/`; and the removal of records by
+  `sweep`. It does **not** cover `done/index` (a cache of what the records say;
+  rewriting it changes nothing `status` prints), `config.json`, `state.json`,
+  the schedule, `fired/` or `out/` outside a firing, or the contents of any
+  payload.
+* A client that wants "anything protocol-visible changed" compares both numbers
+  and the `consistent` flag; a number alone says nothing about the other file.
+  Both are observations: equal numbers across two reads say no write went by
+  between them (as far as these files go), not that a later write will not.
+  `journal.gen` is written without fsync (the records it brackets are made
+  durable by their own writes; the number only has to serve readers on the same
+  machine, and fsyncing it would double the cost of every journal write). After a
+  power loss it can read as an older value, so compare it for equality with what
+  you last saw, never for order across a restart of the machine, and treat a
+  snapshot taken before the restart as stale.
+
+`status` takes no lock. It reads `journal.gen` before and after its pass and
+reports `consistent: false` when:
+
+* the number changed between the two reads (`journal_changed_during_read`);
+* the number is odd, so a journal write is in progress or an earlier one did not
+  finish (`journal_write_in_progress`). A crash can leave it odd; the next
+  command that takes the mutation lock (any control command, `tick`, `sweep`, a
+  runner start) settles it, because holding the lock means no writer is alive;
+* the file is not a readable number (`journal_generation_unreadable`); the next
+  journal write replaces it.
+
+Each diagnostic names `runtime/journal.gen`, and a client refreshes before acting,
+as for any `consistent: false`. The existing check on `state.json` stays.
+
+A firing creates its `out/` entry before its delivery record. While it runs the
+prepared record names that path, so `status` does not list the entry as an
+unregistered `legacy_out` delivery (it lists no delivery for it yet, and the
+generation is odd, so the read is `consistent: false` anyway). A prepared record
+left by a crash keeps its entry out of the unregistered list until the next `run`
+completes or discards it.
+
 ## Consumers and deliveries
 
 A *delivery* is one directory in `out/`. A *consumer* is whatever you configure
@@ -495,6 +559,15 @@ into `out/`, marked in `fired/`, recorded as a pending delivery, and only then
 is the prepared record removed. Each step can be redone or finished by the next
 `run`. The `.landing` names of the passive tick never appear for these.
 Standalone `tick` keeps its legacy behavior.
+
+A fired one-shot's marker records the source generation, and the journaled tick
+removes a one-shot whose marker exists only if its directory still has that
+generation. Say a crash left the marker without the removal and the operator then
+put a new `schedule/once/<item>/` in place the same day: the recovery step and
+every later tick leave the replacement alone (the runner logs it once). A marker
+without a recorded generation (the standalone tick's, or one written before this
+was recorded) keeps the legacy rule, so its one-shot is removed. The standalone
+tick itself is unchanged.
 
 **Terminal records and the lock (implementation reading).** Not part of the
 accepted contract's interface; `status --json` shows the same deliveries as
@@ -827,9 +900,13 @@ script answers `capabilities` with its ordinary `unknown command` error (exit 1)
   `consumer.config_digest` is the SHA-256 of the file the last `run` froze.
   Secrets (the owner token verifier, consumer argv and environment) are never
   printed.
+* `journal_generation` is an additive field: the change token for the delivery
+  journal (see [Change tokens](#change-tokens-revision-and-journal_generation)).
 * `consistent` is `false`, with `diagnostics`, when `state.json` or a delivery
-  record is unreadable, malformed or of an unsupported `schema_version`, or when
-  `state.json` changes while status reads it. An unusable `state.json` also
+  record is unreadable, malformed or of an unsupported `schema_version`, when
+  `state.json` changes while status reads it, or when the delivery journal
+  changes, is mid-write or has an unreadable generation (`journal_changed_during_read`,
+  `journal_write_in_progress`, `journal_generation_unreadable`). An unusable `state.json` also
   shows the runner as `unknown`, owner `null`, and adds `invalid_state` to every
   item's `blocked_by`. A bad `config.json` only sets `consumer.valid: false`.
   An `out_collision`, a `firing_reconciliation_error`, an
