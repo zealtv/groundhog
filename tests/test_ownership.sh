@@ -304,6 +304,17 @@ wait "$HOLD_PID" 2>/dev/null || true
 status_to "$out"
 assert_eq "the busy commands changed nothing" false "$(jget "$out" paused)"
 
+# --- the installer leaves an owned instance alone ----------------------------
+mkdir -p "$T_TMP/host"
+"$TEST_BASH" "$T_REPO_DIR/install.sh" "$T_TMP/host" >/dev/null 2>&1
+new_token_path
+"$TEST_BASH" "$T_TMP/host/.groundhog/groundhog.sh" enroll --owner-label inst --token-file "$TOK" >/dev/null 2>&1
+before="$(cat "$T_TMP/host/.groundhog/runtime/state.json")"
+rc=0; "$TEST_BASH" "$T_REPO_DIR/install.sh" "$T_TMP/host" >"$out.o" 2>"$out.e" || rc=$?
+assert_eq "re-running the installer on an owned instance exits 0" 0 "$rc"
+assert_contains "...and says it left it alone" "$(cat "$out.e")" "left untouched"
+assert_eq "...and did not touch the runtime state" "$before" "$(cat "$T_TMP/host/.groundhog/runtime/state.json")"
+
 # --- legacy behavior stays ---------------------------------------------------
 new_instance
 gh init >/dev/null
