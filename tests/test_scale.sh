@@ -186,6 +186,25 @@ barrier_case "an unresolved record misfiled in done/" damage_inflight nodiag
 barrier_case "a record present in deliveries/ and done/" damage_duplicate
 assert_true "...and neither copy was overwritten" test -f "$GHD/runtime/deliveries/d-00000001.json"
 
+# A listing of done/ that fails must not read as "nothing is filed": the filed
+# deliveries' out/ entries would look unclaimed and be imported (and delivered)
+# a second time. A find that fails is simulated with a shim on PATH.
+plain_consumer "$FAST"
+make_records runtime/deliveries 3 accepted
+run_once
+assert_true "three records are filed" done_is 3
+mkdir -p "$T_TMP/failfind"
+printf '#!/bin/sh\nexit 1\n' > "$T_TMP/failfind/find"; chmod +x "$T_TMP/failfind/find"
+mkdir -p "$GHD/out/waiting"; echo w > "$GHD/out/waiting/f"
+saved_path="$PATH"; PATH="$T_TMP/failfind:$PATH"
+run_once 2.5
+PATH="$saved_path"
+assert_eq "a failing listing of done/ imports nothing" 0 "$(live_count)"
+assert_eq "...and hands nothing off" 0 "$(lines "$INST/calls.txt")"
+assert_contains "...and the runner says why" "$(cat "$RUN_ERR")" "could not list"
+run_once 2.5
+assert_eq "once the listing works the waiting entry is imported and handed off" 1 "$(lines "$INST/calls.txt")"
+
 # release refuses on an unreadable filed record (unreadable evidence is never "resolved")
 plain_consumer "$FAST"
 make_records runtime/deliveries 2 accepted

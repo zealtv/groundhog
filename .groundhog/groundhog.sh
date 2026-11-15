@@ -1592,6 +1592,7 @@ delivery_collision_diags() {
 
 # status_record FILE REL — read one record file for status: its JSON joins
 # DELIVERIES, or a diagnostic says why it cannot.
+LIVE_IDS=""      # US-delimited ids listed from deliveries/ (a record the runner files meanwhile is not listed twice)
 status_record() {
   local f="$1" rel="$2" stem
   stem="${f##*/}"; stem="${stem%.json}"
@@ -1612,6 +1613,7 @@ status_record() {
   fi
   DELIVERIES+=("$JR")
   REG_LIST+="$US$DEL_PATH$US"
+  LIVE_IDS+="$US$stem$US"
   delivery_collision_diags "$DEL_PATH"
   case "$DEL_STATE" in
     pending|in_flight|failed|uncertain)
@@ -1624,7 +1626,7 @@ status_record() {
 }
 
 inspect_deliveries() {
-  local dir="$GH_DIR/runtime/deliveries" f entry name key i
+  local dir="$GH_DIR/runtime/deliveries" f entry name key i stem
   shopt -s nullglob
   for f in "$dir"/*.json; do
     status_record "$f" "runtime/deliveries/${f##*/}"
@@ -1635,11 +1637,19 @@ inspect_deliveries() {
   # parsed again; any other is read exactly like a record in deliveries/.
   DN_DIR="$dir/done"; DN_LAST=""
   done_classify
+  if (( DN_LISTING_BAD )); then
+    CONSISTENT=0
+    diag_add delivery_record_unreadable "runtime/deliveries/done/ could not be listed reliably; refresh before acting" "runtime/deliveries/done"
+  fi
   for (( i = 0; i < ${#DN_KEY[@]}; i++ )); do
+    key="${DN_KEY[i]#./}"
+    [[ "$LIVE_IDS" != *"$US${key%.json}$US"* ]] || continue
     DELIVERIES+=("${DN_VIEW[i]}")
     REG_LIST+="$US${DN_PATH[i]}$US"
   done
   for key in ${DN_TODO[@]+"${DN_TODO[@]}"}; do
+    stem="${key#./}"; stem="${stem%.json}"
+    [[ "$LIVE_IDS" != *"$US$stem$US"* ]] || continue
     status_record "$DN_DIR/${key#./}" "runtime/deliveries/done/${key#./}"
   done
   for key in ${DN_DUP[@]+"${DN_DUP[@]}"}; do
@@ -2396,6 +2406,7 @@ unresolved_attempt_exists() {
   # Filed records are settled; only ones the cache does not vouch for are read.
   DN_DIR="$RT_DIR/deliveries/done"; DN_LAST=""
   done_classify
+  (( ! DN_LISTING_BAD )) || return 0
   (( ${#DN_DUP[@]} == 0 )) || return 0
   for key in ${DN_TODO[@]+"${DN_TODO[@]}"}; do
     if ! drec_load "$DN_DIR/${key#./}" || drec_unresolved; then return 0; fi
@@ -2824,12 +2835,14 @@ DN_DUP=()                     # files that also exist in deliveries/
 DN_BADN=0                     # records in done/ that failed the barrier closed
 DN_LAST=""                    # the scan the arrays above describe (runner only)
 DN_DIRTY=0                    # the index needs rewriting
+DN_LISTING_BAD=0              # the listing of done/ disagrees with the directory
 
 # done_classify — scan done/ (one find, one stat, no parse) and sort each file
 # into trusted (DN_*), to-parse (DN_TODO) or duplicate (DN_DUP). A scan equal
 # to the previous one reuses the previous arrays untouched.
 done_classify() {
-  local scan="" joined="" idx key ino size mtime mode xi xs xm xo xstate xpath xview sig t1 t2
+  local scan="" joined="" idx key ino size mtime mode xi xs xm xo xstate xpath xview sig f n_dir=0 n_scan=0 n_join=0
+  DN_LISTING_BAD=0
   if [[ ! -d "$DN_DIR" ]]; then
     DN_KEY=(); DN_SIG=(); DN_STATE=(); DN_PATH=(); DN_VIEW=(); DN_TODO=(); DN_TODO_SIG=(); DN_DUP=()
     DN_BADN=0; DN_LAST=""
@@ -2837,6 +2850,18 @@ done_classify() {
   fi
   stat_init
   scan="$( cd -- "$DN_DIR" 2>/dev/null && find . -maxdepth 1 -name '*.json' -exec stat "${STAT_ARGS[@]}" "$STAT_NAME$US$STAT_FMT" {} + 2>/dev/null | LC_ALL=C sort )" || scan=""
+  # The listing is the only evidence of what is filed, so it is checked against
+  # a plain glob: a find, stat or sort that failed must not read as "nothing is
+  # filed" (every filed delivery's out/ entry would look unclaimed).
+  shopt -s nullglob
+  for f in "$DN_DIR"/*.json; do n_dir=$((n_dir + 1)); done
+  shopt -u nullglob
+  if [[ -n "$scan" ]]; then n_scan="$(printf '%s\n' "$scan" | wc -l)"; fi
+  if (( n_scan != n_dir )); then
+    DN_KEY=(); DN_SIG=(); DN_STATE=(); DN_PATH=(); DN_VIEW=(); DN_TODO=(); DN_TODO_SIG=(); DN_DUP=()
+    DN_BADN=0; DN_LAST=""; DN_LISTING_BAD=1
+    return 0
+  fi
   if [[ -n "$DN_LAST" && "$scan" == "$DN_LAST" ]]; then return 0; fi
   DN_KEY=(); DN_SIG=(); DN_STATE=(); DN_PATH=(); DN_VIEW=(); DN_TODO=(); DN_TODO_SIG=(); DN_DUP=()
   DN_BADN=0; DN_LAST="$scan"
@@ -2844,10 +2869,12 @@ done_classify() {
   idx="$DN_DIR/index"
   if [[ ! -f "$idx" || -L "$idx" ]]; then idx=/dev/null; fi
   joined="$( LC_ALL=C join -t "$US" -a 1 -e '' -o 1.1,1.2,1.3,1.4,1.5,2.2,2.3,2.4,2.5,2.6,2.7,2.8 <(printf '%s\n' "$scan") "$idx" 2>/dev/null )" || joined=""
-  t1="$(printf '%s\n' "$scan" | wc -l)"; t2="$(printf '%s\n' "$joined" | wc -l)"
-  if (( t1 != t2 )); then
+  n_join="$(printf '%s\n' "$joined" | wc -l)"
+  if (( n_scan != n_join )); then
     # join lost a line (an index it could not merge): trust nothing from it
     joined="$( LC_ALL=C join -t "$US" -a 1 -e '' -o 1.1,1.2,1.3,1.4,1.5,2.2,2.3,2.4,2.5,2.6,2.7,2.8 <(printf '%s\n' "$scan") /dev/null 2>/dev/null )" || joined=""
+    n_join="$(printf '%s\n' "$joined" | wc -l)"
+    if (( n_scan != n_join )); then DN_LISTING_BAD=1; DN_LAST=""; return 0; fi
   fi
   while IFS="$US" read -r key ino size mtime mode xi xs xm xo xstate xpath xview; do
     [[ -n "$key" ]] || continue
@@ -3083,6 +3110,10 @@ recon_scan() {
   if (( ! CFG_PRESENT )); then want=no_consumer; fi
   DN_DIR="$RT_DIR/deliveries/done"
   done_classify
+  if (( DN_LISTING_BAD )); then
+    IX_BAD=$((IX_BAD + 1))
+    runner_log "could not list runtime/deliveries/done/ reliably; every consumer admission is blocked and no out/ entry is imported until it can be"
+  fi
   done_parse_runner
   for (( k = 0; k < ${#DN_KEY[@]}; k++ )); do
     f="${DN_KEY[k]#./}"
@@ -3115,7 +3146,7 @@ recon_scan() {
   # origin legacy_out and an unknown occurrence (metadata only: nothing is
   # marked handed off). A name that is not valid UTF-8 would be stored lossily
   # and imported again every cycle, so it is reported and left alone.
-  out_unclaimed "$RECON_CLAIMED"
+  if (( ! DN_LISTING_BAD )); then out_unclaimed "$RECON_CLAIMED"; else UNCL_SET=""; fi
   for entry in "$OUT"/*; do
     [[ -n "$UNCL_SET" ]] || break
     [[ -d "$entry" ]] || continue
