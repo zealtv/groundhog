@@ -328,4 +328,3 @@ directories under `$TMPDIR` and never touch a real schedule. To test a chosen
 moment they put a `date` shim first on `PATH`, so the script needs no test hook.
 New tests: add `tests/test_<area>.sh`, source `tests/lib.sh`, and finish with
 `t_finish`.
-
