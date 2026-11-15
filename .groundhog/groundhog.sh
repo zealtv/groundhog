@@ -2608,17 +2608,21 @@ jgen_load() {
   return 0
 }
 
-# jgen_put N — store N. A file that already holds one fixed-width number is
-# overwritten in place (a single short write, no truncation, so a reader never
-# sees it empty); anything else is replaced atomically.
+# jgen_put N — store N, without fsync. The generation exists for the readers on
+# this machine (status, which takes no lock), and the page cache serves them at
+# once; the records it brackets are made durable by their own writes. A power
+# loss can therefore leave it at an older value (see the README). A file that
+# already holds one fixed-width number is overwritten in place (a single short
+# write, no truncation, so a reader never sees it empty); anything else is
+# replaced by a rename.
 jgen_put() {
-  local v f="$RT_DIR/journal.gen"
+  local v f="$RT_DIR/journal.gen" tmp="$RT_DIR/.journal.gen.$$.tmp"
   printf -v v '%018d' "$1"
   if (( JGEN_PLAIN )) && [[ -f "$f" ]]; then
     printf '%s\n' "$v" 1<>"$f" 2>/dev/null || return 1
-    rt_fsync "$f" || return 1
   else
-    rt_atomic_write "$f" "$v" || return 1
+    printf '%s\n' "$v" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; return 1; }
     JGEN_PLAIN=1
   fi
   return 0

@@ -443,9 +443,12 @@ added `journal_generation`:
   and the `consistent` flag; a number alone says nothing about the other file.
   Both are observations: equal numbers across two reads say no write went by
   between them (as far as these files go), not that a later write will not.
-  After a power loss `journal.gen` can read as an older value; compare it for
-  equality with what you last saw, never for order across a restart of the
-  machine.
+  `journal.gen` is written without fsync (the records it brackets are made
+  durable by their own writes; the number only has to serve readers on the same
+  machine, and fsyncing it would double the cost of every journal write). After a
+  power loss it can read as an older value, so compare it for equality with what
+  you last saw, never for order across a restart of the machine, and treat a
+  snapshot taken before the restart as stale.
 
 `status` takes no lock. It reads `journal.gen` before and after its pass and
 reports `consistent: false` when:
