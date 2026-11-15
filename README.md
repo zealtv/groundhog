@@ -271,13 +271,25 @@ script answers `capabilities` with its ordinary `unknown command` error (exit 1)
   relative to the instance, so same-named items at different paths stay
   distinct), `item_id` (the last path component, verbatim), `paused_by` (the
   `.paused` components above or at the item), `eligible_now`, `fired_marker`,
-  `fired`, `firing_allowed` and `blocked_by`. `eligible_now` and `fired_marker`
+  `fired`, `firing_allowed`, `blocked_by` and `cadence`. `eligible_now` and `fired_marker`
   come from the same `walk_due` and `fired_marker_for` that `tick` and `due` use,
   so they agree with `due` at any moment. `fired_marker` names the marker for
   the occurrence due right now and is `null` when none is. Paths the schedule
   grammar rejects are listed in `diagnostics` (the ones `lint` reports); an item
   that `tick` would nonetheless fire is also listed, because status says what
   `tick` would do.
+* `cadence` is an additive, structured description of when the item recurs,
+  taken from the components the schedule grammar matched (a client never parses
+  `path`): `{"axis","day","date","time","interval","defaulted"}`, every key
+  always present. `axis` is `daily`, `weekly`, `monthly`, `yearly`, `once` or
+  `every`. `day` is `mon`..`sun` (weekly) or the day of month as a string such as
+  `"15"` (monthly). `date` is `"MM-DD"` (yearly) or `"YYYY-MM-DD"` (once).
+  `time` is local `"HH:MM"` (`09` reads `"09:00"`) or `null`. `interval` is
+  `"15m"`/`"3h"` (every). Unused fields are `null`. `defaulted` is `true` when
+  the axis root supplied the default: weekly `mon`, monthly `"1"`, yearly
+  `"01-01"`, and once with `date: null` meaning the next tick. The whole object
+  is `null` for an item that `tick` would fire but the grammar does not
+  recognize. Paused items keep their cadence.
 * `deliveries` lists the records under `runtime/deliveries/` plus, read-only,
   every other directory in `out/` as `origin: "legacy_out"`, state `pending`,
   reason `unregistered`, `id: null`. Status registers nothing.
@@ -316,4 +328,3 @@ directories under `$TMPDIR` and never touch a real schedule. To test a chosen
 moment they put a `date` shim first on `PATH`, so the script needs no test hook.
 New tests: add `tests/test_<area>.sh`, source `tests/lib.sh`, and finish with
 `t_finish`.
-

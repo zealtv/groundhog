@@ -4,7 +4,10 @@
 `gh-inspection-api` stitch (2026-11-15), `groundhog.sh capabilities --json` and
 `groundhog.sh status --json` exist and advertise `status-json-v1` only. Every
 other command and runtime file specified here, and the other five capabilities,
-remain unimplemented. This document records the accepted interface; it does not
+remain unimplemented. Each schedule record of `status --json` also carries an
+additive `cadence` object (see [README.md](../README.md#inspection)); clients
+ignore unknown fields, so the contract's required fields are unchanged. This
+document records the accepted interface; it does not
 enable a runner. The existing commands in [README.md](../README.md) remain the
 current passive interface. Basis: the source `groundhog.sh` and Easyhog's
 `docs/design.md` and ownership/ordinary-consumer findings, read on 2026-11-15.

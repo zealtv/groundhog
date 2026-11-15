@@ -514,18 +514,22 @@ cmd_list() {
 # The same grammar serves `status --json`. Two globals widen the walk:
 #   LINT_INCLUDE_PAUSED=1  descend into .paused components (matching their
 #                          names with the suffix stripped) instead of skipping
-#   LINT_ITEMS / LINT_ITEM_PAUSED  every recognized item directory, and the
-#                          paused components above it (US-separated)
+#   LINT_ITEMS / LINT_ITEM_PAUSED / LINT_ITEM_CAD  every recognized item
+#                          directory, the paused components above it, and its
+#                          cadence parts (axis=…, dow=…, time=…; US-separated)
 # `lint` leaves LINT_INCLUDE_PAUSED at 0, so its behavior is unchanged.
 LINT_ORPHANS=()
 LINT_ITEMS=()
 LINT_ITEM_PAUSED=()
+LINT_ITEM_CAD=()
 LINT_INCLUDE_PAUSED=0
+US=$'\x1f'          # separator inside parsed-JSON keys and path lists
 
 lint_walk() {
   local dir="$1"
   local state="$2"
   local paused_by="${3:-}"
+  local cad="${4:-}"
   local entry name eff paused_now
   shopt -s nullglob
   for entry in "$dir"/*; do
@@ -541,51 +545,51 @@ lint_walk() {
 
     case "$state" in
       axis-daily)
-        if   is_hh "$eff" || is_hm "$eff"; then lint_walk "$entry" "item-only" "$paused_now"
-        elif is_id "$eff"; then lint_item "$entry" "$paused_now"
+        if   is_hh "$eff" || is_hm "$eff"; then lint_walk "$entry" "item-only" "$paused_now" "$cad${cad:+$US}time=$eff"
+        elif is_id "$eff"; then lint_item "$entry" "$paused_now" "$cad"
         else LINT_ORPHANS+=("$entry"); fi
         ;;
       axis-weekly)
-        if   is_dow "$eff"; then lint_walk "$entry" "weekly-dow" "$paused_now"
-        elif is_hh  "$eff" || is_hm "$eff"; then lint_walk "$entry" "item-only" "$paused_now"
-        elif is_id  "$eff"; then lint_item "$entry" "$paused_now"
+        if   is_dow "$eff"; then lint_walk "$entry" "weekly-dow" "$paused_now" "$cad${cad:+$US}dow=$eff"
+        elif is_hh  "$eff" || is_hm "$eff"; then lint_walk "$entry" "item-only" "$paused_now" "$cad${cad:+$US}time=$eff"
+        elif is_id  "$eff"; then lint_item "$entry" "$paused_now" "$cad"
         else LINT_ORPHANS+=("$entry"); fi
         ;;
       axis-monthly)
-        if   is_dom "$eff"; then lint_walk "$entry" "param-with-hour-or-item" "$paused_now"
-        elif is_hh  "$eff" || is_hm "$eff"; then lint_walk "$entry" "item-only" "$paused_now"
-        elif is_id  "$eff"; then lint_item "$entry" "$paused_now"
+        if   is_dom "$eff"; then lint_walk "$entry" "param-with-hour-or-item" "$paused_now" "$cad${cad:+$US}dom=$eff"
+        elif is_hh  "$eff" || is_hm "$eff"; then lint_walk "$entry" "item-only" "$paused_now" "$cad${cad:+$US}time=$eff"
+        elif is_id  "$eff"; then lint_item "$entry" "$paused_now" "$cad"
         else LINT_ORPHANS+=("$entry"); fi
         ;;
       axis-yearly)
         # HH-MM forbidden at yearly root — would collide with MM-DD shape.
-        if   is_md "$eff"; then lint_walk "$entry" "param-with-hour-or-item" "$paused_now"
-        elif is_hh "$eff"; then lint_walk "$entry" "item-only" "$paused_now"
-        elif is_id "$eff"; then lint_item "$entry" "$paused_now"
+        if   is_md "$eff"; then lint_walk "$entry" "param-with-hour-or-item" "$paused_now" "$cad${cad:+$US}md=$eff"
+        elif is_hh "$eff"; then lint_walk "$entry" "item-only" "$paused_now" "$cad${cad:+$US}time=$eff"
+        elif is_id "$eff"; then lint_item "$entry" "$paused_now" "$cad"
         else LINT_ORPHANS+=("$entry"); fi
         ;;
       axis-once)
-        if   is_ymd "$eff"; then lint_walk "$entry" "param-with-hour-or-item" "$paused_now"
-        elif is_hh  "$eff" || is_hm "$eff"; then lint_walk "$entry" "item-only" "$paused_now"
-        elif is_id  "$eff"; then lint_item "$entry" "$paused_now"
+        if   is_ymd "$eff"; then lint_walk "$entry" "param-with-hour-or-item" "$paused_now" "$cad${cad:+$US}ymd=$eff"
+        elif is_hh  "$eff" || is_hm "$eff"; then lint_walk "$entry" "item-only" "$paused_now" "$cad${cad:+$US}time=$eff"
+        elif is_id  "$eff"; then lint_item "$entry" "$paused_now" "$cad"
         else LINT_ORPHANS+=("$entry"); fi
         ;;
       axis-every)
         # every/ requires a bucket; bare items at axis root are orphans.
-        if   is_interval "$eff"; then lint_walk "$entry" "every-bucket" "$paused_now"
+        if   is_interval "$eff"; then lint_walk "$entry" "every-bucket" "$paused_now" "$cad${cad:+$US}interval=$eff"
         else LINT_ORPHANS+=("$entry"); fi
         ;;
       every-bucket)
-        if is_id "$eff"; then lint_item "$entry" "$paused_now"
+        if is_id "$eff"; then lint_item "$entry" "$paused_now" "$cad"
         else LINT_ORPHANS+=("$entry"); fi
         ;;
       weekly-dow|param-with-hour-or-item)
-        if   is_hh "$eff" || is_hm "$eff"; then lint_walk "$entry" "item-only" "$paused_now"
-        elif is_id "$eff"; then lint_item "$entry" "$paused_now"
+        if   is_hh "$eff" || is_hm "$eff"; then lint_walk "$entry" "item-only" "$paused_now" "$cad${cad:+$US}time=$eff"
+        elif is_id "$eff"; then lint_item "$entry" "$paused_now" "$cad"
         else LINT_ORPHANS+=("$entry"); fi
         ;;
       item-only)
-        if is_id "$eff"; then lint_item "$entry" "$paused_now"
+        if is_id "$eff"; then lint_item "$entry" "$paused_now" "$cad"
         else LINT_ORPHANS+=("$entry"); fi
         ;;
     esac
@@ -597,6 +601,7 @@ lint_walk() {
 lint_item() {
   LINT_ITEMS+=("$1")
   LINT_ITEM_PAUSED+=("$2")
+  LINT_ITEM_CAD+=("$3")
 }
 
 # Fill LINT_ORPHANS / LINT_ITEMS / LINT_ITEM_PAUSED from schedule/.
@@ -605,6 +610,7 @@ lint_scan() {
   LINT_ORPHANS=()
   LINT_ITEMS=()
   LINT_ITEM_PAUSED=()
+  LINT_ITEM_CAD=()
   local axis_dir name eff paused_now
   shopt -s nullglob
   for axis_dir in "$SCHED"/*; do
@@ -618,12 +624,12 @@ lint_scan() {
       paused_now="$axis_dir"
     fi
     case "$eff" in
-      daily)   lint_walk "$axis_dir" "axis-daily"   "$paused_now" ;;
-      weekly)  lint_walk "$axis_dir" "axis-weekly"  "$paused_now" ;;
-      monthly) lint_walk "$axis_dir" "axis-monthly" "$paused_now" ;;
-      yearly)  lint_walk "$axis_dir" "axis-yearly"  "$paused_now" ;;
-      once)    lint_walk "$axis_dir" "axis-once"    "$paused_now" ;;
-      every)   lint_walk "$axis_dir" "axis-every"   "$paused_now" ;;
+      daily)   lint_walk "$axis_dir" "axis-daily"   "$paused_now" "axis=daily" ;;
+      weekly)  lint_walk "$axis_dir" "axis-weekly"  "$paused_now" "axis=weekly" ;;
+      monthly) lint_walk "$axis_dir" "axis-monthly" "$paused_now" "axis=monthly" ;;
+      yearly)  lint_walk "$axis_dir" "axis-yearly"  "$paused_now" "axis=yearly" ;;
+      once)    lint_walk "$axis_dir" "axis-once"    "$paused_now" "axis=once" ;;
+      every)   lint_walk "$axis_dir" "axis-every"   "$paused_now" "axis=every" ;;
       *)       LINT_ORPHANS+=("$axis_dir") ;;
     esac
   done
@@ -723,7 +729,6 @@ GH_IMPLEMENTATION_VERSION="dev"
 # and durability tools; the consumer stitch adds consumer-v1 and delivery-v1.
 GH_CAPABILITIES=("status-json-v1")
 
-US=$'\x1f'          # separator inside parsed-JSON keys and path lists
 JSON_LOSSY=0        # set when json_str had to replace bytes that are not UTF-8
 JSTR=""
 JR=""
@@ -1412,11 +1417,57 @@ inspect_deliveries() {
 # --- schedule ----------------------------------------------------------------
 SCHEDULE=()
 
+# cadence_json PARTS — JR is the item's cadence as a structured object, built
+# from the components the grammar walk matched (never by re-parsing the path):
+#   axis      daily | weekly | monthly | yearly | once | every
+#   day       weekly: mon..sun; monthly: day of month "1".."31"; else null
+#   date      yearly: "MM-DD"; once: "YYYY-MM-DD"; else null
+#   time      "HH:MM" local when the path names one, else null
+#   interval  every: "<N>m" or "<N>h"; else null
+#   defaulted true when the axis root supplied a default: weekly→mon,
+#             monthly→1, yearly→01-01, once→next tick (date null)
+# PARTS empty (an item the grammar did not recognize) gives null.
+cadence_json() {
+  local parts=() part axis="" day="" date="" time="" interval="" defaulted=false
+  if [[ -z "$1" ]]; then JR=null; return 0; fi
+  IFS="$US" read -r -a parts <<< "$1"
+  for part in "${parts[@]}"; do
+    case "$part" in
+      axis=*)     axis="${part#axis=}" ;;
+      dow=*)      day="${part#dow=}" ;;
+      dom=*)      day="${part#dom=}" ;;
+      md=*)       date="${part#md=}" ;;
+      ymd=*)      date="${part#ymd=}" ;;
+      interval=*) interval="${part#interval=}" ;;
+      time=*)
+        time="${part#time=}"
+        [[ "$time" == *-* ]] && time="${time/-/:}" || time="$time:00"
+        ;;
+    esac
+  done
+  case "$axis" in
+    weekly)  [[ -n "$day" ]]  || { day=mon; defaulted=true; } ;;
+    monthly) [[ -n "$day" ]]  || { day=1; defaulted=true; } ;;
+    yearly)  [[ -n "$date" ]] || { date=01-01; defaulted=true; } ;;
+    once)    [[ -n "$date" ]] || defaulted=true ;;
+  esac
+  local f v out=""
+  for f in axis day date time interval; do
+    case "$f" in
+      axis) v="$axis" ;; day) v="$day" ;; date) v="$date" ;;
+      time) v="$time" ;; interval) v="$interval" ;;
+    esac
+    if [[ -n "$v" ]]; then json_str "$v"; v="$JSTR"; else v=null; fi
+    out+="${out:+,}\"$f\":$v"
+  done
+  JR="{$out,\"defaulted\":$defaulted}"
+}
+
 inspect_schedule() {
   local now_t due_text name src is_once slot k p rel marker marker_rel due_idx i
   local paused_list part paused_json bb fired eligible allowed marker_json
   local item_paths=() item_pauses=() due_src=() due_slot=() found o
-  local parts=()
+  local parts=() item_cads=() cad_json
   now_t="$(now_today)"
 
   LINT_INCLUDE_PAUSED=1
@@ -1427,6 +1478,7 @@ inspect_schedule() {
   done
   item_paths=(${LINT_ITEMS[@]+"${LINT_ITEMS[@]}"})
   item_pauses=(${LINT_ITEM_PAUSED[@]+"${LINT_ITEM_PAUSED[@]}"})
+  item_cads=(${LINT_ITEM_CAD[@]+"${LINT_ITEM_CAD[@]}"})
 
   # Due logic comes from the script's own walk_due, exactly as tick and due
   # use it; this function only asks which items it emitted.
@@ -1447,6 +1499,7 @@ inspect_schedule() {
       # (for example a name with a space). Report it as the item it is.
       item_paths+=("$src")
       item_pauses+=("")
+      item_cads+=("")
     fi
   done <<< "$due_text"
 
@@ -1490,9 +1543,10 @@ inspect_schedule() {
     allowed=false
     [[ -z "$bb" ]] && allowed=true
 
+    cadence_json "${item_cads[k]}"; cad_json="$JR"
     json_str "$rel"; local path_json="$JSTR"
     json_str "${p##*/}"; local id_json="$JSTR"
-    SCHEDULE+=("{\"path\":$path_json,\"item_id\":$id_json,\"paused_by\":[$paused_json],\"eligible_now\":$eligible,\"fired_marker\":$marker_json,\"fired\":$fired,\"firing_allowed\":$allowed,\"blocked_by\":[$bb]}")
+    SCHEDULE+=("{\"path\":$path_json,\"item_id\":$id_json,\"cadence\":$cad_json,\"paused_by\":[$paused_json],\"eligible_now\":$eligible,\"fired_marker\":$marker_json,\"fired\":$fired,\"firing_allowed\":$allowed,\"blocked_by\":[$bb]}")
   done
   LINT_INCLUDE_PAUSED=0
 }
