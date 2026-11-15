@@ -201,19 +201,24 @@ change, process-name match or stopped external supervisor transfers ownership.
 An unenrolled instance has no owner and cannot run. Enrollment does not remove
 pause or adopt pending out entries as accepted.
 
-A supervisor creates a new session token only on an explicit user request to
-enroll an unowned, compatible selected instance. It may then explicitly resume
-and run under that token. For its own paused instance, an explicit start action
-may resume it. Reopening a supervisor must not silently enroll, reuse persisted
-tokens or start work. An external owner remains external even when stopped.
-Control actions require this supervisor session to hold the matching token;
-discovery or recognized application identity grants no exception.
+Enrollment requires an explicit `enroll` request for an unowned, compatible
+instance. The caller may be a previously authorized noninteractive script or
+service; no new foreground human action is required for each session. An owner
+may retain and reuse its valid private token across its own restarts and invoke
+`run` under that authorization. Token identity, secret and generation are still
+validated for every control command. `run` never clears pause: resuming requires
+an explicit `resume` command. Discovery alone never enrolls or grants control,
+and recognized application identity grants no exception. An external owner
+remains external even when stopped.
 
-On clean supervisor shutdown: stop each owned runner, wait for the stop barrier,
-then release ownership and delete its session token. Do not clear persistent
-pause. If stop/release fails, report the retained owner and keep its token
-instead of claiming cleanup. An uncertain enrollment likewise retains its token
-until read-only reconciliation above establishes its disposition.
+`stop` retains ownership. An owner may deliberately remain stopped but owned,
+keeping its token for later authorized control. To end ownership, explicitly
+`release` after safe stop and reconciliation of unresolved attempts, then delete
+the invalidated private token. Shutdown does not itself require release or
+clear persistent pause. If a requested stop/release fails, report the retained
+owner and keep its token instead of claiming cleanup. An uncertain enrollment
+likewise retains its token until read-only reconciliation above establishes its
+disposition; prior service authorization does not bypass that reconciliation.
 A crash leaves ownership retained and must be shown as owned with liveness
 unknown or stopped. A supervisor that still holds the matching token may stop,
 recover outstanding attempts and release. Lost-token ownership requires a
@@ -222,9 +227,16 @@ resolve ambiguous attempts, invalidate the old owner and advance generation.
 There is deliberately no automatic takeover command in v1. Never delete a lock
 file merely because a PID looks absent.
 
-Easyhog is one ordinary client of these rules: its explicit Play, Pause and Quit
-actions map to the same enrollment, resume/run, pause and shutdown protocol.
-It receives no extra authority or lifecycle exemption.
+Easyhog is one ordinary client with a session policy: explicit Play enrolls an
+unowned compatible instance, or resumes/runs one whose token that session holds.
+On reopen, it does not reuse persisted tokens or start work; explicit Play is
+required, and a retained external owner still prevents enrollment. On clean
+Quit it stops its owned runners, waits for the stop barrier, then releases and
+deletes tokens only after successful safe cleanup. Failed stop/release or an
+unresolved enrollment retains the token and reports the incomplete cleanup.
+These are client choices implemented entirely through the same generic
+primitives, not privileged protocol semantics or exemptions. Core behavior never
+branches on the client's name.
 
 Use OS-released advisory exclusion, with one runner lock held for the runner's
 lifetime and a separate short-lived mutation lock serializing all upgraded
@@ -603,6 +615,8 @@ GH=/example/project/.groundhog/groundhog.sh
 # From a second terminal holding the same session token:
 "$GH" pause --token-file /example/session/owner-token
 "$GH" stop --token-file /example/session/owner-token
+# Stop retains ownership; a service may keep this token for later authorized run.
+# To end ownership, explicitly release after safe stop/reconciliation:
 "$GH" release --token-file /example/session/owner-token
 # Ownership is absent again; global pause remains true.
 ```
@@ -623,7 +637,10 @@ GH=/example/project/.groundhog/groundhog.sh
 | Stop, establish A finished and durable acceptance, recover d-demo-3 with decision accept | uncertain → accepted with decision, no consumer invocation; accepted independent work may continue; next explicit run can admit B if no other unresolved attempt. |
 | Stop, establish A finished and reconcile side effects, recover d-demo-3 with decision retry | uncertain → pending; next explicit run may create a new attempt if no other unresolved invocation. |
 | External supervisor stops without release | owner retained, runner stopped; other supervisor enroll fails 3. |
-| Supervisor shuts down cleanly, reopen viewer | No owner, runner stopped, pause retained; no auto-enrollment or start. |
+| Authorized service stops without release, then restarts with its valid token and invokes run | Same owner/generation; pause retained; no re-enrollment required; unresolved handoff barrier still applies. |
+| Authorized service explicitly enrolls an unowned instance and invokes run | Same authorization checks as any caller; no foreground human session required; run does not clear pause. |
+| Owner stops, reconciles unresolved attempts, explicitly releases | No owner, runner stopped, pause retained; old token invalidated. |
+| Easyhog clean Quit completes stop/release, then reopen | No owner, runner stopped, pause retained; this client's policy requires explicit Play and does not reuse persisted tokens. |
 
 Enrollment failure examples (no new command is needed):
 
@@ -655,7 +672,8 @@ must not reuse those directory-creating code paths for inspection.
 Decisions for Bob before implementation: persistent ownership with manual
 lost-token repair; explicit configured argv rather than an automatic hook;
 exit-zero acceptance (synchronous completion or durable delegation) rather than
-stdout JSON; retained payloads and manual retries/recovery; cooperative local locking and no mixed-version pause
-guarantee; upgraded standalone tick refusal while owned; and clean supervisor
-release only after unresolved handoffs have been reconciled. No dependent
-runtime implementation is authorized by this document.
+stdout JSON; retained payloads and manual retries/recovery; cooperative local
+locking and no mixed-version pause guarantee; upgraded standalone tick refusal
+while owned; and explicit release only after safe stop and reconciliation of
+unresolved handoffs. No dependent runtime implementation is authorized by this
+document.
