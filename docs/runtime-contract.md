@@ -1,16 +1,20 @@
 # Optional runtime contract — accepted v1 design
 
-**Design accepted by Bob on 2026-11-15; partly implemented.** As of the
-`gh-runner-lifecycle` stitch (2026-11-15), `capabilities --json`, `status --json`,
-`enroll`, `run`, `pause`, `resume`, `stop` and `release` exist, and the upgraded
-`tick`, `init`, `add`, `drop` and `sweep` follow the lock, ownership and pause
-rules here. `capabilities` advertises `status-json-v1` everywhere and
-`ownership-v1`, `runner-v1` and `pause-v1` only on hosts with the locking and
-durability tools described in [README.md](../README.md#runner-ownership-and-pause).
-Consumer configuration and invocation, the delivery journal, `retry`, `recover`
-and the `consumer-v1` and `delivery-v1` capabilities remain unimplemented, so
-this script still does not satisfy "all six capabilities" for supervised control.
-Each schedule record of `status --json` also carries an
+**Design accepted by Bob on 2026-11-15; implemented in this script.** As of the
+`gh-consumer-dispatch` stitch (2026-11-15), `capabilities --json`, `status --json`,
+`enroll`, `run`, `pause`, `resume`, `stop`, `release`, `retry` and `recover`
+exist, the upgraded `tick`, `init`, `add`, `drop` and `sweep` follow the lock,
+ownership and pause rules here, and `run` reconciles the delivery journal and
+hands pending deliveries to the consumer in `runtime/config.json`.
+`capabilities` advertises `status-json-v1` everywhere, `ownership-v1`, `runner-v1`
+and `pause-v1` on hosts with the locking and durability tools described in
+[README.md](../README.md#runner-ownership-and-pause), and `consumer-v1` and
+`delivery-v1` where the host can also start a consumer in a session of its own
+([README.md](../README.md#consumers-and-deliveries)); with all six, this script
+satisfies "all six capabilities" for supervised control. The README records the
+points where the implementation chose a reading of this document (the extra
+`runtime/prepared/` journal, the exit-status record for signals, the legacy
+one-shot rule). Each schedule record of `status --json` also carries an
 additive `cadence` object (see [README.md](../README.md#inspection)); clients
 ignore unknown fields, so the contract's required fields are unchanged. This
 document records the accepted interface. The existing commands in
