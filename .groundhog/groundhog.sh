@@ -814,11 +814,13 @@ sweep_runtime() {
     name="${f##*/}"; name="${name%.json}"
     if [[ "$gone_ids" == *"$US$name$US"* ]] \
        && [[ -n "$(find "$f" -maxdepth 0 -type f -mtime +"$days")" ]]; then
-      rm -f "$f"; printf 'swept delivery %s\n' "$name"
+      jgen_begin || die "sweep: cannot write runtime/journal.gen"
+      rm -f "$f"; jgen_end || true; printf 'swept delivery %s\n' "$name"
     elif [[ "$acc_ids" == *"$US$name$US"* ]] \
        && drec_load "$f" && [[ ! -d "$GH_DIR/$D_PATH" ]] \
        && [[ -n "$(find "$f" -maxdepth 0 -type f -mtime +"$days")" ]]; then
-      rm -f "$f"; printf 'swept delivery %s\n' "$name"
+      jgen_begin || die "sweep: cannot write runtime/journal.gen"
+      rm -f "$f"; jgen_end || true; printf 'swept delivery %s\n' "$name"
     fi
   done
   shopt -u nullglob
@@ -840,7 +842,8 @@ sweep_remove_records_for() {
   local f
   for f in "$RT_DIR"/deliveries/*.json "$RT_DIR"/deliveries/done/*.json; do
     if drec_load "$f" && [[ "$D_PATH" == "$1" && "$D_STATE" == accepted ]]; then
-      rm -f "$f"; printf 'swept delivery %s\n' "$D_ID"
+      jgen_begin || die "sweep: cannot write runtime/journal.gen"
+      rm -f "$f"; jgen_end || true; printf 'swept delivery %s\n' "$D_ID"
     fi
   done
 }
@@ -1655,6 +1658,15 @@ inspect_deliveries() {
     diag_add delivery_record_malformed "runtime/deliveries/done/${key#./} also exists in runtime/deliveries/" "runtime/deliveries/done/${key#./}"
   done
 
+  # A firing in progress (or interrupted) has its out/ entry before its delivery
+  # record: the prepared record names the path, so the entry is claimed, not an
+  # unregistered legacy delivery. The runner turns it into a record.
+  for f in "$GH_DIR"/runtime/prepared/*.json; do
+    read_text "$f" && jp_parse "$TEXT" || continue
+    jp_get "${US}out_path"
+    if [[ "$JP_GT" == s && "$JP_GV" =~ ^out/[^/]+$ ]]; then REG_LIST+="$US$JP_GV$US"; fi
+  done
+
   # Entries in out/ that no record claims: read-only legacy deliveries.
   # They are not registered here; status never writes.
   out_unclaimed "$REG_LIST"
@@ -1869,12 +1881,32 @@ cmd_capabilities() {
     "$GH_PROTOCOL" "$GH_PROTOCOL_VERSION" "$JSTR" "$caps"
 }
 
+# jgen_peek — read runtime/journal.gen without writing: JG_ST is ok, absent or
+# bad, JG_VAL the number (0 unless ok).
+JG_ST=""; JG_VAL=0
+jgen_peek() {
+  local f="$GH_DIR/runtime/journal.gen"
+  JG_VAL=0
+  if [[ ! -e "$f" && ! -L "$f" ]]; then JG_ST=absent; return 0; fi
+  if read_text "$f"; then
+    TEXT="${TEXT%$'\n'}"
+    if [[ "$TEXT" =~ ^[0-9]{18}$ ]]; then JG_ST=ok; JG_VAL=$((10#$TEXT)); return 0; fi
+  fi
+  JG_ST=bad
+}
+
 cmd_status() {
   json_only_args status "$@"
   GH_BAD_INSTALL_EXIT=2
   resolve_paths
   INSTANCE="$(canonical_dir "$GH_DIR")"
   OBSERVED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  # The delivery journal's generation is read before and after the pass (no
+  # lock): every journal write moves it, so a pass that straddled a write
+  # shows as a changed or odd number.
+  local jg_st jg_val
+  jgen_peek; jg_st="$JG_ST"; jg_val="$JG_VAL"
 
   inspect_state
   inspect_consumer
@@ -1891,6 +1923,17 @@ cmd_status() {
     CONSISTENT=0
     diag_add state_changed_during_read "runtime/state.json changed while status was reading; refresh before acting" "runtime/state.json"
   fi
+  jgen_peek
+  if [[ "$JG_ST" == bad || "$jg_st" == bad ]]; then
+    CONSISTENT=0
+    diag_add journal_generation_unreadable "runtime/journal.gen is not a readable number; the next journal write replaces it. Refresh before acting" "runtime/journal.gen"
+  elif [[ "$JG_ST:$JG_VAL" != "$jg_st:$jg_val" ]]; then
+    CONSISTENT=0
+    diag_add journal_changed_during_read "the delivery journal changed while status was reading; refresh before acting" "runtime/journal.gen"
+  elif (( jg_val % 2 )); then
+    CONSISTENT=0
+    diag_add journal_write_in_progress "a delivery journal write is in progress, or one did not finish; the next control command or runner start settles it. Refresh before acting" "runtime/journal.gen"
+  fi
   if (( JSON_LOSSY )); then
     diag_add path_not_utf8 "some names are not valid UTF-8; invalid bytes are shown as U+FFFD" ""
   fi
@@ -1904,9 +1947,9 @@ cmd_status() {
   join_by_comma ${DELIVERIES[@]+"${DELIVERIES[@]}"}; deliveries="$JR"
   join_by_comma ${DIAGS[@]+"${DIAGS[@]}"};          diags="$JR"
 
-  printf '{"protocol":"%s","protocol_version":%s,"instance":%s,"observed_at":%s,"revision":%s,"consistent":%s,"paused":%s,"owner":%s,"runner":{"state":"%s","last_error":%s},"consumer":{"configured":%s,"valid":%s,"config_digest":%s},"schedule":[%s],"deliveries":[%s],"diagnostics":[%s]}\n' \
+  printf '{"protocol":"%s","protocol_version":%s,"instance":%s,"observed_at":%s,"revision":%s,"journal_generation":%s,"consistent":%s,"paused":%s,"owner":%s,"runner":{"state":"%s","last_error":%s},"consumer":{"configured":%s,"valid":%s,"config_digest":%s},"schedule":[%s],"deliveries":[%s],"diagnostics":[%s]}\n' \
     "$GH_PROTOCOL" "$GH_PROTOCOL_VERSION" "$instance_json" "$observed_json" \
-    "$S_REV" "$consistent" "$S_PAUSED" "$S_OWNER" "$S_RUNNER_STATE" "$S_RUNNER_ERROR" \
+    "$S_REV" "$jg_val" "$consistent" "$S_PAUSED" "$S_OWNER" "$S_RUNNER_STATE" "$S_RUNNER_ERROR" \
     "$C_CONFIGURED" "$C_VALID" "$S_DIGEST" "$schedule" "$deliveries" "$diags"
 }
 
@@ -2037,7 +2080,7 @@ lock_mutation() {
   while :; do
     rc=0
     lock_try "$LOCK_FD_MUTATION" || rc=$?
-    if (( rc == 0 )); then MUT_HELD=1; return 0; fi
+    if (( rc == 0 )); then MUT_HELD=1; jgen_settle; return 0; fi
     if (( rc != 1 )); then exec 9>&-; return 2; fi
     tries=$((tries + 1))
     if (( tries >= 30 )); then exec 9>&-; return 1; fi
@@ -2537,6 +2580,81 @@ rt_atomic_write() {
   return 0
 }
 
+# --- the journal generation -----------------------------------------------------
+# runtime/journal.gen holds one number that every write to the delivery journal
+# moves: delivery records (live and under done/), their filing under done/, the
+# prepared firing records, and sweep's removal of records. A write is bracketed:
+# jgen_begin makes the number odd, jgen_end makes it even again, and status
+# (which takes no lock) reads it before and after its pass and reports
+# consistent:false when it moved or is odd. Odd means a write is in progress, or
+# was interrupted: the next command that takes the mutation lock settles it.
+# Brackets nest (an outer one covers the inner writes with one begin and end),
+# and every writer already holds the mutation lock, so the read-modify-write
+# below has one party at a time.
+JGEN_DEPTH=0
+JGEN_CUR=0
+JGEN_N=0
+JGEN_PLAIN=0     # 1 when the file holds exactly one fixed-width number
+
+jgen_usable() { [[ -n "$RT_DIR" && -z "$GH_RT_MISSING" && -d "$RT_DIR" ]]; }
+
+# jgen_load — JGEN_N is the number in the file (0 when absent or unreadable).
+jgen_load() {
+  JGEN_N=0; JGEN_PLAIN=0
+  if read_text "$RT_DIR/journal.gen"; then
+    TEXT="${TEXT%$'\n'}"
+    if [[ "$TEXT" =~ ^[0-9]{18}$ ]]; then JGEN_N=$((10#$TEXT)); JGEN_PLAIN=1; fi
+  fi
+  return 0
+}
+
+# jgen_put N — store N. A file that already holds one fixed-width number is
+# overwritten in place (a single short write, no truncation, so a reader never
+# sees it empty); anything else is replaced atomically.
+jgen_put() {
+  local v f="$RT_DIR/journal.gen"
+  printf -v v '%018d' "$1"
+  if (( JGEN_PLAIN )) && [[ -f "$f" ]]; then
+    printf '%s\n' "$v" 1<>"$f" 2>/dev/null || return 1
+    rt_fsync "$f" || return 1
+  else
+    rt_atomic_write "$f" "$v" || return 1
+    JGEN_PLAIN=1
+  fi
+  return 0
+}
+
+# jgen_begin — 1 when the generation could not be written (the journal write
+# must not go ahead).
+jgen_begin() {
+  jgen_usable || return 0
+  if (( JGEN_DEPTH > 0 )); then JGEN_DEPTH=$((JGEN_DEPTH + 1)); return 0; fi
+  jgen_load
+  if (( JGEN_N % 2 )); then JGEN_CUR=$((JGEN_N + 2)); else JGEN_CUR=$((JGEN_N + 1)); fi
+  jgen_put "$JGEN_CUR" || return 1
+  JGEN_DEPTH=1
+  return 0
+}
+
+# jgen_end — 2 when the write happened but the generation could not be moved
+# on (status then reads an unfinished write until the next lock holder settles).
+jgen_end() {
+  (( JGEN_DEPTH > 0 )) || return 0
+  JGEN_DEPTH=$((JGEN_DEPTH - 1))
+  (( JGEN_DEPTH == 0 )) || return 0
+  jgen_put $((JGEN_CUR + 1)) || return 2
+  return 0
+}
+
+# jgen_settle — the mutation lock was just taken, so no writer is alive: an odd
+# number is an interrupted write. Make it even.
+jgen_settle() {
+  (( JGEN_DEPTH == 0 )) && jgen_usable && [[ -f "$RT_DIR/journal.gen" ]] || return 0
+  jgen_load
+  if (( JGEN_N % 2 )); then jgen_put $((JGEN_N + 1)) || true; fi
+  return 0
+}
+
 # src_generation DIR — inode and modification time, enough to tell a replaced
 # schedule directory from the one that was copied.
 src_generation() {
@@ -2711,9 +2829,14 @@ drec_render() {
 # drec_save — write the current D_*/A_* durably. Returns 0, 1 or 2 like
 # rt_atomic_write.
 drec_save() {
+  local rc=0 erc=0
   mkdir -p "$RT_DIR/deliveries" 2>/dev/null || return 1
   drec_render
-  rt_atomic_write "${D_FILE:-$RT_DIR/deliveries/$D_ID.json}" "$DREC"
+  jgen_begin || return 1
+  rt_atomic_write "${D_FILE:-$RT_DIR/deliveries/$D_ID.json}" "$DREC" || rc=$?
+  jgen_end || erc=$?
+  if (( rc == 0 )); then rc=$erc; fi
+  return "$rc"
 }
 
 # drec_locate ID — sets DREC_AT to the file holding delivery ID: the live
@@ -2956,7 +3079,9 @@ done_file_one() {
   # A copy already filed under this id is evidence, not something to replace;
   # the scan has counted it, so admission stays blocked until it is dealt with.
   if [[ -e "$DN_DIR/$base" || -L "$DN_DIR/$base" ]]; then return 0; fi
-  mv -f -- "$f" "$DN_DIR/$base" 2>/dev/null || return 1
+  jgen_begin || return 1
+  if ! mv -f -- "$f" "$DN_DIR/$base" 2>/dev/null; then jgen_end || true; return 1; fi
+  jgen_end || return 1
   DN_FILED=1
   if done_cacheable; then
     stat_init
@@ -2997,13 +3122,17 @@ prep_load() {
 
 # prep_write ID OUT_REL MARKER_REL SCHED_REL DATE SLOT ONCE GEN
 prep_write() {
-  local a b c d e f g h
+  local a b c d e f g h rc=0 erc=0
   json_str "$1"; a="$JSTR"; json_str "$2"; b="$JSTR"; json_str "$3"; c="$JSTR"
   json_str "$4"; d="$JSTR"; json_str "$5"; e="$JSTR"; str_or_null "$6"; f="$JR"
   json_str "$8"; h="$JSTR"
   g=false; [[ "$7" == 1 ]] && g=true
   mkdir -p "$RT_DIR/prepared" 2>/dev/null || return 1
-  rt_atomic_write "$RT_DIR/prepared/$1.json" "{\"schema_version\":1,\"id\":$a,\"out_path\":$b,\"fired_marker\":$c,\"schedule_path\":$d,\"occurrence\":{\"date\":$e,\"slot\":$f},\"once\":$g,\"source_generation\":$h,\"created_at\":\"$(now_utc)\"}"
+  jgen_begin || return 1
+  rt_atomic_write "$RT_DIR/prepared/$1.json" "{\"schema_version\":1,\"id\":$a,\"out_path\":$b,\"fired_marker\":$c,\"schedule_path\":$d,\"occurrence\":{\"date\":$e,\"slot\":$f},\"once\":$g,\"source_generation\":$h,\"created_at\":\"$(now_utc)\"}" || rc=$?
+  jgen_end || erc=$?
+  if (( rc == 0 )); then rc=$erc; fi
+  return "$rc"
 }
 
 # prep_block FILE REASON — set a prepared firing aside as blocked: its
@@ -3012,7 +3141,9 @@ prep_write() {
 prep_block() {
   local f="$1"
   runner_log "firing ${f##*/} could not be reconciled ($2); its occurrence stays blocked (see status)"
+  jgen_begin || true
   mv -f "$f" "${f%.json}.blocked" 2>/dev/null || true
+  jgen_end || true
 }
 
 # once_remove SRC GENERATION — remove a fired one-shot's schedule directory
@@ -3034,6 +3165,18 @@ once_remove() {
   return 0
 }
 
+# firing_complete — finish a firing whose out/ entry exists: marker, delivery
+# record, one-shot removal, then forget the prepared record. Safe to repeat.
+# Uses P_*. Returns 1 on an I/O failure.
+firing_complete() {
+  local rc=0 erc=0
+  jgen_begin || return 1
+  firing_complete_body || rc=$?
+  jgen_end || erc=$?
+  if (( rc == 0 )); then rc=$erc; fi
+  return "$rc"
+}
+
 # marker_write MARKER ONCE GEN — the fired marker. A one-shot's marker records
 # the generation of the source that was copied (inode and mtime, as in the
 # prepared record), so a later tick removes only that source, never a
@@ -3046,10 +3189,7 @@ marker_write() {
   fi
 }
 
-# firing_complete — finish a firing whose out/ entry exists: marker, delivery
-# record, one-shot removal, then forget the prepared record. Safe to repeat.
-# Uses P_*. Returns 1 on an I/O failure.
-firing_complete() {
+firing_complete_body() {
   local markerp="$GH_DIR/$P_MARKER" rec="$RT_DIR/deliveries/$P_ID.json" rc=0
   mkdir -p "$(dirname "$markerp")" || return 1
   [[ -e "$markerp" ]] || marker_write "$markerp" "$P_ONCE" "$P_GEN" || return 1
@@ -3083,8 +3223,10 @@ recon_prepared() {
     if [[ -e "$RT_DIR/staging/$P_ID" || -L "$RT_DIR/staging/$P_ID" ]]; then
       # Copy not finished (or not renamed): nothing was exposed. Discard it;
       # the occurrence still has no marker, so the tick fires it afresh.
+      jgen_begin || { shopt -u nullglob; return 1; }
       rm -rf -- "$RT_DIR/staging/$P_ID"
       rm -f "$f"
+      jgen_end || { shopt -u nullglob; return 1; }
       runner_log "discarded an unfinished firing of $P_SCHED"
     elif [[ -d "$GH_DIR/$P_OUT" ]]; then
       if ! firing_complete; then shopt -u nullglob; return 1; fi
@@ -3093,7 +3235,9 @@ recon_prepared() {
       prep_block "$f" "the fired marker exists but out/ has no matching entry"
       BLOCKED_MARKERS+="$US$P_MARKER$US"
     else
+      jgen_begin || { shopt -u nullglob; return 1; }
       rm -f "$f"
+      jgen_end || { shopt -u nullglob; return 1; }
     fi
   done
   shopt -u nullglob
@@ -3371,7 +3515,18 @@ tick_note_collision() {
   return 0
 }
 
+# tick_fire — one firing, bracketed in the journal generation from the prepared
+# record to the delivery record, so status never reads the out/ entry half way.
 tick_fire() {
+  local rc=0 erc=0
+  jgen_begin || return 1
+  tick_fire_body "$@" || rc=$?
+  jgen_end || erc=$?
+  if (( rc == 0 )); then rc=$erc; fi
+  return "$rc"
+}
+
+tick_fire_body() {
   local name="$1" src="$2" is_once="$3" slot="$4" dst="$5" marker="$6" now_t="$7"
   local out_rel="$8" marker_rel="$9" src_rel="${10}" id gen rc=0
   rand_hex 8 || return 1
