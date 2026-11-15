@@ -54,7 +54,8 @@ enroll_ok; gh resume --token-file "$TOK" >/dev/null
 run_once 2
 status_to "$out"
 assert_eq "path reuse: the old generation stays missing" '"missing"' "$(jq_py dget "$out" id "$old" state)"
-assert_eq "...and keeps no collision" '[]' "$(grep -o '"collisions":\[[^]]*\]' "$GHD/runtime/deliveries/$old.json" | sed 's/"collisions"://')"
+oldrec="$GHD/runtime/deliveries/$old.json"; [ -f "$oldrec" ] || oldrec="$GHD/runtime/deliveries/done/$old.json"   # the runner files a missing record under done/
+assert_eq "...and keeps no collision" '[]' "$(grep -o '"collisions":\[[^]]*\]' "$oldrec" | sed 's/"collisions"://')"
 assert_true "...the live delivery's record holds the weekly item's collision" \
   sh -c "grep -l 'weekly/$dow/foo' '$GHD'/runtime/deliveries/*.json | grep -v $old >/dev/null"
 assert_contains "...and status reports it" "$(jget "$out" diagnostics)" out_collision

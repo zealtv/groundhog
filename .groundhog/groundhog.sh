@@ -765,7 +765,7 @@ sweep_runtime() {
   local prot_paths="" prot_dates="" acc_paths="" acc_ids="" gone_ids="" prot_state_list=""
   local md date_dir
   shopt -s nullglob
-  for f in "$RT_DIR"/deliveries/*.json; do
+  for f in "$RT_DIR"/deliveries/*.json "$RT_DIR"/deliveries/done/*.json; do
     if ! drec_load "$f"; then
       shopt -u nullglob
       die "sweep: ${f##*/} is unreadable or of an unsupported shape; nothing was swept"
@@ -810,7 +810,7 @@ sweep_runtime() {
     fi
   done
   # Records of removed or terminal deliveries: old enough by the record's own age.
-  for f in "$RT_DIR"/deliveries/*.json; do
+  for f in "$RT_DIR"/deliveries/*.json "$RT_DIR"/deliveries/done/*.json; do
     name="${f##*/}"; name="${name%.json}"
     if [[ "$gone_ids" == *"$US$name$US"* ]] \
        && [[ -n "$(find "$f" -maxdepth 0 -type f -mtime +"$days")" ]]; then
@@ -838,7 +838,7 @@ sweep_runtime() {
 # swept out/ entry.
 sweep_remove_records_for() {
   local f
-  for f in "$RT_DIR"/deliveries/*.json; do
+  for f in "$RT_DIR"/deliveries/*.json "$RT_DIR"/deliveries/done/*.json; do
     if drec_load "$f" && [[ "$D_PATH" == "$1" && "$D_STATE" == accepted ]]; then
       rm -f "$f"; printf 'swept delivery %s\n' "$D_ID"
     fi
@@ -936,6 +936,20 @@ json_str() {
     fi
   done
   JSTR="\"$out\""
+}
+
+# utf8_valid VALUE — is VALUE valid UTF-8? Names that are not would be stored
+# lossily in a record (json_str), so the path in the record would never match
+# the directory again. Leaves JSON_LOSSY and JSTR as they were.
+utf8_valid() {
+  local LC_ALL=C lossy="$JSON_LOSSY" keep="$JSTR" ok=1
+  if [[ "$1" == *[^\ -~]* ]]; then
+    JSON_LOSSY=0
+    json_str "$1"
+    if (( JSON_LOSSY )); then ok=0; fi
+    JSON_LOSSY="$lossy"; JSTR="$keep"
+  fi
+  (( ok ))
 }
 
 # --- minimal JSON parser -----------------------------------------------------
@@ -1417,6 +1431,37 @@ inspect_consumer() {
   return 0
 }
 
+# out_unclaimed CLAIMED — sets UNCL_SET to the out/ directories (not .landing)
+# that CLAIMED, a US-delimited list of out/ paths, does not name, each as
+# US out/NAME US. One sort and one comm instead of a substring search per entry
+# (that search grows with the square of the journal). A name holding a newline
+# cannot travel through those tools and is checked the slow way, as is every
+# name on a host without comm or sort: slower, never wrong.
+UNCL_SET=""
+out_unclaimed() {
+  local entry name cand="" line fast=1
+  UNCL_SET=""
+  if ! command -v comm >/dev/null 2>&1 || ! command -v sort >/dev/null 2>&1 || ! command -v tr >/dev/null 2>&1; then fast=0; fi
+  shopt -s nullglob
+  for entry in "$OUT"/*; do
+    [[ -d "$entry" ]] || continue
+    name="${entry##*/}"
+    [[ "$name" == *.landing ]] && continue
+    if (( ! fast )) || [[ "$name" == *$'\n'* ]]; then
+      if [[ "$1" != *"$US""out/$name""$US"* ]]; then UNCL_SET+="$US""out/$name""$US"; fi
+      continue
+    fi
+    cand+="out/$name"$'\n'
+  done
+  if [[ -n "$cand" ]]; then
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      UNCL_SET+="$US$line$US"
+    done < <( LC_ALL=C comm -23 <(printf '%s' "$cand" | LC_ALL=C sort) <(printf '%s' "$1" | tr "$US" '\n' | LC_ALL=C sort -u) )
+  fi
+  return 0
+}
+
 # --- deliveries --------------------------------------------------------------
 DELIVERIES=()
 REG_LIST=""      # US-separated out/ paths that a record claims
@@ -1543,42 +1588,76 @@ delivery_collision_diags() {
   done
 }
 
+# status_record FILE REL — read one record file for status: its JSON joins
+# DELIVERIES, or a diagnostic says why it cannot.
+LIVE_IDS=""      # US-delimited ids listed from deliveries/ (a record the runner files meanwhile is not listed twice)
+status_record() {
+  local f="$1" rel="$2" stem
+  stem="${f##*/}"; stem="${stem%.json}"
+  if ! read_text "$f"; then
+    CONSISTENT=0
+    diag_add delivery_record_unreadable "$rel is not a readable regular file" "$rel"
+    return 0
+  fi
+  if ! jp_parse "$TEXT"; then
+    CONSISTENT=0
+    diag_add delivery_record_malformed "$rel is not valid JSON ($JP_ERR)" "$rel"
+    return 0
+  fi
+  if ! delivery_check "$stem"; then
+    CONSISTENT=0
+    diag_add delivery_record_malformed "$rel: $VERR" "$rel"
+    return 0
+  fi
+  DELIVERIES+=("$JR")
+  REG_LIST+="$US$DEL_PATH$US"
+  LIVE_IDS+="$US$stem$US"
+  delivery_collision_diags "$DEL_PATH"
+  case "$DEL_STATE" in
+    pending|in_flight|failed|uncertain)
+      if [[ ! -e "$GH_DIR/$DEL_PATH" ]]; then
+        diag_add delivery_path_missing "$DEL_PATH is recorded as $DEL_STATE but is not in out/" "$DEL_PATH"
+      fi
+      ;;
+  esac
+  return 0
+}
+
 inspect_deliveries() {
-  local dir="$GH_DIR/runtime/deliveries" f base stem rel entry name
+  local dir="$GH_DIR/runtime/deliveries" f entry name key i stem
   shopt -s nullglob
   for f in "$dir"/*.json; do
-    base="${f##*/}"
-    stem="${base%.json}"
-    rel="runtime/deliveries/$base"
-    if ! read_text "$f"; then
-      CONSISTENT=0
-      diag_add delivery_record_unreadable "$rel is not a readable regular file" "$rel"
-      continue
-    fi
-    if ! jp_parse "$TEXT"; then
-      CONSISTENT=0
-      diag_add delivery_record_malformed "$rel is not valid JSON ($JP_ERR)" "$rel"
-      continue
-    fi
-    if ! delivery_check "$stem"; then
-      CONSISTENT=0
-      diag_add delivery_record_malformed "$rel: $VERR" "$rel"
-      continue
-    fi
-    DELIVERIES+=("$JR")
-    REG_LIST+="$US$DEL_PATH$US"
-    delivery_collision_diags "$DEL_PATH"
-    case "$DEL_STATE" in
-      pending|in_flight|failed|uncertain)
-        if [[ ! -e "$GH_DIR/$DEL_PATH" ]]; then
-          diag_add delivery_path_missing "$DEL_PATH is recorded as $DEL_STATE but is not in out/" "$DEL_PATH"
-        fi
-        ;;
-    esac
+    status_record "$f" "runtime/deliveries/${f##*/}"
+  done
+
+  # Terminal records the runner filed under done/: the ones its index vouches
+  # for (same inode, size, mtime and mode as when it last parsed them) are not
+  # parsed again; any other is read exactly like a record in deliveries/.
+  DN_DIR="$dir/done"; DN_LAST=""
+  done_classify
+  if (( DN_LISTING_BAD )); then
+    CONSISTENT=0
+    diag_add delivery_record_unreadable "runtime/deliveries/done/ could not be listed reliably; refresh before acting" "runtime/deliveries/done"
+  fi
+  for (( i = 0; i < ${#DN_KEY[@]}; i++ )); do
+    key="${DN_KEY[i]#./}"
+    [[ "$LIVE_IDS" != *"$US${key%.json}$US"* ]] || continue
+    DELIVERIES+=("${DN_VIEW[i]}")
+    REG_LIST+="$US${DN_PATH[i]}$US"
+  done
+  for key in ${DN_TODO[@]+"${DN_TODO[@]}"}; do
+    stem="${key#./}"; stem="${stem%.json}"
+    [[ "$LIVE_IDS" != *"$US$stem$US"* ]] || continue
+    status_record "$DN_DIR/${key#./}" "runtime/deliveries/done/${key#./}"
+  done
+  for key in ${DN_DUP[@]+"${DN_DUP[@]}"}; do
+    CONSISTENT=0
+    diag_add delivery_record_malformed "runtime/deliveries/done/${key#./} also exists in runtime/deliveries/" "runtime/deliveries/done/${key#./}"
   done
 
   # Entries in out/ that no record claims: read-only legacy deliveries.
   # They are not registered here; status never writes.
+  out_unclaimed "$REG_LIST"
   for entry in "$OUT"/*; do
     [[ -e "$entry" || -L "$entry" ]] || continue
     name="${entry##*/}"
@@ -1587,7 +1666,11 @@ inspect_deliveries() {
       diag_add out_entry_not_directory "out/$name is not a directory, so it is not listed as a delivery" "out/$name"
       continue
     fi
-    [[ "$REG_LIST" == *"$US""out/$name""$US"* ]] && continue
+    [[ "$UNCL_SET" == *"$US""out/$name""$US"* ]] || continue
+    if ! utf8_valid "$name"; then
+      diag_add out_entry_name_not_utf8 "out/$name has a name that is not valid UTF-8, so the runner does not import or hand it off; rename it" "out/$name"
+      continue
+    fi
     json_str "out/$name"
     DELIVERIES+=("{\"id\":null,\"path\":$JSTR,\"origin\":\"legacy_out\",\"schedule_path\":null,\"occurrence\":null,\"state\":\"pending\",\"reason\":\"unregistered\",\"attempts\":[],\"execution\":\"unknown\"}")
   done
@@ -1692,6 +1775,9 @@ inspect_schedule() {
   for (( k = 0; k < ${#item_paths[@]}; k++ )); do
     p="${item_paths[k]}"
     rel="${p#"$GH_DIR"/}"
+    if ! utf8_valid "$rel"; then
+      diag_add schedule_name_not_utf8 "$rel has a name that is not valid UTF-8, so the runner does not fire it; rename it" "$rel"
+    fi
     paused_json=""
     if [[ -n "${item_pauses[k]}" ]]; then
       IFS="$US" read -r -a parts <<< "${item_pauses[k]}"
@@ -2309,12 +2395,20 @@ cmd_stop() {
 # (the delivery is in_flight or uncertain, or an attempt is still in_flight), or
 # a record cannot be read (unreadable evidence is never taken for "resolved").
 unresolved_attempt_exists() {
-  local f
+  local f key
   shopt -s nullglob
   for f in "$RT_DIR"/deliveries/*.json; do
     if ! drec_load "$f" || drec_unresolved; then shopt -u nullglob; return 0; fi
   done
   shopt -u nullglob
+  # Filed records are settled; only ones the cache does not vouch for are read.
+  DN_DIR="$RT_DIR/deliveries/done"; DN_LAST=""
+  done_classify
+  (( ! DN_LISTING_BAD )) || return 0
+  (( ${#DN_DUP[@]} == 0 )) || return 0
+  for key in ${DN_TODO[@]+"${DN_TODO[@]}"}; do
+    if ! drec_load "$DN_DIR/${key#./}" || drec_unresolved; then return 0; fi
+  done
   return 1
 }
 
@@ -2348,13 +2442,15 @@ cmd_release() {
 # retry and recovery.
 #
 # Delivery records live in runtime/deliveries/<id>.json (one file per delivery,
-# replaced atomically). A firing the runner makes is first written to
+# replaced atomically); the runner files accepted and missing ones under
+# runtime/deliveries/done/ (see "terminal records" below). A firing the runner makes is first written to
 # runtime/prepared/<id>.json, copied into runtime/staging/<id>/, renamed into
 # out/, marked in fired/, recorded as a delivery, and only then is the prepared
 # record removed; every step can be redone or finished by the next run. While a
 # runner is live it is the only writer of delivery records (retry, recover,
 # release and sweep all refuse or wait for a stopped runner), so it keeps an
-# in-memory index (IX_*) of them for a cycle.
+# in-memory index (IX_*) of them for a cycle and reads them without the mutation
+# lock, taking the lock only for the writes (recon_scan, recon_apply).
 # ---------------------------------------------------------------------------
 
 now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -2454,12 +2550,13 @@ opt_json() { str_or_null "$1"; }
 D_ID=""; D_PATH=""; D_ORIGIN="runtime"; D_SCHED=""; D_HASOCC=0; D_DATE=""; D_SLOT=""
 D_STATE="pending"; D_REASON=""; D_REGAT=""; D_MARKER=""
 D_COLL=()            # one per out_collision: date US slot US schedule_path
+D_FILE=""            # the file drec_load read; drec_save writes back to it
 A_ID=(); A_START=(); A_FIN=(); A_OUT=(); A_EXIT=(); A_SIG=(); A_ERR=(); A_DEC=(); A_DECAT=()
 
 drec_reset() {
   D_ID=""; D_PATH=""; D_ORIGIN="runtime"; D_SCHED=""; D_HASOCC=0; D_DATE=""; D_SLOT=""
   D_STATE="pending"; D_REASON=""; D_REGAT=""; D_MARKER=""
-  D_COLL=()
+  D_COLL=(); D_FILE=""
   A_ID=(); A_START=(); A_FIN=(); A_OUT=(); A_EXIT=(); A_SIG=(); A_ERR=(); A_DEC=(); A_DECAT=()
 }
 
@@ -2481,6 +2578,7 @@ rawstr() {
 drec_load() {
   local f="$1" stem n i k c
   drec_reset
+  D_FILE="$f"
   stem="${f##*/}"; stem="${stem%.json}"
   read_text "$f" || return 1
   jp_parse "$TEXT" || return 1
@@ -2615,7 +2713,20 @@ drec_render() {
 drec_save() {
   mkdir -p "$RT_DIR/deliveries" 2>/dev/null || return 1
   drec_render
-  rt_atomic_write "$RT_DIR/deliveries/$D_ID.json" "$DREC"
+  rt_atomic_write "${D_FILE:-$RT_DIR/deliveries/$D_ID.json}" "$DREC"
+}
+
+# drec_locate ID — sets DREC_AT to the file holding delivery ID: the live
+# directory, or done/ where the runner files terminal records. Returns 1 if
+# neither has it.
+DREC_AT=""
+drec_locate() {
+  DREC_AT="$RT_DIR/deliveries/$1.json"
+  [[ -e "$DREC_AT" || -L "$DREC_AT" ]] && return 0
+  DREC_AT="$RT_DIR/deliveries/done/$1.json"
+  [[ -e "$DREC_AT" || -L "$DREC_AT" ]] && return 0
+  DREC_AT="$RT_DIR/deliveries/$1.json"
+  return 1
 }
 
 # drec_mark_uncertain CODE MESSAGE — the last unresolved attempt has no known
@@ -2691,6 +2802,170 @@ ix_next_pending() {
     cand="${IX_REG[i]}|${IX_ID[i]}"
     if (( IXI < 0 )) || [[ "$cand" < "$best" ]]; then IXI=$i; best="$cand"; fi
   done
+  return 0
+}
+
+# --- terminal records: runtime/deliveries/done/ --------------------------------
+# A delivery that is accepted or missing never changes again. The runner files
+# such a record under runtime/deliveries/done/ so the per-cycle scan and the
+# admission loops only meet the records that can still change. done/ also holds
+# `index`, a cache the runner writes: one line per filed record with the stat
+# signature (inode, size, mtime, mode) the file had when the runner last parsed
+# it, plus the record's state, path and the JSON status shows for it. A record
+# whose signature still matches is trusted without being parsed again; one that
+# differs (or has no line) is parsed, and one that cannot be parsed fails the
+# barrier closed exactly as an unreadable record in deliveries/ does. Only the
+# runner (and a stopped-runner command) writes; status only reads.
+STAT_KIND=""; STAT_ARGS=(); STAT_NAME=""; STAT_FMT=""
+stat_init() {
+  if [[ -n "$STAT_KIND" ]]; then return 0; fi
+  if stat -c %i / >/dev/null 2>&1; then
+    STAT_KIND=gnu; STAT_ARGS=(-c); STAT_NAME="%n"; STAT_FMT="%i$US%s$US%Y$US%a"
+  else
+    STAT_KIND=bsd; STAT_ARGS=(-f); STAT_NAME="%N"; STAT_FMT="%i$US%z$US%m$US%Lp"
+  fi
+}
+
+DN_DIR=""            # <runtime>/deliveries/done, set by the caller
+DN_KEY=(); DN_SIG=(); DN_STATE=(); DN_PATH=(); DN_VIEW=()    # trusted or parsed records
+DN_TODO=(); DN_TODO_SIG=()    # files whose signature the index does not vouch for
+DN_DUP=()                     # files that also exist in deliveries/
+DN_BADN=0                     # records in done/ that failed the barrier closed
+DN_LAST=""                    # the scan the arrays above describe (runner only)
+DN_DIRTY=0                    # the index needs rewriting
+DN_LISTING_BAD=0              # the listing of done/ disagrees with the directory
+
+# done_classify — scan done/ (one find, one stat, no parse) and sort each file
+# into trusted (DN_*), to-parse (DN_TODO) or duplicate (DN_DUP). A scan equal
+# to the previous one reuses the previous arrays untouched.
+done_classify() {
+  local scan="" joined="" idx key ino size mtime mode xi xs xm xo xstate xpath xview sig f line n_dir=0 n_scan=0 n_join=0
+  DN_LISTING_BAD=0
+  if [[ ! -d "$DN_DIR" ]]; then
+    DN_KEY=(); DN_SIG=(); DN_STATE=(); DN_PATH=(); DN_VIEW=(); DN_TODO=(); DN_TODO_SIG=(); DN_DUP=()
+    DN_BADN=0; DN_LAST=""
+    return 0
+  fi
+  stat_init
+  scan="$( cd -- "$DN_DIR" 2>/dev/null && find . -maxdepth 1 -name '*.json' -exec stat "${STAT_ARGS[@]}" "$STAT_NAME$US$STAT_FMT" {} + 2>/dev/null | LC_ALL=C sort )" || scan=""
+  # The listing is the only evidence of what is filed, so it is checked against
+  # a plain glob: a find, stat or sort that failed must not read as "nothing is
+  # filed" (every filed delivery's out/ entry would look unclaimed).
+  shopt -s nullglob
+  for f in "$DN_DIR"/*.json; do n_dir=$((n_dir + 1)); done
+  shopt -u nullglob
+  if [[ -n "$scan" ]]; then n_scan="$(printf '%s\n' "$scan" | wc -l)"; fi
+  if (( n_scan != n_dir )); then
+    DN_KEY=(); DN_SIG=(); DN_STATE=(); DN_PATH=(); DN_VIEW=(); DN_TODO=(); DN_TODO_SIG=(); DN_DUP=()
+    DN_BADN=0; DN_LAST=""; DN_LISTING_BAD=1
+    return 0
+  fi
+  if [[ -n "$DN_LAST" && "$scan" == "$DN_LAST" ]]; then return 0; fi
+  DN_KEY=(); DN_SIG=(); DN_STATE=(); DN_PATH=(); DN_VIEW=(); DN_TODO=(); DN_TODO_SIG=(); DN_DUP=()
+  DN_BADN=0; DN_LAST="$scan"
+  [[ -n "$scan" ]] || return 0
+  idx="$DN_DIR/index"
+  if [[ ! -f "$idx" || -L "$idx" ]]; then idx=/dev/null; fi
+  joined="$( LC_ALL=C join -t "$US" -a 1 -e '' -o 1.1,1.2,1.3,1.4,1.5,2.2,2.3,2.4,2.5,2.6,2.7,2.8 <(printf '%s\n' "$scan") "$idx" 2>/dev/null )" || joined=""
+  n_join="$(printf '%s\n' "$joined" | wc -l)"
+  if (( n_scan != n_join )); then
+    # join is missing, or lost a line (an index it could not merge): trust
+    # nothing from the index and give every listed file an empty index half.
+    joined=""
+    while IFS= read -r line; do
+      joined+="$line$US$US$US$US$US$US$US"$'\n'
+    done <<< "$scan"
+  fi
+  while IFS="$US" read -r key ino size mtime mode xi xs xm xo xstate xpath xview; do
+    [[ -n "$key" ]] || continue
+    if [[ -e "${DN_DIR%/done}/${key#./}" || -L "${DN_DIR%/done}/${key#./}" ]]; then
+      DN_DUP+=("$key"); continue
+    fi
+    sig="$ino$US$size$US$mtime$US$mode"
+    if [[ -n "$xview" && ( "$xstate" == accepted || "$xstate" == missing ) \
+          && "$sig" == "$xi$US$xs$US$xm$US$xo" ]]; then
+      DN_KEY+=("$key"); DN_SIG+=("$sig"); DN_STATE+=("$xstate"); DN_PATH+=("$xpath"); DN_VIEW+=("$xview")
+    else
+      DN_TODO+=("$key"); DN_TODO_SIG+=("$sig")
+    fi
+  done <<< "$joined"
+  return 0
+}
+
+# done_cacheable — after drec_load and delivery_check: may status reuse this
+# record's JSON (JR) without reading the file again? Not when it carries
+# collisions (they become diagnostics) or a path the index line cannot hold.
+done_cacheable() {
+  (( ${#D_COLL[@]} == 0 )) || return 1
+  [[ "$D_PATH" != *"$US"* && "$D_PATH" != *$'\n'* ]] || return 1
+  return 0
+}
+
+# done_parse_runner — parse what the index did not vouch for. A file that does
+# not hold a readable, terminal record counts in DN_BADN: it blocks admission.
+done_parse_runner() {
+  local i key stem
+  DN_BADN=$((DN_BADN + ${#DN_DUP[@]}))
+  for key in ${DN_DUP[@]+"${DN_DUP[@]}"}; do
+    runner_log "delivery record ${key#./} exists in both deliveries/ and deliveries/done/; every consumer admission is blocked until it is dealt with"
+  done
+  DN_DUP=()
+  for (( i = 0; i < ${#DN_TODO[@]}; i++ )); do
+    key="${DN_TODO[i]}"
+    stem="${key#./}"; stem="${stem%.json}"
+    if ! drec_load "$DN_DIR/${key#./}" || ! delivery_check "$stem" \
+       || [[ "$D_STATE" != accepted && "$D_STATE" != missing ]] || drec_unresolved; then
+      DN_BADN=$((DN_BADN + 1))
+      runner_log "delivery record done/${key#./} is unreadable or not a terminal record; every consumer admission is blocked until it is dealt with"
+      continue
+    fi
+    if done_cacheable; then
+      DN_KEY+=("$key"); DN_SIG+=("${DN_TODO_SIG[i]}"); DN_STATE+=("$D_STATE"); DN_PATH+=("$D_PATH"); DN_VIEW+=("$JR")
+      DN_DIRTY=1
+    else
+      DN_KEY+=("$key"); DN_SIG+=("${DN_TODO_SIG[i]}"); DN_STATE+=("$D_STATE"); DN_PATH+=("$D_PATH"); DN_VIEW+=("")
+    fi
+  done
+  DN_TODO=(); DN_TODO_SIG=()
+  if (( DN_BADN > 0 )); then
+    runner_log "$DN_BADN delivery record(s) under deliveries/done/ cannot be trusted; every consumer admission is blocked until they are dealt with"
+  fi
+}
+
+# done_index_write — rewrite done/index from the trusted records. A cache:
+# a failure only costs the next reader a parse.
+done_index_write() {
+  local i lines="groundhog-done-index 1" text
+  for (( i = 0; i < ${#DN_KEY[@]}; i++ )); do
+    [[ -n "${DN_VIEW[i]}" ]] || continue
+    lines+=$'\n'"${DN_KEY[i]}$US${DN_SIG[i]}$US${DN_STATE[i]}$US${DN_PATH[i]}$US${DN_VIEW[i]}"
+  done
+  text="$(printf '%s\n' "$lines" | LC_ALL=C sort)" || return 1
+  mkdir -p "$DN_DIR" 2>/dev/null || return 1
+  rt_atomic_write "$DN_DIR/index" "$text"
+}
+
+# done_file_one — after drec_load and delivery_check of a live record that is
+# accepted or missing and settled: move it into done/ and remember its
+# signature for the index. Returns 1 if it could not be moved.
+DN_FILED=0
+done_file_one() {
+  local f="$1" base sig=""
+  base="${f##*/}"
+  mkdir -p "$DN_DIR" 2>/dev/null || return 1
+  # A copy already filed under this id is evidence, not something to replace;
+  # the scan has counted it, so admission stays blocked until it is dealt with.
+  if [[ -e "$DN_DIR/$base" || -L "$DN_DIR/$base" ]]; then return 0; fi
+  mv -f -- "$f" "$DN_DIR/$base" 2>/dev/null || return 1
+  DN_FILED=1
+  if done_cacheable; then
+    stat_init
+    sig="$(stat "${STAT_ARGS[@]}" "$STAT_FMT" "$DN_DIR/$base" 2>/dev/null)" || sig=""
+    if [[ -n "$sig" ]]; then
+      DN_KEY+=("./$base"); DN_SIG+=("$sig"); DN_STATE+=("$D_STATE"); DN_PATH+=("$D_PATH"); DN_VIEW+=("$JR")
+      DN_DIRTY=1
+    fi
+  fi
   return 0
 }
 
@@ -2813,15 +3088,39 @@ recon_prepared() {
   return 0
 }
 
-# recon_records — one pass over the delivery records: abandoned in-flight
-# attempts become uncertain, pending deliveries whose path vanished become
-# missing, pending reasons follow whether a consumer is configured. Builds the
-# index. Unreadable records are counted (they fail the barrier closed).
-recon_records() {
-  local f changed want rc
+# The reconciliation is two steps so the mutation lock is held in short slices
+# whatever the journal size. recon_scan reads without the lock (a live runner
+# is the only writer of delivery records; retry, recover, release, sweep and
+# the standalone tick all refuse or wait for a stopped runner): it builds the
+# index IX_* from done/ (trusted by signature, see above) and from the records
+# still in deliveries/, and lists the work that needs a write. recon_apply
+# then takes the lock for about a second at a time, reloads each record before
+# touching it, and lets go in between so pause, stop, retry and recover get in.
+WK_KIND=(); WK_IX=(); WK_NAME=()
+UTF8_LOGGED=""
+RECON_SLICE=1            # seconds of lock hold per slice (SECONDS ticks in whole seconds)
+
+# recon_scan — build the index and the work list. Unreadable records are
+# counted (they fail the barrier closed). Writes nothing but done/'s cache.
+recon_scan() {
+  local f entry name flag k want=""
   ix_reset
   RECON_CLAIMED=""
-  want=""; if (( ! CFG_PRESENT )); then want=no_consumer; fi
+  WK_KIND=(); WK_IX=(); WK_NAME=()
+  if (( ! CFG_PRESENT )); then want=no_consumer; fi
+  DN_DIR="$RT_DIR/deliveries/done"
+  done_classify
+  if (( DN_LISTING_BAD )); then
+    IX_BAD=$((IX_BAD + 1))
+    runner_log "could not list runtime/deliveries/done/ reliably; every consumer admission is blocked and no out/ entry is imported until it can be"
+  fi
+  done_parse_runner
+  for (( k = 0; k < ${#DN_KEY[@]}; k++ )); do
+    f="${DN_KEY[k]#./}"
+    IX_ID+=("${f%.json}"); IX_STATE+=("${DN_STATE[k]}"); IX_PATH+=("${DN_PATH[k]}"); IX_REG+=(""); IX_UN+=(0)
+    RECON_CLAIMED+="$US${DN_PATH[k]}$US"
+  done
+  IX_BAD=$((IX_BAD + DN_BADN))
   shopt -s nullglob
   for f in "$RT_DIR"/deliveries/*.json; do
     if ! drec_load "$f"; then
@@ -2829,56 +3128,126 @@ recon_records() {
       runner_log "delivery record ${f##*/} is unreadable; every consumer admission is blocked until it is dealt with"
       continue
     fi
-    changed=0
+    flag=0
     case "$D_STATE" in
-      in_flight)
-        drec_mark_uncertain result_not_recorded "the runner that started this attempt ended before recording its result; the consumer may or may not have finished"
-        runner_log "delivery $D_ID: its in-flight attempt is now uncertain; recover it explicitly"
-        changed=1
-        ;;
+      in_flight) flag=1 ;;
       pending)
-        if [[ ! -d "$GH_DIR/$D_PATH" ]]; then
-          D_STATE=missing; D_REASON=path_missing; changed=1
-          runner_log "delivery $D_ID: $D_PATH is gone from out/; recorded as missing"
-        elif [[ "$D_REASON" != "$want" ]]; then
-          D_REASON="$want"; changed=1
-        fi
+        if [[ ! -d "$GH_DIR/$D_PATH" || "$D_REASON" != "$want" ]]; then flag=1; fi
+        ;;
+      accepted|missing)
+        if ! drec_unresolved; then flag=1; fi
         ;;
     esac
-    if (( changed )); then
-      rc=0; drec_save || rc=$?
-      if (( rc != 0 )); then shopt -u nullglob; return 1; fi
-    fi
     ix_set -1
+    if (( flag )); then WK_KIND+=(fix); WK_IX+=($(( ${#IX_ID[@]} - 1 ))); WK_NAME+=(""); fi
     RECON_CLAIMED+="$US$D_PATH$US"
+  done
+  # Complete out/ directories no record claims become pending deliveries with
+  # origin legacy_out and an unknown occurrence (metadata only: nothing is
+  # marked handed off). A name that is not valid UTF-8 would be stored lossily
+  # and imported again every cycle, so it is reported and left alone.
+  if (( ! DN_LISTING_BAD )); then out_unclaimed "$RECON_CLAIMED"; else UNCL_SET=""; fi
+  for entry in "$OUT"/*; do
+    [[ -n "$UNCL_SET" ]] || break
+    [[ -d "$entry" ]] || continue
+    name="${entry##*/}"
+    [[ "$name" == *.landing ]] && continue
+    [[ "$UNCL_SET" == *"$US""out/$name""$US"* ]] || continue
+    if ! utf8_valid "$name"; then
+      if [[ "$UTF8_LOGGED" != *"$US$name$US"* ]]; then
+        UTF8_LOGGED+="$US$name$US"
+        json_str "out/$name"
+        runner_log "not importing $JSTR: its name is not valid UTF-8 (invalid bytes shown as U+FFFD); rename it"
+      fi
+      continue
+    fi
+    WK_KIND+=(import); WK_IX+=(-1); WK_NAME+=("$name")
   done
   shopt -u nullglob
   return 0
 }
 
-# recon_legacy_import — complete out/ directories no record claims become
-# pending deliveries with origin legacy_out and an unknown occurrence. This
-# imports metadata only: nothing is marked handed off.
-recon_legacy_import() {
-  local entry name rc reason=""
-  if (( ! CFG_PRESENT )); then reason=no_consumer; fi
-  shopt -s nullglob
-  for entry in "$OUT"/*; do
-    [[ -d "$entry" ]] || continue
-    name="${entry##*/}"
-    [[ "$name" == *.landing ]] && continue
-    [[ "$RECON_CLAIMED" == *"$US""out/$name""$US"* ]] && continue
-    rand_hex 8 || { shopt -u nullglob; return 1; }
+# recon_apply_one I — one item of the work list, under the lock. Returns 1 on
+# a journal write failure.
+recon_apply_one() {
+  local i="$1" kind="${WK_KIND[$1]}" ix="${WK_IX[$1]}" want="" rc=0 changed=0 f name
+  if (( ! CFG_PRESENT )); then want=no_consumer; fi
+  if [[ "$kind" == import ]]; then
+    name="${WK_NAME[i]}"
+    rand_hex 8 || return 1
     drec_reset
     D_ID="d-$RAND"; D_PATH="out/$name"; D_ORIGIN=legacy_out; D_STATE=pending
-    D_REASON="$reason"; D_REGAT="$(now_utc)"
-    rc=0; drec_save || rc=$?
-    if (( rc != 0 )); then shopt -u nullglob; return 1; fi
+    D_REASON="$want"; D_REGAT="$(now_utc)"
+    drec_save || rc=$?
+    if (( rc != 0 )); then return 1; fi
     ix_set -1
     RECON_CLAIMED+="$US$D_PATH$US"
     runner_log "imported out/$name as delivery $D_ID (legacy_out)"
+    return 0
+  fi
+  f="$RT_DIR/deliveries/${IX_ID[ix]}.json"
+  if ! drec_load "$f"; then
+    IX_BAD=$((IX_BAD + 1))
+    runner_log "delivery record ${f##*/} is unreadable; every consumer admission is blocked until it is dealt with"
+    return 0
+  fi
+  case "$D_STATE" in
+    in_flight)
+      drec_mark_uncertain result_not_recorded "the runner that started this attempt ended before recording its result; the consumer may or may not have finished"
+      runner_log "delivery $D_ID: its in-flight attempt is now uncertain; recover it explicitly"
+      changed=1
+      ;;
+    pending)
+      if [[ ! -d "$GH_DIR/$D_PATH" ]]; then
+        D_STATE=missing; D_REASON=path_missing; changed=1
+        runner_log "delivery $D_ID: $D_PATH is gone from out/; recorded as missing"
+      elif [[ "$D_REASON" != "$want" ]]; then
+        D_REASON="$want"; changed=1
+      fi
+      ;;
+  esac
+  if (( changed )); then
+    drec_save || rc=$?
+    if (( rc != 0 )); then return 1; fi
+  elif [[ "$D_STATE" == accepted || "$D_STATE" == missing ]] && ! drec_unresolved && delivery_check "${IX_ID[ix]}"; then
+    # Settled for good: file it under done/ (it was just read, so the view is current).
+    done_file_one "$f" || return 1
+  fi
+  ix_set "$ix"
+  return 0
+}
+
+# recon_apply — run the work list in slices of about RECON_SLICE seconds, each
+# under the mutation lock, with the lock released (and a short pause for
+# waiting commands to take it) between slices. Returns 0 even when the lock
+# could not be had or a stop request arrived: what is left is picked up by the
+# next cycle. Returns 1 on a journal write failure (the lock is released).
+recon_apply() {
+  local n=${#WK_KIND[@]} i=0 start
+  while (( i < n )); do
+    runner_enter || return 0
+    start=$SECONDS; DN_FILED=0
+    while (( i < n )); do
+      if ! recon_apply_one "$i"; then unlock_mutation; return 1; fi
+      i=$((i + 1))
+      if (( SECONDS - start >= RECON_SLICE )); then break; fi
+    done
+    if (( DN_FILED )); then
+      rt_fsync "$RT_DIR/deliveries" || true
+      rt_fsync "$DN_DIR" || true
+    fi
+    unlock_mutation
+    if (( i < n )); then sleep 0.3 8>&- 9>&-; fi
   done
-  shopt -u nullglob
+  return 0
+}
+
+# recon_done_flush — persist what the scan and the slices learned about done/.
+recon_done_flush() {
+  if (( DN_DIRTY )); then
+    done_index_write || runner_log "could not update runtime/deliveries/done/index; it is a cache and is rebuilt on demand"
+    DN_DIRTY=0; DN_LAST=""
+  fi
   return 0
 }
 RECON_CLAIMED=""
@@ -2892,7 +3261,7 @@ legacy_note_collision() {
   local f
   [[ -d "$RT_DIR/deliveries" && -n "$GH_LOCK_HELPER" && -z "$GH_RT_MISSING" ]] || return 0
   shopt -s nullglob
-  for f in "$RT_DIR"/deliveries/*.json; do
+  for f in "$RT_DIR"/deliveries/*.json "$RT_DIR"/deliveries/done/*.json; do
     drec_load "$f" || continue
     [[ "$D_PATH" == "$1" && "$D_STATE" != missing ]] || continue
     if (( ${#D_COLL[@]} < 20 )); then
@@ -2920,6 +3289,14 @@ tick_runtime() {
       dst="$OUT/${name}-${now_t}"
     fi
     marker="$(fired_marker_for "$src" "$now_t" "$slot")"
+    if ! utf8_valid "${src#"$GH_DIR"/}"; then
+      if [[ "$UTF8_LOGGED" != *"$US$src$US"* ]]; then
+        UTF8_LOGGED+="$US$src$US"
+        json_str "${src#"$GH_DIR"/}"
+        runner_log "not firing $JSTR: its name is not valid UTF-8 (invalid bytes shown as U+FFFD); rename it"
+      fi
+      continue
+    fi
     tick_item "$name" "$src" "$is_once" "$slot" "$dst" "$marker" "$now_t" || return 1
   done < <(walk_due)
   return 0
@@ -2954,7 +3331,8 @@ tick_note_collision() {
   local rc=0
   ix_find_path "$1"
   if (( IXI < 0 )); then return 0; fi    # an entry no record claims: status shows it as unregistered
-  drec_load "$RT_DIR/deliveries/${IX_ID[IXI]}.json" || return 0
+  drec_locate "${IX_ID[IXI]}" || return 0
+  drec_load "$DREC_AT" || return 0
   if (( ${#D_COLL[@]} < 20 )); then
     D_COLL+=("$3$US$4$US$2")
     drec_save || rc=$?
@@ -3230,8 +3608,9 @@ delivery_control() {
   (( rc == 0 )) || rt_die 6 "$cmd: cannot test the runner lock"
   lock_mutation_or_die "$cmd"
   control_check "$cmd"
-  [[ -f "$RT_DIR/deliveries/$OPT_DELIVERY.json" ]] || rt_die 5 "$cmd: there is no delivery record $OPT_DELIVERY"
-  drec_load "$RT_DIR/deliveries/$OPT_DELIVERY.json" || rt_die 5 "$cmd: the record of delivery $OPT_DELIVERY is unreadable or of an unsupported shape; it was not changed"
+  drec_locate "$OPT_DELIVERY" || rt_die 5 "$cmd: there is no delivery record $OPT_DELIVERY"
+  [[ -f "$DREC_AT" ]] || rt_die 5 "$cmd: there is no delivery record $OPT_DELIVERY"
+  drec_load "$DREC_AT" || rt_die 5 "$cmd: the record of delivery $OPT_DELIVERY is unreadable or of an unsupported shape; it was not changed"
 }
 
 delivery_save_or_die() {
@@ -3446,11 +3825,17 @@ runner_enter() {
 # records facts and admits nothing.
 runner_reconcile_deliveries() {
   runner_enter || return 0
-  if ! recon_prepared || ! recon_records || ! recon_legacy_import; then
+  if ! recon_prepared; then
     unlock_mutation
     runner_fail 6 reconcile_failed "could not reconcile the delivery journal; the runner stops and ownership is retained"
   fi
   unlock_mutation
+  # The rest holds the lock only in short slices (see recon_scan).
+  if ! recon_scan || ! recon_apply; then
+    recon_done_flush
+    runner_fail 6 reconcile_failed "could not reconcile the delivery journal; the runner stops and ownership is retained"
+  fi
+  recon_done_flush
   return 0
 }
 
