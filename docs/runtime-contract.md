@@ -355,6 +355,10 @@ changes require stop/start. A new configuration never resets delivery results
 or bypasses an unresolved invocation from the previous configuration.
 Stdout/stderr go to the runner's output streams, not the JSON protocol; status
 records bounded structured errors, not unredacted consumer output.
+If the runner's own output stream goes away (a supervisor closed the pipe), the
+runner keeps running without logging and records `runner.last_error` with code
+`output_lost` (additive; accepted by Bob on 2026-11-15). Supervisors should give
+`run` output that outlives them, such as a regular file.
 
 Without configuration, cycles still fire deliveries into `out/`, mark them
 `pending` with reason `no_consumer`, and never invoke anything. A later explicit
