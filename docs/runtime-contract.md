@@ -180,6 +180,7 @@ runtime/
   state.json                  # version, revision, pause, owner, runner, config digest
   config.json                 # optional explicit consumer configuration
   deliveries/<id>.json        # path, occurrence, attempts, handoff result
+  deliveries/done/<id>.json   # accepted or missing records the runner filed (implementation reading; README)
   staging/<id>/               # internal incomplete firing, never dispatchable
   locks/                      # instance mutation and runner exclusion locks
 ```

@@ -496,6 +496,51 @@ is the prepared record removed. Each step can be redone or finished by the next
 `run`. The `.landing` names of the passive tick never appear for these.
 Standalone `tick` keeps its legacy behavior.
 
+**Terminal records and the lock (implementation reading).** Not part of the
+accepted contract's interface; `status --json` shows the same deliveries as
+before. A delivery that is `accepted` or `missing` never changes again, so the
+runner files its record under `runtime/deliveries/done/<id>.json` on a later
+cycle (a rename; `retry`, `recover`, `sweep` and `release` look in both
+directories). Next to those files sits `done/index`, a cache the runner
+writes: per filed record, the inode, size, mtime and mode the file had when the
+runner last read it, and the JSON `status` prints for it. This keeps the cost of a
+cycle, of `release` and of `status` from growing with every settled delivery:
+
+* A cycle lists `done/` with one `find` and one `stat`. A record whose signature
+  matches the index is trusted without being parsed; any other (new, edited,
+  replaced, or with a changed mode) is parsed. An unchanged listing costs
+  nothing more. Records that carry `out_collision` entries are never cached, so
+  status always re-reads them.
+* The barrier still fails closed. A file in `done/` that cannot be read, is not
+  a terminal record (for example an `in_flight` one filed there by hand), or also
+  exists in `deliveries/` blocks every consumer admission and shows in `status`
+  as `delivery_record_unreadable` or `delivery_record_malformed`, like an
+  unreadable record in `deliveries/`. The runner does not re-parse a filed record
+  on every cycle, so an in-place edit that leaves the inode, size, mtime (to the
+  second) and mode as they were goes unseen until `done/index` is removed or the
+  record is replaced; any atomic rewrite changes the inode.
+* The index is only a cache: delete it and the next `status` or `run` reads every
+  record once and, for `run`, writes it again. Deleting records (retention) is
+  not part of this layout; `sweep` still refuses while an owner exists.
+* A runner is the only writer of delivery records while it lives, so it reads
+  them without the mutation lock and takes the lock only to write: in slices of
+  about a second, each followed by a short pause for `pause`, `stop`, `retry` or
+  `recover` to take it, each record re-read before it is changed. The first
+  cycle after an upgrade files the existing accepted and missing records the same
+  way; a runner stopped during it finishes the job on the next run. Pending,
+  failed, in-flight and uncertain records stay in `deliveries/` and are read every
+  cycle, so a journal that accumulates those (for example `pending` with reason
+  `no_consumer`) still costs time per cycle, though no longer lock time.
+* The order of `deliveries` in `status --json` follows the files (live records,
+  then filed ones); delivery ids are random, so the order carried no meaning
+  before either.
+
+A name in `out/` or `schedule/` that is not valid UTF-8 (possible on Linux; APFS
+refuses it) cannot round-trip through a record, so it would have been imported
+again every cycle. The runner and `tick` now leave such a schedule item unfired
+and such an `out/` entry unimported; `status` does not list the entry as a
+delivery and reports `out_entry_name_not_utf8` or `schedule_name_not_utf8` instead.
+
 **Serial handoff.** One consumer call at a time per instance, across stop,
 crash and restart:
 
@@ -787,7 +832,8 @@ script answers `capabilities` with its ordinary `unknown command` error (exit 1)
   `state.json` changes while status reads it. An unusable `state.json` also
   shows the runner as `unknown`, owner `null`, and adds `invalid_state` to every
   item's `blocked_by`. A bad `config.json` only sets `consumer.valid: false`.
-  An `out_collision` or a `firing_reconciliation_error` is a diagnostic, not an
+  An `out_collision`, a `firing_reconciliation_error`, an
+  `out_entry_name_not_utf8` or a `schedule_name_not_utf8` is a diagnostic, not an
   inconsistency.
   Clients must refresh before acting. `observed_at` is UTC; schedule times use
   the local clock, as `tick` does.
