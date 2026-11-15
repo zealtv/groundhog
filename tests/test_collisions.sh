@@ -89,4 +89,51 @@ assert_contains "lint notes the shared id on stderr" "$lerr" "item id 'foo' exis
 assert_not_contains "...once, for foo only" "$lerr" "'bar'"
 assert_eq "...and its stdout and exit status are unchanged" "schedule is clean 0" "$lout $lrc"
 
+# --- 5. the runner: one name, three items (daily, weekly, one-shot) ---------------
+new_instance; gh init >/dev/null
+for w in daily "weekly/$dow" once; do gh add "$w" foo >/dev/null 2>&1; echo "$w" > "$GHD/schedule/$w/foo/n.txt"; done
+enroll_ok; gh resume --token-file "$TOK" >/dev/null
+run_once 2
+status_to "$out"
+assert_eq "one delivery owns the name" 1 "$(jq_py where "$out" deliveries path "\"out/foo-$td\"" id | wc -l | tr -d ' ')"
+assert_eq "...the first walked item won (the others left it untouched)" daily "$(cat "$GHD/out/foo-$td/n.txt")"
+assert_eq "...one out_collision per later firing" 2 "$(jget "$out" diagnostics | grep -o '"code":"out_collision"' | wc -l | tr -d ' ')"
+assert_true "...every occurrence is marked fired" test -e "$GHD/fired/$td/weekly/$dow/foo" -a -e "$GHD/fired/$td/once/foo" -a -e "$GHD/fired/$td/daily/foo"
+assert_false "...and the one-shot's source is gone, only the diagnostic remains of it" test -e "$GHD/schedule/once/foo"
+assert_contains "...which names it" "$(jget "$out" diagnostics)" "schedule/once/foo"
+
+# --- 6. the same id in two every/ buckets --------------------------------------------
+new_instance; gh init >/dev/null
+gh add every/1h foo >/dev/null 2>&1; gh add every/30m foo >/dev/null 2>&1
+enroll_ok; gh resume --token-file "$TOK" >/dev/null
+set_clock "2026-11-15 14:05:00"      # both buckets have a slot at 14:00
+run_once 2
+clear_clock
+status_to "$out"
+assert_eq "every/1h and every/30m share the slot name: one delivery" 1 "$(jq_py col "$out" deliveries path | wc -l | tr -d ' ')"
+assert_contains "...and the later bucket's firing is reported" "$(jget "$out" diagnostics)" out_collision
+
+# --- 7. the same name on different dates never collides -------------------------------
+new_instance; gh init >/dev/null
+gh add daily foo >/dev/null
+set_clock "2026-11-14 10:00:00"; gh tick >/dev/null
+set_clock "2026-11-15 10:00:00"; gh tick >/dev/null
+assert_eq "two days, two out names" "foo-2026-11-14 foo-2026-11-15" "$(ls "$GHD/out" | tr '\n' ' ' | sed 's/ $//')"
+clear_clock
+
+# --- 8. a non-directory squatting on the name -----------------------------------------
+# The firing is recorded and not delivered (legacy no-overwrite). No delivery can
+# stand for a file, so the status shows the entry as a diagnostic, and the runner
+# logs the collision.
+new_instance; gh init >/dev/null
+gh add daily foo >/dev/null
+ln -s /nonexistent/target "$GHD/out/foo-$td"
+enroll_ok; gh resume --token-file "$TOK" >/dev/null
+run_once 2
+status_to "$out"
+assert_true "the occurrence is marked fired" test -e "$GHD/fired/$td/daily/foo"
+assert_true "...the squatter is untouched" test -L "$GHD/out/foo-$td"
+assert_contains "...status names the entry" "$(jget "$out" diagnostics)" out_entry_not_directory
+assert_contains "...and the runner logged the collision" "$(cat "$RUN_ERR")" "out_collision"
+
 t_finish
