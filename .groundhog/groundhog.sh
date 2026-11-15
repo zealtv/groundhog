@@ -21,6 +21,8 @@ usage:
   groundhog.sh resume --token-file PATH
   groundhog.sh stop --token-file PATH
   groundhog.sh release --token-file PATH
+  groundhog.sh retry --token-file PATH --delivery ID
+  groundhog.sh recover --token-file PATH --delivery ID --decision retry|accept
 
 notes:
   - this script operates on the .groundhog/ directory beside it
@@ -39,9 +41,12 @@ notes:
   - item contents are opaque to groundhog
   - capabilities and status are strictly read-only and print one JSON object;
     see README.md and docs/runtime-contract.md
-  - enroll, run, pause, resume, stop and release are the optional runner
-    commands; they need the OS-released locking described in README.md, and
-    an owned instance refuses tick, init, add, drop and sweep
+  - enroll, run, pause, resume, stop, release, retry and recover are the
+    optional runner commands; they need the OS-released locking described in
+    README.md, and an owned instance refuses tick, init, add, drop and sweep
+  - run hands pending deliveries to the consumer in runtime/config.json, if
+    there is one; retry and recover are the operator's decisions about a
+    failed or uncertain handoff (see README.md)
 USAGE
 }
 
@@ -705,8 +710,110 @@ cmd_sweep() {
   ensure_dirs
   local days="${1:-14}"
   [[ "$days" =~ ^[0-9]+$ ]] || die "sweep <days> must be a non-negative integer"
-  sweep_dir "$OUT" out "$days"
-  sweep_dir "$FIRED" fired "$days"
+  if sweep_supervised; then
+    sweep_runtime "$days"
+  else
+    sweep_dir "$OUT" out "$days"
+    sweep_dir "$FIRED" fired "$days"
+  fi
+}
+
+# An instance with delivery records or runtime state is supervised: its sweep
+# keeps every payload whose handoff has not been settled.
+sweep_supervised() {
+  [[ -d "$RT_DIR/deliveries" || -e "$RT_STATE" ]]
+}
+
+# sweep_runtime DAYS — the supervised sweep. Pending, failed, in-flight and
+# uncertain deliveries keep their out/ entry, their record and the fired-marker
+# date directory they reference; so do entries no record claims yet (they are
+# unregistered deliveries). Accepted deliveries leave together with their
+# record; a record whose path has been removed from outside leaves as a
+# terminal record once it is old enough. Skipped entries are reported.
+# Unreadable evidence stops the sweep before anything is removed.
+sweep_runtime() {
+  local days="$1" f entry name rel state k n
+  local prot_paths="" prot_dates="" acc_paths="" acc_ids="" gone_ids="" prot_state_list=""
+  local md date_dir
+  shopt -s nullglob
+  for f in "$RT_DIR"/deliveries/*.json; do
+    if ! drec_load "$f"; then
+      shopt -u nullglob
+      die "sweep: ${f##*/} is unreadable or of an unsupported shape; nothing was swept"
+    fi
+    case "$D_STATE" in
+      pending|in_flight|failed|uncertain)
+        prot_paths+="$US$D_PATH$US"
+        prot_state_list+="$US$D_PATH=$D_STATE$US"
+        if [[ "$D_MARKER" == fired/*/* ]]; then
+          md="${D_MARKER#fired/}"; md="${md%%/*}"
+          prot_dates+="$US$md$US"
+        fi
+        ;;
+      accepted)
+        acc_paths+="$US$D_PATH$US"
+        acc_ids+="$US$D_ID$US"
+        ;;
+      missing)
+        gone_ids+="$US$D_ID$US"
+        ;;
+    esac
+  done
+  for entry in "$OUT"/*; do
+    [[ -d "$entry" ]] || continue
+    name="${entry##*/}"
+    rel="out/$name"
+    if [[ "$name" == *.landing ]]; then
+      if [[ -n "$(find "$entry" -maxdepth 0 -type d -mtime +"$days")" ]]; then
+        rm -rf -- "$entry"; printf 'swept out %s\n' "$name"
+      fi
+    elif [[ "$prot_paths" == *"$US$rel$US"* ]]; then
+      state="${prot_state_list#*"$US$rel="}"; state="${state%%"$US"*}"
+      printf 'skipped out %s (%s)\n' "$name" "$state"
+    elif [[ "$acc_paths" == *"$US$rel$US"* ]]; then
+      if [[ -n "$(find "$entry" -maxdepth 0 -type d -mtime +"$days")" ]]; then
+        rm -rf -- "$entry"
+        printf 'swept out %s\n' "$name"
+        sweep_remove_records_for "$rel"
+      fi
+    else
+      printf 'skipped out %s (unregistered)\n' "$name"
+    fi
+  done
+  # Records of removed or terminal deliveries: old enough by the record's own age.
+  for f in "$RT_DIR"/deliveries/*.json; do
+    name="${f##*/}"; name="${name%.json}"
+    if [[ "$gone_ids" == *"$US$name$US"* ]] \
+       && [[ -n "$(find "$f" -maxdepth 0 -type f -mtime +"$days")" ]]; then
+      rm -f "$f"; printf 'swept delivery %s\n' "$name"
+    elif [[ "$acc_ids" == *"$US$name$US"* ]] \
+       && drec_load "$f" && [[ ! -d "$GH_DIR/$D_PATH" ]] \
+       && [[ -n "$(find "$f" -maxdepth 0 -type f -mtime +"$days")" ]]; then
+      rm -f "$f"; printf 'swept delivery %s\n' "$name"
+    fi
+  done
+  shopt -u nullglob
+  for date_dir in "$FIRED"/*; do
+    [[ -d "$date_dir" ]] || continue
+    name="${date_dir##*/}"
+    if [[ -z "$(find "$date_dir" -maxdepth 0 -type d -mtime +"$days")" ]]; then continue; fi
+    if [[ "$prot_dates" == *"$US$name$US"* ]]; then
+      printf 'skipped fired %s (referenced by an unsettled delivery)\n' "$name"
+    else
+      rm -rf -- "$date_dir"; printf 'swept fired %s\n' "$name"
+    fi
+  done
+}
+
+# sweep_remove_records_for OUT_REL — remove the accepted records that claim a
+# swept out/ entry.
+sweep_remove_records_for() {
+  local f
+  for f in "$RT_DIR"/deliveries/*.json; do
+    if drec_load "$f" && [[ "$D_PATH" == "$1" && "$D_STATE" == accepted ]]; then
+      rm -f "$f"; printf 'swept delivery %s\n' "$D_ID"
+    fi
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -726,7 +833,8 @@ GH_PROTOCOL_VERSION=1
 GH_IMPLEMENTATION_VERSION="dev"
 # Advertise only what this script implements here. cmd_capabilities adds
 # ownership-v1, runner-v1 and pause-v1 on hosts where rt_detect finds the locking
-# and durability tools; the consumer stitch adds consumer-v1 and delivery-v1.
+# and durability tools, and consumer-v1 and delivery-v1 where it also finds a way
+# to start a consumer in its own session.
 GH_CAPABILITIES=("status-json-v1")
 
 JSON_LOSSY=0        # set when json_str had to replace bytes that are not UTF-8
@@ -1202,8 +1310,10 @@ state_reset_invalid() {
 C_CONFIGURED=false
 C_VALID=true
 
-# config_check — structural validity of the parsed runtime/config.json. Whether
-# the executable and cwd exist belongs to the consumer-dispatch stitch.
+# config_check — structural validity of the parsed runtime/config.json.
+# config_verify (consumer dispatch section) adds what only this host can judge:
+# the executable, the cwd and the environment names. status runs both; they
+# stat paths and write nothing.
 config_check() {
   local n i key
   jp_get ""
@@ -1249,7 +1359,7 @@ inspect_consumer() {
     diag_add consumer_config_invalid "runtime/config.json is not valid JSON ($JP_ERR)" "$rel"
     return 0
   fi
-  if ! config_check; then
+  if ! config_check || ! config_verify; then
     C_VALID=false
     diag_add consumer_config_invalid "runtime/config.json: $VERR" "$rel"
   fi
@@ -1364,6 +1474,24 @@ delivery_check() {
 DEL_PATH=""
 DEL_STATE=""
 
+# delivery_collision_diags OUT_PATH — after delivery_check on a record: one
+# out_collision diagnostic per later firing that found this out/ entry already
+# present and was recorded without overwriting it.
+delivery_collision_diags() {
+  local n i k date slot sched what
+  jp_get "${US}collisions"
+  [[ "$JP_GT" == a ]] || return 0
+  n="$JP_GV"
+  for (( i = 0; i < n; i++ )); do
+    k="${US}collisions${US}$i"
+    jp_get "$k${US}schedule_path"; sched=""; [[ "$JP_GT" == s ]] && sched="$JP_GV"
+    jp_get "$k${US}date"; date=""; [[ "$JP_GT" == s ]] && date="$JP_GV"
+    jp_get "$k${US}slot"; slot=""; [[ "$JP_GT" == s ]] && slot="$JP_GV"
+    what="${sched:-a schedule item}${date:+ on $date}${slot:+ slot $slot}"
+    diag_add out_collision "$1 already existed when $what fired; the firing was recorded without overwriting it and without a second delivery" "$1"
+  done
+}
+
 inspect_deliveries() {
   local dir="$GH_DIR/runtime/deliveries" f base stem rel entry name
   shopt -s nullglob
@@ -1388,6 +1516,7 @@ inspect_deliveries() {
     fi
     DELIVERIES+=("$JR")
     REG_LIST+="$US$DEL_PATH$US"
+    delivery_collision_diags "$DEL_PATH"
     case "$DEL_STATE" in
       pending|in_flight|failed|uncertain)
         if [[ ! -e "$GH_DIR/$DEL_PATH" ]]; then
@@ -1410,6 +1539,12 @@ inspect_deliveries() {
     [[ "$REG_LIST" == *"$US""out/$name""$US"* ]] && continue
     json_str "out/$name"
     DELIVERIES+=("{\"id\":null,\"path\":$JSTR,\"origin\":\"legacy_out\",\"schedule_path\":null,\"occurrence\":null,\"state\":\"pending\",\"reason\":\"unregistered\",\"attempts\":[],\"execution\":\"unknown\"}")
+  done
+
+  # Firings the runner could not reconcile are set aside, not guessed at.
+  for entry in "$GH_DIR"/runtime/prepared/*.blocked; do
+    name="${entry##*/}"
+    diag_add firing_reconciliation_error "runtime/prepared/$name is a firing that could not be reconciled; its occurrence stays blocked until an operator deals with it" "runtime/prepared/$name"
   done
   shopt -u nullglob
 }
@@ -1584,6 +1719,9 @@ cmd_capabilities() {
   rt_detect
   if [[ -z "$GH_RT_MISSING" ]]; then
     GH_CAPABILITIES+=("ownership-v1" "runner-v1" "pause-v1")
+    if [[ -n "$GH_ISOLATE" ]]; then
+      GH_CAPABILITIES+=("consumer-v1" "delivery-v1")
+    fi
   fi
   for c in "${GH_CAPABILITIES[@]}"; do
     json_str "$c"
@@ -1656,6 +1794,9 @@ GH_LOCK_HELPER=""      # flock | perl | empty (no locking available)
 GH_HASH_TOOL=""        # sha256sum | shasum | openssl
 GH_SYNC_TOOL=""        # perl | sync
 GH_RT_MISSING=""       # what the host lacks for ownership-v1/runner-v1/pause-v1
+GH_ISOLATE=""          # perl | setsid | empty (no way to start a consumer in its own session)
+GH_PERL_BIN=""
+GH_SETSID_BIN=""
 GH_RT_DETECTED=0
 MUT_HELD=0
 PASSIVE_PAUSED=false
@@ -1685,6 +1826,17 @@ rt_detect() {
   [[ -r /dev/urandom ]] || missing+="${missing:+, }/dev/urandom"
   command -v od >/dev/null 2>&1 || missing+="${missing:+, }od"
   GH_RT_MISSING="$missing"
+  # Consumers run in a session of their own (so Ctrl-C on the runner cannot
+  # reach them). Bash cannot do that by itself without job control, so a helper
+  # is needed: perl's POSIX::setsid (preferred; perl is the lock helper on
+  # macOS) or setsid(1). Without one this host offers no consumer-v1.
+  if command -v perl >/dev/null 2>&1 && perl -MPOSIX -e 'exit 0' >/dev/null 2>&1; then
+    GH_ISOLATE=perl
+    GH_PERL_BIN="$(command -v perl)"
+  elif command -v setsid >/dev/null 2>&1; then
+    GH_ISOLATE=setsid
+    GH_SETSID_BIN="$(command -v setsid)"
+  fi
   return 0
 }
 
@@ -1926,7 +2078,7 @@ control_check() {
 }
 
 # --- options -----------------------------------------------------------------
-OPT_TOKEN_FILE=""; OPT_LABEL=""; OPT_INTERVAL=""
+OPT_TOKEN_FILE=""; OPT_LABEL=""; OPT_INTERVAL=""; OPT_DELIVERY=""; OPT_DECISION=""
 # parse_opts CMD ALLOWED… -- ARGS… — every option takes one value and may
 # appear once. Unknown options and stray arguments exit 2.
 parse_opts() {
@@ -1934,10 +2086,10 @@ parse_opts() {
   shift
   while [[ "$1" != -- ]]; do allowed+="$1 "; shift; done
   shift
-  OPT_TOKEN_FILE=""; OPT_LABEL=""; OPT_INTERVAL=""
+  OPT_TOKEN_FILE=""; OPT_LABEL=""; OPT_INTERVAL=""; OPT_DELIVERY=""; OPT_DECISION=""
   while (( $# )); do
     case "$1" in
-      --token-file|--owner-label|--interval-seconds)
+      --token-file|--owner-label|--interval-seconds|--delivery|--decision)
         name="${1#--}"
         [[ "$allowed" == *" $name "* ]] || rt_die 2 "$cmd: unknown option '$1'"
         (( $# >= 2 )) && [[ -n "$2" ]] || rt_die 2 "$cmd: $1 needs a value"
@@ -1945,6 +2097,8 @@ parse_opts() {
           token-file)       [[ -z "$OPT_TOKEN_FILE" ]] || rt_die 2 "$cmd: --token-file given more than once"; OPT_TOKEN_FILE="$2" ;;
           owner-label)      [[ -z "$OPT_LABEL" ]]      || rt_die 2 "$cmd: --owner-label given more than once"; OPT_LABEL="$2" ;;
           interval-seconds) [[ -z "$OPT_INTERVAL" ]]   || rt_die 2 "$cmd: --interval-seconds given more than once"; OPT_INTERVAL="$2" ;;
+          delivery)         [[ -z "$OPT_DELIVERY" ]]   || rt_die 2 "$cmd: --delivery given more than once"; OPT_DELIVERY="$2" ;;
+          decision)         [[ -z "$OPT_DECISION" ]]   || rt_die 2 "$cmd: --decision given more than once"; OPT_DECISION="$2" ;;
         esac
         shift 2
         ;;
@@ -2099,16 +2253,14 @@ cmd_stop() {
   done
 }
 
-# Placeholder for the delivery journal (gh-consumer-dispatch): true when an
-# attempt is still unresolved (in_flight or uncertain), or a record cannot be
-# read. Today nothing writes delivery records, so this reads an empty journal.
+# unresolved_attempt_exists — true when any delivery holds an unresolved attempt
+# (the delivery is in_flight or uncertain, or an attempt is still in_flight), or
+# a record cannot be read (unreadable evidence is never taken for "resolved").
 unresolved_attempt_exists() {
   local f
   shopt -s nullglob
   for f in "$RT_DIR"/deliveries/*.json; do
-    if ! read_text "$f" || ! jp_parse "$TEXT"; then shopt -u nullglob; return 0; fi
-    jp_get "${US}state"
-    case "$JP_GV" in in_flight|uncertain) shopt -u nullglob; return 0 ;; esac
+    if ! drec_load "$f" || drec_unresolved; then shopt -u nullglob; return 0; fi
   done
   shopt -u nullglob
   return 1
@@ -2139,6 +2291,926 @@ cmd_release() {
   echo "released; delete the token file, which no longer authorizes anything"
 }
 
+# ---------------------------------------------------------------------------
+# Consumer dispatch: configuration, the delivery journal, serial handoff,
+# retry and recovery.
+#
+# Delivery records live in runtime/deliveries/<id>.json (one file per delivery,
+# replaced atomically). A firing the runner makes is first written to
+# runtime/prepared/<id>.json, copied into runtime/staging/<id>/, renamed into
+# out/, marked in fired/, recorded as a delivery, and only then is the prepared
+# record removed; every step can be redone or finished by the next run. While a
+# runner is live it is the only writer of delivery records (retry, recover,
+# release and sweep all refuse or wait for a stopped runner), so it keeps an
+# in-memory index (IX_*) of them for a cycle.
+# ---------------------------------------------------------------------------
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# --- consumer configuration ---------------------------------------------------
+CFG_PRESENT=0
+CFG_ARGV=()
+CFG_ENV=()
+CFG_CWD=""
+CFG_DIGEST=""
+RESERVED_ENV=" GROUNDHOG_INSTANCE GROUNDHOG_DELIVERY_ID GROUNDHOG_ATTEMPT_ID "
+
+# config_verify — after config_check accepted the parsed document: the parts
+# only this host can judge (executable, cwd, environment names). Fills CFG_ARGV,
+# CFG_ENV and CFG_CWD. Returns 1 with VERR set (field names, never values).
+# Needs INSTANCE (the canonical instance directory). Writes nothing.
+config_verify() {
+  local n i key name
+  CFG_ARGV=(); CFG_ENV=(); CFG_CWD=""
+  jp_get "${US}consumer${US}argv"
+  n="$JP_GV"
+  for (( i = 0; i < n; i++ )); do
+    jp_get "${US}consumer${US}argv${US}$i"
+    CFG_ARGV+=("$JP_GV")
+  done
+  if [[ ! -f "${CFG_ARGV[0]}" || ! -x "${CFG_ARGV[0]}" ]]; then
+    VERR="consumer.argv[0] is not an existing executable file"
+    return 1
+  fi
+  jp_get "${US}consumer${US}cwd"
+  CFG_CWD="$( CDPATH=; cd "$INSTANCE" 2>/dev/null && cd -- "$JP_GV" 2>/dev/null && pwd -P )" || CFG_CWD=""
+  if [[ -z "$CFG_CWD" ]]; then
+    VERR="consumer.cwd does not name an existing directory"
+    return 1
+  fi
+  n=${#JP_K[@]}
+  for (( i = 0; i < n; i++ )); do
+    key="${JP_K[i]}"
+    [[ "$key" == "${US}consumer${US}env${US}"* ]] || continue
+    name="${key#"${US}consumer${US}env${US}"}"
+    if [[ ! "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      VERR="consumer.env has a name that is not a plain identifier"
+      return 1
+    fi
+    if [[ "$RESERVED_ENV" == *" $name "* ]]; then
+      VERR="consumer.env names a reserved variable ($name)"
+      return 1
+    fi
+    CFG_ENV+=("$name=${JP_V[i]}")
+  done
+  return 0
+}
+
+# runner_config_load — startup: read, validate and freeze runtime/config.json.
+# No file means no consumer (delivery only). Returns 1 with RUNNER_CFG_ERR set
+# when the file is present but unusable.
+RUNNER_CFG_ERR=""
+runner_config_load() {
+  local f="$RT_DIR/config.json"
+  CFG_PRESENT=0; CFG_DIGEST=""
+  [[ -e "$f" || -L "$f" ]] || return 0
+  if ! read_text "$f"; then RUNNER_CFG_ERR="runtime/config.json exists but is not a readable regular file"; return 1; fi
+  sha256_text "$TEXT" || { RUNNER_CFG_ERR="cannot hash runtime/config.json"; return 1; }
+  CFG_DIGEST="sha256:$HASH"
+  if ! jp_parse "$TEXT"; then RUNNER_CFG_ERR="runtime/config.json is not valid JSON ($JP_ERR)"; return 1; fi
+  if ! config_check; then RUNNER_CFG_ERR="runtime/config.json: $VERR"; return 1; fi
+  if ! config_verify; then RUNNER_CFG_ERR="runtime/config.json: $VERR"; return 1; fi
+  CFG_PRESENT=1
+  return 0
+}
+
+# --- small helpers -------------------------------------------------------------
+# rt_atomic_write FILE TEXT — temp file, fsync, rename, fsync the directory.
+# Returns 0; 1 = nothing was replaced; 2 = the replacement may have happened.
+rt_atomic_write() {
+  local f="$1" dir tmp
+  dir="${f%/*}"
+  tmp="$dir/.${f##*/}.$$.tmp"
+  rm -f "$tmp"
+  if ! printf '%s\n' "$2" > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi
+  if ! rt_fsync "$tmp"; then rm -f "$tmp"; return 1; fi
+  if ! mv -f "$tmp" "$f" 2>/dev/null; then rm -f "$tmp"; return 2; fi
+  rt_fsync "$dir" || return 2
+  return 0
+}
+
+# src_generation DIR — inode and modification time, enough to tell a replaced
+# schedule directory from the one that was copied.
+src_generation() {
+  stat -c '%i %Y' -- "$1" 2>/dev/null || stat -f '%i %m' -- "$1" 2>/dev/null || true
+}
+
+# opt_json VALUE — JSON for a string, or null when VALUE is empty. Sets JR.
+opt_json() { str_or_null "$1"; }
+
+# --- delivery records --------------------------------------------------------
+D_ID=""; D_PATH=""; D_ORIGIN="runtime"; D_SCHED=""; D_HASOCC=0; D_DATE=""; D_SLOT=""
+D_STATE="pending"; D_REASON=""; D_REGAT=""; D_MARKER=""
+D_COLL=()            # one per out_collision: date US slot US schedule_path
+A_ID=(); A_START=(); A_FIN=(); A_OUT=(); A_EXIT=(); A_SIG=(); A_ERR=(); A_DEC=(); A_DECAT=()
+
+drec_reset() {
+  D_ID=""; D_PATH=""; D_ORIGIN="runtime"; D_SCHED=""; D_HASOCC=0; D_DATE=""; D_SLOT=""
+  D_STATE="pending"; D_REASON=""; D_REGAT=""; D_MARKER=""
+  D_COLL=()
+  A_ID=(); A_START=(); A_FIN=(); A_OUT=(); A_EXIT=(); A_SIG=(); A_ERR=(); A_DEC=(); A_DECAT=()
+}
+
+# rawstr KEY — the string at KEY ("" for null or absent) in RAWS. Returns 1 if
+# the value has another type.
+RAWS=""
+rawstr() {
+  jp_get "$1"
+  case "$JP_GT" in
+    ""|z) RAWS="" ;;
+    s)    RAWS="$JP_GV" ;;
+    *)    return 1 ;;
+  esac
+}
+
+# drec_load FILE — parse a delivery record into D_* and A_*. Returns 1 if the
+# file is unreadable, malformed or of a shape the runtime does not write; such
+# a record is never rewritten and fails the barrier closed.
+drec_load() {
+  local f="$1" stem n i k c
+  drec_reset
+  stem="${f##*/}"; stem="${stem%.json}"
+  read_text "$f" || return 1
+  jp_parse "$TEXT" || return 1
+  jp_get ""; [[ "$JP_GT" == o ]] || return 1
+  jp_get "${US}schema_version"; [[ "$JP_GT" == n && "$JP_GV" == 1 ]] || return 1
+  jp_get "${US}id"; [[ "$JP_GT" == s && "$JP_GV" == "$stem" && -n "$stem" ]] || return 1
+  D_ID="$stem"
+  jp_get "${US}path"
+  [[ "$JP_GT" == s && "$JP_GV" =~ ^out/[^/]+$ && "$JP_GV" != out/. && "$JP_GV" != out/.. ]] || return 1
+  D_PATH="$JP_GV"
+  jp_get "${US}origin"
+  case "$JP_GT:$JP_GV" in
+    :|s:runtime) D_ORIGIN=runtime ;;
+    s:legacy_out) D_ORIGIN=legacy_out ;;
+    *) return 1 ;;
+  esac
+  rawstr "${US}schedule_path" || return 1; D_SCHED="$RAWS"
+  jp_get "${US}occurrence"
+  case "$JP_GT" in
+    ""|z) D_HASOCC=0 ;;
+    o) D_HASOCC=1
+       rawstr "${US}occurrence${US}date" || return 1; D_DATE="$RAWS"
+       rawstr "${US}occurrence${US}slot" || return 1; D_SLOT="$RAWS" ;;
+    *) return 1 ;;
+  esac
+  jp_get "${US}state"
+  case "$JP_GT:$JP_GV" in
+    s:pending|s:in_flight|s:accepted|s:failed|s:uncertain|s:missing) D_STATE="$JP_GV" ;;
+    *) return 1 ;;
+  esac
+  rawstr "${US}reason" || return 1; D_REASON="$RAWS"
+  rawstr "${US}registered_at" || return 1; D_REGAT="$RAWS"
+  rawstr "${US}fired_marker" || return 1; D_MARKER="$RAWS"
+  jp_get "${US}attempts"
+  case "$JP_GT" in
+    "") ;;
+    a)
+      n="$JP_GV"
+      for (( i = 0; i < n; i++ )); do
+        k="${US}attempts${US}$i"
+        jp_get "$k"; [[ "$JP_GT" == o ]] || return 1
+        jp_get "$k${US}id"; [[ "$JP_GT" == s && -n "$JP_GV" ]] || return 1
+        A_ID[i]="$JP_GV"
+        jp_get "$k${US}started_at"; [[ "$JP_GT" == s ]] || return 1
+        A_START[i]="$JP_GV"
+        jp_nstr "$k${US}finished_at" || return 1; A_FIN[i]="$JR"
+        jp_get "$k${US}outcome"
+        case "$JP_GT:$JP_GV" in
+          s:in_flight|s:accepted|s:failed|s:unknown) A_OUT[i]="$JP_GV" ;;
+          *) return 1 ;;
+        esac
+        jp_get "$k${US}exit_code"
+        case "$JP_GT" in
+          ""|z) A_EXIT[i]=null ;;
+          n) [[ "$JP_GV" =~ ^-?[0-9]{1,9}$ ]] || return 1; A_EXIT[i]="$JP_GV" ;;
+          *) return 1 ;;
+        esac
+        jp_nstr "$k${US}signal" || return 1; A_SIG[i]="$JR"
+        jp_errobj "$k${US}error" || return 1; A_ERR[i]="$JR"
+        jp_get "$k${US}decision"
+        A_DEC[i]=""; A_DECAT[i]=null
+        if [[ -n "$JP_GT" && "$JP_GT" != z ]]; then
+          [[ "$JP_GT" == s && ( "$JP_GV" == retry || "$JP_GV" == accept ) ]] || return 1
+          A_DEC[i]="$JP_GV"
+          jp_nstr "$k${US}decided_at" || return 1; A_DECAT[i]="$JR"
+        fi
+      done
+      ;;
+    *) return 1 ;;
+  esac
+  jp_get "${US}collisions"
+  case "$JP_GT" in
+    "") ;;
+    a)
+      n="$JP_GV"
+      for (( i = 0; i < n; i++ )); do
+        k="${US}collisions${US}$i"
+        jp_get "$k"; [[ "$JP_GT" == o ]] || return 1
+        rawstr "$k${US}date" || return 1; c="$RAWS"
+        rawstr "$k${US}slot" || return 1; c+="$US$RAWS"
+        rawstr "$k${US}schedule_path" || return 1; c+="$US$RAWS"
+        D_COLL[i]="$c"
+      done
+      ;;
+    *) return 1 ;;
+  esac
+  return 0
+}
+
+# drec_render — the record as JSON text in DREC.
+DREC=""
+drec_render() {
+  local id path origin sched occ state reason regat marker att="" coll="" i n j parts
+  json_str "$D_ID"; id="$JSTR"
+  json_str "$D_PATH"; path="$JSTR"
+  json_str "$D_ORIGIN"; origin="$JSTR"
+  str_or_null "$D_SCHED"; sched="$JR"
+  if (( D_HASOCC )); then
+    str_or_null "$D_DATE"; occ="{\"date\":$JR"
+    str_or_null "$D_SLOT"; occ+=",\"slot\":$JR}"
+  else
+    occ=null
+  fi
+  json_str "$D_STATE"; state="$JSTR"
+  str_or_null "$D_REASON"; reason="$JR"
+  str_or_null "$D_REGAT"; regat="$JR"
+  str_or_null "$D_MARKER"; marker="$JR"
+  n=${#A_ID[@]}
+  for (( i = 0; i < n; i++ )); do
+    json_str "${A_ID[i]}"; local aid="$JSTR"
+    json_str "${A_START[i]}"; local ast="$JSTR"
+    json_str "${A_OUT[i]}"; local aout="$JSTR"
+    local one="{\"id\":$aid,\"started_at\":$ast,\"finished_at\":${A_FIN[i]},\"outcome\":$aout,\"exit_code\":${A_EXIT[i]},\"signal\":${A_SIG[i]},\"error\":${A_ERR[i]}"
+    if [[ -n "${A_DEC[i]}" ]]; then
+      json_str "${A_DEC[i]}"; one+=",\"decision\":$JSTR,\"decided_at\":${A_DECAT[i]}"
+    fi
+    att+="${att:+,}$one}"
+  done
+  n=${#D_COLL[@]}
+  for (( i = 0; i < n; i++ )); do
+    IFS="$US" read -r -a parts <<< "${D_COLL[i]}"
+    str_or_null "${parts[0]:-}"; local cd="$JR"
+    str_or_null "${parts[1]:-}"; local cs="$JR"
+    str_or_null "${parts[2]:-}"; local cp="$JR"
+    coll+="${coll:+,}{\"date\":$cd,\"slot\":$cs,\"schedule_path\":$cp}"
+  done
+  DREC="{\"schema_version\":1,\"id\":$id,\"path\":$path,\"origin\":$origin,\"schedule_path\":$sched,\"occurrence\":$occ,\"state\":$state,\"reason\":$reason,\"registered_at\":$regat,\"fired_marker\":$marker,\"attempts\":[$att],\"collisions\":[$coll]}"
+}
+
+# drec_save — write the current D_*/A_* durably. Returns 0, 1 or 2 like
+# rt_atomic_write.
+drec_save() {
+  mkdir -p "$RT_DIR/deliveries" 2>/dev/null || return 1
+  drec_render
+  rt_atomic_write "$RT_DIR/deliveries/$D_ID.json" "$DREC"
+}
+
+# drec_mark_uncertain CODE MESSAGE — the last unresolved attempt has no known
+# result: its outcome becomes unknown and the delivery uncertain.
+drec_mark_uncertain() {
+  local n=${#A_ID[@]} k last=-1 c m
+  for (( k = 0; k < n; k++ )); do
+    if [[ "${A_OUT[k]}" == in_flight ]]; then last=$k; fi
+  done
+  json_str "$1"; c="$JSTR"
+  json_str "$2"; m="$JSTR"
+  if (( last >= 0 )); then
+    A_OUT[last]=unknown
+    A_ERR[last]="{\"code\":$c,\"message\":$m,\"path\":null}"
+  fi
+  D_STATE=uncertain
+  D_REASON="$1"
+}
+
+# drec_unresolved — after drec_load: does this record hold an unresolved attempt?
+drec_unresolved() {
+  local k
+  if [[ "$D_STATE" == in_flight || "$D_STATE" == uncertain ]]; then return 0; fi
+  for (( k = 0; k < ${#A_OUT[@]}; k++ )); do
+    if [[ "${A_OUT[k]}" == in_flight ]]; then return 0; fi
+  done
+  return 1
+}
+
+# --- the in-memory index (one runner cycle) ------------------------------------
+IX_ID=(); IX_STATE=(); IX_PATH=(); IX_REG=(); IX_UN=(); IX_BAD=0
+IXI=-1
+
+ix_reset() { IX_ID=(); IX_STATE=(); IX_PATH=(); IX_REG=(); IX_UN=(); IX_BAD=0; IXI=-1; }
+
+# ix_set I — store the loaded record at index I (-1 appends).
+ix_set() {
+  local i="$1" un=0
+  if drec_unresolved; then un=1; fi
+  if (( i < 0 )); then i=${#IX_ID[@]}; fi
+  IX_ID[i]="$D_ID"; IX_STATE[i]="$D_STATE"; IX_PATH[i]="$D_PATH"; IX_REG[i]="$D_REGAT"; IX_UN[i]="$un"
+}
+
+# ix_find_path PATH — sets IXI to the first record claiming PATH, or -1.
+ix_find_path() {
+  local i n=${#IX_ID[@]}
+  IXI=-1
+  for (( i = 0; i < n; i++ )); do
+    if [[ "${IX_PATH[i]}" == "$1" ]]; then IXI=$i; return 0; fi
+  done
+  return 0
+}
+
+# ix_blocked — is any attempt unresolved, or any record unreadable? Either
+# blocks every consumer admission.
+ix_blocked() {
+  local i n=${#IX_ID[@]}
+  if (( IX_BAD > 0 )); then return 0; fi
+  for (( i = 0; i < n; i++ )); do
+    if [[ "${IX_UN[i]}" == 1 ]]; then return 0; fi
+  done
+  return 1
+}
+
+# ix_next_pending — sets IXI to the oldest pending delivery, or -1.
+ix_next_pending() {
+  local i n=${#IX_ID[@]} best="" cand
+  IXI=-1
+  for (( i = 0; i < n; i++ )); do
+    [[ "${IX_STATE[i]}" == pending ]] || continue
+    cand="${IX_REG[i]}|${IX_ID[i]}"
+    if (( IXI < 0 )) || [[ "$cand" < "$best" ]]; then IXI=$i; best="$cand"; fi
+  done
+  return 0
+}
+
+# --- prepared firings ------------------------------------------------------------
+P_ID=""; P_OUT=""; P_MARKER=""; P_SCHED=""; P_DATE=""; P_SLOT=""; P_ONCE=false; P_GEN=""
+BLOCKED_MARKERS=""      # US-delimited fired-marker paths of blocked firings
+
+prep_load() {
+  local f="$1" stem
+  stem="${f##*/}"; stem="${stem%.json}"
+  read_text "$f" || return 1
+  jp_parse "$TEXT" || return 1
+  jp_get "${US}schema_version"; [[ "$JP_GT" == n && "$JP_GV" == 1 ]] || return 1
+  jp_get "${US}id"; [[ "$JP_GT" == s && "$JP_GV" == "$stem" ]] || return 1
+  P_ID="$stem"
+  jp_get "${US}out_path"; [[ "$JP_GT" == s && "$JP_GV" =~ ^out/[^/]+$ ]] || return 1
+  P_OUT="$JP_GV"
+  jp_get "${US}fired_marker"; [[ "$JP_GT" == s && "$JP_GV" == fired/* ]] || return 1
+  P_MARKER="$JP_GV"
+  jp_get "${US}schedule_path"; [[ "$JP_GT" == s && "$JP_GV" == schedule/* ]] || return 1
+  P_SCHED="$JP_GV"
+  rawstr "${US}occurrence${US}date" || return 1; P_DATE="$RAWS"
+  rawstr "${US}occurrence${US}slot" || return 1; P_SLOT="$RAWS"
+  jp_get "${US}once"; [[ "$JP_GT" == b ]] || return 1
+  P_ONCE="$JP_GV"
+  rawstr "${US}source_generation" || return 1; P_GEN="$RAWS"
+  return 0
+}
+
+# prep_write ID OUT_REL MARKER_REL SCHED_REL DATE SLOT ONCE GEN
+prep_write() {
+  local a b c d e f g h
+  json_str "$1"; a="$JSTR"; json_str "$2"; b="$JSTR"; json_str "$3"; c="$JSTR"
+  json_str "$4"; d="$JSTR"; json_str "$5"; e="$JSTR"; str_or_null "$6"; f="$JR"
+  json_str "$8"; h="$JSTR"
+  g=false; [[ "$7" == 1 ]] && g=true
+  mkdir -p "$RT_DIR/prepared" 2>/dev/null || return 1
+  rt_atomic_write "$RT_DIR/prepared/$1.json" "{\"schema_version\":1,\"id\":$a,\"out_path\":$b,\"fired_marker\":$c,\"schedule_path\":$d,\"occurrence\":{\"date\":$e,\"slot\":$f},\"once\":$g,\"source_generation\":$h,\"created_at\":\"$(now_utc)\"}"
+}
+
+# prep_block FILE REASON — set a prepared firing aside as blocked: its
+# occurrence is not fired again, and status reports it, until an operator deals
+# with it (conflicting or corrupt evidence is never guessed at).
+prep_block() {
+  local f="$1"
+  runner_log "firing ${f##*/} could not be reconciled ($2); its occurrence stays blocked (see status)"
+  mv -f "$f" "${f%.json}.blocked" 2>/dev/null || true
+}
+
+# once_remove SRC GENERATION — remove a fired one-shot's schedule directory
+# (and now-empty parents under once/), unless GENERATION is given and the
+# directory is no longer the one that was copied.
+once_remove() {
+  local src="$1" gen="$2" parent
+  [[ -d "$src" ]] || return 0
+  if [[ -n "$gen" && "$(src_generation "$src")" != "$gen" ]]; then
+    runner_log "left ${src#"$GH_DIR"/} in place: it changed since it was fired"
+    return 0
+  fi
+  rm -rf -- "$src"
+  parent="$(dirname "$src")"
+  while [[ "$parent" != "$SCHED/once" && "$parent" == "$SCHED/once/"* ]]; do
+    rmdir "$parent" 2>/dev/null || break
+    parent="$(dirname "$parent")"
+  done
+  return 0
+}
+
+# firing_complete — finish a firing whose out/ entry exists: marker, delivery
+# record, one-shot removal, then forget the prepared record. Safe to repeat.
+# Uses P_*. Returns 1 on an I/O failure.
+firing_complete() {
+  local markerp="$GH_DIR/$P_MARKER" rec="$RT_DIR/deliveries/$P_ID.json" rc=0
+  mkdir -p "$(dirname "$markerp")" || return 1
+  [[ -e "$markerp" ]] || touch "$markerp" || return 1
+  if [[ ! -e "$rec" ]]; then
+    drec_reset
+    D_ID="$P_ID"; D_PATH="$P_OUT"; D_ORIGIN=runtime; D_SCHED="$P_SCHED"; D_HASOCC=1
+    D_DATE="$P_DATE"; D_SLOT="$P_SLOT"; D_STATE=pending; D_REASON=""; D_REGAT="$(now_utc)"; D_MARKER="$P_MARKER"
+    if (( ! CFG_PRESENT )); then D_REASON=no_consumer; fi
+    drec_save || rc=$?
+    (( rc == 0 )) || return 1
+    ix_set -1
+  fi
+  if [[ "$P_ONCE" == true ]]; then once_remove "$GH_DIR/$P_SCHED" "$P_GEN"; fi
+  rm -f "$RT_DIR/prepared/$P_ID.json"
+  return 0
+}
+
+# --- reconciliation (the first step of every cycle) ----------------------------
+recon_prepared() {
+  local f
+  BLOCKED_MARKERS=""
+  shopt -s nullglob
+  for f in "$RT_DIR"/prepared/*.blocked; do
+    if read_text "$f" && jp_parse "$TEXT"; then
+      jp_get "${US}fired_marker"
+      if [[ "$JP_GT" == s ]]; then BLOCKED_MARKERS+="$US$JP_GV$US"; fi
+    fi
+  done
+  for f in "$RT_DIR"/prepared/*.json; do
+    if ! prep_load "$f"; then prep_block "$f" "unreadable record"; continue; fi
+    if [[ -e "$RT_DIR/staging/$P_ID" || -L "$RT_DIR/staging/$P_ID" ]]; then
+      # Copy not finished (or not renamed): nothing was exposed. Discard it;
+      # the occurrence still has no marker, so the tick fires it afresh.
+      rm -rf -- "$RT_DIR/staging/$P_ID"
+      rm -f "$f"
+      runner_log "discarded an unfinished firing of $P_SCHED"
+    elif [[ -d "$GH_DIR/$P_OUT" ]]; then
+      if ! firing_complete; then shopt -u nullglob; return 1; fi
+      runner_log "completed an interrupted firing of $P_SCHED -> $P_OUT"
+    elif [[ -e "$GH_DIR/$P_MARKER" ]]; then
+      prep_block "$f" "the fired marker exists but out/ has no matching entry"
+      BLOCKED_MARKERS+="$US$P_MARKER$US"
+    else
+      rm -f "$f"
+    fi
+  done
+  shopt -u nullglob
+  return 0
+}
+
+# recon_records — one pass over the delivery records: abandoned in-flight
+# attempts become uncertain, pending deliveries whose path vanished become
+# missing, pending reasons follow whether a consumer is configured. Builds the
+# index. Unreadable records are counted (they fail the barrier closed).
+recon_records() {
+  local f changed want rc
+  ix_reset
+  RECON_CLAIMED=""
+  want=""; if (( ! CFG_PRESENT )); then want=no_consumer; fi
+  shopt -s nullglob
+  for f in "$RT_DIR"/deliveries/*.json; do
+    if ! drec_load "$f"; then
+      IX_BAD=$((IX_BAD + 1))
+      runner_log "delivery record ${f##*/} is unreadable; every consumer admission is blocked until it is dealt with"
+      continue
+    fi
+    changed=0
+    case "$D_STATE" in
+      in_flight)
+        drec_mark_uncertain result_not_recorded "the runner that started this attempt ended before recording its result; the consumer may or may not have finished"
+        runner_log "delivery $D_ID: its in-flight attempt is now uncertain; recover it explicitly"
+        changed=1
+        ;;
+      pending)
+        if [[ ! -d "$GH_DIR/$D_PATH" ]]; then
+          D_STATE=missing; D_REASON=path_missing; changed=1
+          runner_log "delivery $D_ID: $D_PATH is gone from out/; recorded as missing"
+        elif [[ "$D_REASON" != "$want" ]]; then
+          D_REASON="$want"; changed=1
+        fi
+        ;;
+    esac
+    if (( changed )); then
+      rc=0; drec_save || rc=$?
+      if (( rc != 0 )); then shopt -u nullglob; return 1; fi
+    fi
+    ix_set -1
+    RECON_CLAIMED+="$US$D_PATH$US"
+  done
+  shopt -u nullglob
+  return 0
+}
+
+# recon_legacy_import — complete out/ directories no record claims become
+# pending deliveries with origin legacy_out and an unknown occurrence. This
+# imports metadata only: nothing is marked handed off.
+recon_legacy_import() {
+  local entry name rc reason=""
+  if (( ! CFG_PRESENT )); then reason=no_consumer; fi
+  shopt -s nullglob
+  for entry in "$OUT"/*; do
+    [[ -d "$entry" ]] || continue
+    name="${entry##*/}"
+    [[ "$name" == *.landing ]] && continue
+    [[ "$RECON_CLAIMED" == *"$US""out/$name""$US"* ]] && continue
+    rand_hex 8 || { shopt -u nullglob; return 1; }
+    drec_reset
+    D_ID="d-$RAND"; D_PATH="out/$name"; D_ORIGIN=legacy_out; D_STATE=pending
+    D_REASON="$reason"; D_REGAT="$(now_utc)"
+    rc=0; drec_save || rc=$?
+    if (( rc != 0 )); then shopt -u nullglob; return 1; fi
+    ix_set -1
+    RECON_CLAIMED+="$US$D_PATH$US"
+    runner_log "imported out/$name as delivery $D_ID (legacy_out)"
+  done
+  shopt -u nullglob
+  return 0
+}
+RECON_CLAIMED=""
+
+# --- the journaled tick --------------------------------------------------------
+# Same schedule semantics as tick_body, but every firing is journaled and every
+# failure is reported to the caller.
+tick_runtime() {
+  local now_t name src is_once slot dst marker
+  now_t="$(now_today)"
+  while IFS=$'\t' read -r name src is_once slot; do
+    [[ -n "$name" ]] || continue
+    if (( GH_SIGNALED )); then break; fi
+    if [[ -n "$slot" ]]; then
+      dst="$OUT/${name}-${now_t}-${slot}"
+    else
+      dst="$OUT/${name}-${now_t}"
+    fi
+    marker="$(fired_marker_for "$src" "$now_t" "$slot")"
+    tick_item "$name" "$src" "$is_once" "$slot" "$dst" "$marker" "$now_t" || return 1
+  done < <(walk_due)
+  return 0
+}
+
+tick_item() {
+  local name="$1" src="$2" is_once="$3" slot="$4" dst="$5" marker="$6" now_t="$7"
+  local out_rel="out/${dst##*/}" marker_rel="${marker#"$GH_DIR"/}" src_rel="${src#"$GH_DIR"/}"
+  if [[ "$BLOCKED_MARKERS" == *"$US$marker_rel$US"* ]]; then
+    runner_log "skipped $src_rel: an unreconciled firing blocks this occurrence (see status)"
+    return 0
+  fi
+  if [[ -e "$marker" ]]; then
+    :   # already fired for this occurrence
+  elif [[ -e "$dst" || -L "$dst" ]]; then
+    runner_log "warning: out/${dst##*/} already exists; recording the firing of $src_rel without overwrite (out_collision)"
+    mkdir -p "$(dirname "$marker")" || return 1
+    touch "$marker" || return 1
+    tick_note_collision "$out_rel" "$src_rel" "$now_t" "$slot" || return 1
+  else
+    tick_fire "$name" "$src" "$is_once" "$slot" "$dst" "$marker" "$now_t" "$out_rel" "$marker_rel" "$src_rel" || return 1
+    return 0
+  fi
+  if [[ "$is_once" == "1" ]]; then once_remove "$src" ""; fi
+  return 0
+}
+
+# tick_note_collision OUT_REL SRC_REL DATE SLOT — attach an out_collision
+# diagnostic to the delivery that owns the existing out/ entry. No second
+# delivery is invented and no source identity is claimed.
+tick_note_collision() {
+  local rc=0
+  ix_find_path "$1"
+  if (( IXI < 0 )); then return 0; fi    # an entry no record claims: status shows it as unregistered
+  drec_load "$RT_DIR/deliveries/${IX_ID[IXI]}.json" || return 0
+  if (( ${#D_COLL[@]} < 20 )); then
+    D_COLL+=("$3$US$4$US$2")
+    drec_save || rc=$?
+    (( rc == 0 )) || return 1
+  fi
+  return 0
+}
+
+tick_fire() {
+  local name="$1" src="$2" is_once="$3" slot="$4" dst="$5" marker="$6" now_t="$7"
+  local out_rel="$8" marker_rel="$9" src_rel="${10}" id gen rc=0
+  rand_hex 8 || return 1
+  id="d-$RAND"
+  gen="$(src_generation "$src")"
+  prep_write "$id" "$out_rel" "$marker_rel" "$src_rel" "$now_t" "$slot" "$is_once" "$gen" || return 1
+  mkdir -p "$RT_DIR/staging" || return 1
+  rm -rf -- "$RT_DIR/staging/$id"
+  cp -R -- "$src" "$RT_DIR/staging/$id" || return 1
+  [[ ! -e "$dst" && ! -L "$dst" ]] || return 1
+  mv -- "$RT_DIR/staging/$id" "$dst" || return 1
+  rt_fsync "$OUT" || return 1
+  mkdir -p "$(dirname "$marker")" || return 1
+  touch "$marker" || return 1
+  drec_reset
+  D_ID="$id"; D_PATH="$out_rel"; D_ORIGIN=runtime; D_SCHED="$src_rel"; D_HASOCC=1
+  D_DATE="$now_t"; D_SLOT="$slot"; D_STATE=pending; D_REGAT="$(now_utc)"; D_MARKER="$marker_rel"
+  if (( ! CFG_PRESENT )); then D_REASON=no_consumer; fi
+  drec_save || rc=$?
+  (( rc == 0 )) || return 1
+  ix_set -1
+  rm -f "$RT_DIR/prepared/$id.json"
+  if [[ "$is_once" == "1" ]]; then once_remove "$src" "$gen"; fi
+  printf 'fired %s -> %s\n' "$name" "$dst"
+  return 0
+}
+
+# --- handoff -------------------------------------------------------------------
+INFLIGHT_ID=""          # the delivery whose consumer call this runner admitted
+INFLIGHT_ATTEMPT=""
+CPID=""
+CSTATUS=0
+H_ID=""; H_ATTEMPT=""; H_PATH=""
+BARRIER_LOGGED=0
+
+# consumer_start DELIVERY_ABS ID ATTEMPT — start the configured consumer as a
+# background job of its own session, sets CPID. The child gets: cwd, the
+# runner's environment plus the configured map plus the three reserved values,
+# stdin from /dev/null, and neither lock fd (8>&- 9>&-; an inherited lock fd
+# would keep a dead runner's lock alive). argv is exec'd literally: no shell,
+# no PATH search. Neither the token nor the token file reaches it (they live in
+# unexported shell variables and argv of this process only).
+consumer_start() {
+  local delivery="$1" did="$2" aid="$3"
+  (
+    cd -- "$CFG_CWD" || exit 126
+    for e in ${CFG_ENV[@]+"${CFG_ENV[@]}"}; do
+      export "$e" || exit 126
+    done
+    export "GROUNDHOG_INSTANCE=$INSTANCE" "GROUNDHOG_DELIVERY_ID=$did" "GROUNDHOG_ATTEMPT_ID=$aid"
+    case "$GH_ISOLATE" in
+      perl)
+        # setsid(2) makes the child its own session and process group leader,
+        # so Ctrl-C on the runner's terminal cannot reach it. A background job
+        # of a non-interactive shell starts with SIGINT and SIGQUIT ignored;
+        # restore them. The indirect-object exec never goes through a shell.
+        exec "$GH_PERL_BIN" -MPOSIX -e '$SIG{INT} = "DEFAULT"; $SIG{QUIT} = "DEFAULT"; POSIX::setsid() or do { print STDERR "groundhog: setsid failed: $!\n"; POSIX::_exit(126) }; exec { $ARGV[0] } @ARGV; print STDERR "groundhog: cannot execute $ARGV[0]: $!\n"; POSIX::_exit(127)' -- "${CFG_ARGV[@]}" "$delivery"
+        ;;
+      setsid)
+        exec "$GH_SETSID_BIN" -w "${CFG_ARGV[@]}" "$delivery"
+        ;;
+    esac
+    exit 126
+  ) 8>&- 9>&- </dev/null &
+  CPID=$!
+}
+
+# consumer_wait — wait for CPID without blocking signals or stop requests.
+# Returns 0 with CSTATUS set once it exited; 1 when this runner should detach
+# (a signal, or a stop request) and leave it running. The child's own exit is
+# seen by bash's SIGCHLD handling: kill -0 turns false once it is reaped and
+# `wait` then yields its status.
+consumer_wait() {
+  local spid n=0
+  while kill -0 "$CPID" 2>/dev/null; do
+    if (( GH_SIGNALED )); then return 1; fi
+    sleep 0.2 8>&- 9>&- &
+    spid=$!
+    wait "$spid" 2>/dev/null || true
+    n=$((n + 1))
+    if (( n % 5 == 0 )) && runner_poll_stop; then return 1; fi
+  done
+  CSTATUS=0
+  wait "$CPID" 2>/dev/null || CSTATUS=$?
+  return 0
+}
+
+# handoff_admit — one admission under the mutation lock: token, stop request,
+# pause, the instance-wide barrier, then the oldest pending delivery. On
+# success the attempt is durably in_flight and the lock is released. Returns 1
+# when nothing is admitted.
+handoff_admit() {
+  local rc=0 aid n
+  runner_enter || return 1
+  if [[ "$S_PAUSED" == true ]]; then unlock_mutation; return 1; fi
+  if ix_blocked; then
+    if (( ! BARRIER_LOGGED )); then
+      runner_log "consumer admission is blocked: an attempt is unresolved (in flight or uncertain) or a delivery record is unreadable; recover it explicitly"
+      BARRIER_LOGGED=1
+    fi
+    unlock_mutation
+    return 1
+  fi
+  BARRIER_LOGGED=0
+  while :; do
+    ix_next_pending
+    if (( IXI < 0 )); then unlock_mutation; return 1; fi
+    if ! drec_load "$RT_DIR/deliveries/${IX_ID[IXI]}.json"; then
+      IX_BAD=$((IX_BAD + 1)); unlock_mutation; return 1
+    fi
+    if [[ "$D_STATE" != pending ]]; then ix_set "$IXI"; continue; fi
+    if [[ ! -d "$GH_DIR/$D_PATH" ]]; then
+      D_STATE=missing; D_REASON=path_missing
+      rc=0; drec_save || rc=$?
+      if (( rc != 0 )); then unlock_mutation; runner_fail 6 journal_write_failed "could not record delivery $D_ID as missing"; fi
+      ix_set "$IXI"
+      runner_log "delivery $D_ID: $D_PATH is gone from out/; recorded as missing"
+      continue
+    fi
+    break
+  done
+  if [[ ! -f "${CFG_ARGV[0]}" || ! -x "${CFG_ARGV[0]}" ]]; then
+    unlock_mutation
+    runner_fail 2 consumer_unavailable "the configured consumer executable is no longer available; nothing was handed off"
+  fi
+  if [[ ! -d "$CFG_CWD" ]]; then
+    unlock_mutation
+    runner_fail 2 consumer_unavailable "the configured consumer working directory is no longer available; nothing was handed off"
+  fi
+  rand_hex 8 || { unlock_mutation; runner_fail 6 random_failed "cannot read random bytes"; }
+  aid="a-$RAND"
+  H_ID="$D_ID"; H_ATTEMPT="$aid"
+  H_PATH="$( cd "$GH_DIR/$D_PATH" 2>/dev/null && pwd -P )" || H_PATH=""
+  if [[ -z "$H_PATH" ]]; then unlock_mutation; runner_fail 6 delivery_path_unusable "cannot resolve $D_PATH"; fi
+  n=${#A_ID[@]}
+  A_ID[n]="$aid"; A_START[n]="$(now_utc)"; A_FIN[n]=null; A_OUT[n]=in_flight
+  A_EXIT[n]=null; A_SIG[n]=null; A_ERR[n]=null; A_DEC[n]=""; A_DECAT[n]=null
+  D_STATE=in_flight; D_REASON=""
+  # Durable before the consumer exists: a crash after this line leaves an
+  # in_flight attempt that the next run turns into uncertain, never a replay.
+  rc=0; drec_save || rc=$?
+  if (( rc != 0 )); then
+    unlock_mutation
+    runner_fail 6 journal_write_failed "could not record the attempt as in flight; the consumer was not started"
+  fi
+  ix_set "$IXI"
+  INFLIGHT_ID="$H_ID"; INFLIGHT_ATTEMPT="$aid"
+  unlock_mutation
+  return 0
+}
+
+# handoff_record — write the consumer's result into the delivery record. If it
+# cannot be written the attempt stays in_flight (uncertain after exit).
+handoff_record() {
+  local tries=0 rc n code msg sig=null outcome state
+  while :; do
+    rc=0; lock_mutation || rc=$?
+    if (( rc == 0 )); then break; fi
+    tries=$((tries + 1))
+    if (( rc != 1 || tries >= 10 )); then
+      runner_fail 6 result_not_recorded "could not take the mutation lock to record the result of delivery $H_ID; the attempt stays unresolved"
+    fi
+  done
+  if ! drec_load "$RT_DIR/deliveries/$H_ID.json"; then
+    unlock_mutation
+    runner_fail 6 result_not_recorded "the record of delivery $H_ID is unreadable; its attempt stays unresolved"
+  fi
+  n=$(( ${#A_ID[@]} - 1 ))
+  if (( n < 0 )) || [[ "${A_ID[n]}" != "$H_ATTEMPT" || "${A_OUT[n]}" != in_flight ]]; then
+    unlock_mutation
+    runner_fail 6 result_not_recorded "the record of delivery $H_ID no longer shows attempt $H_ATTEMPT in flight; it stays unresolved"
+  fi
+  A_FIN[n]="\"$(now_utc)\""
+  if (( CSTATUS == 0 )); then
+    outcome=accepted; state=accepted
+    A_EXIT[n]=0
+  else
+    outcome=failed; state=failed
+    A_EXIT[n]="$CSTATUS"
+    msg="the consumer exited with status $CSTATUS"
+    code=consumer_failed
+    if (( CSTATUS > 128 && CSTATUS < 160 )); then
+      sig="$(kill -l $((CSTATUS - 128)) 2>/dev/null || true)"
+      if [[ "$sig" =~ ^[A-Z0-9+-]+$ ]]; then
+        A_SIG[n]="\"SIG$sig\""
+        msg="$msg (128 plus signal $((CSTATUS - 128)), SIG$sig, or a script that exited with that number)"
+      fi
+    elif (( CSTATUS == 126 || CSTATUS == 127 )); then
+      msg="$msg (127 and 126 also report that the executable could not be started)"
+    fi
+    json_str "$code"; code="$JSTR"
+    json_str "$msg"; msg="$JSTR"
+    A_ERR[n]="{\"code\":$code,\"message\":$msg,\"path\":null}"
+  fi
+  A_OUT[n]="$outcome"
+  D_STATE="$state"; D_REASON=""
+  rc=0; drec_save || rc=$?
+  unlock_mutation
+  if (( rc != 0 )); then
+    runner_fail 6 result_not_recorded "could not write the result of delivery $H_ID; its attempt stays unresolved"
+  fi
+  ix_find_path "$D_PATH"
+  if (( IXI >= 0 )); then ix_set "$IXI"; fi
+  INFLIGHT_ID=""; INFLIGHT_ATTEMPT=""
+  runner_log "delivery $H_ID: $state"
+}
+
+# runner_handoff_pending — serial handoffs: one consumer call at a time, each
+# admitted under the mutation lock, run outside it, recorded under it again.
+runner_handoff_pending() {
+  (( CFG_PRESENT )) || return 0
+  while :; do
+    if (( GH_SIGNALED || RUNNER_STOP )); then return 0; fi
+    handoff_admit || return 0
+    consumer_start "$H_PATH" "$H_ID" "$H_ATTEMPT"
+    runner_log "handoff: delivery $H_ID, attempt $H_ATTEMPT"
+    if ! consumer_wait; then
+      runner_log "closing admission and detaching from the consumer of delivery $H_ID; it keeps running and the attempt stays unresolved"
+      RUNNER_STOP=1
+      return 0
+    fi
+    handoff_record
+  done
+}
+
+# runner_finalize_inflight — EXIT trap: a consumer call this runner admitted but
+# did not record is uncertain from here on; the next explicit recovery decides.
+runner_finalize_inflight() {
+  local held=$MUT_HELD rc=0
+  [[ -n "$INFLIGHT_ID" ]] || return 0
+  if (( ! held )); then lock_mutation || return 1; fi
+  if drec_load "$RT_DIR/deliveries/$INFLIGHT_ID.json" && [[ "$D_STATE" == in_flight ]]; then
+    drec_mark_uncertain consumer_detached "the runner ended while the consumer's result was not recorded; the consumer may or may not have finished"
+    drec_save || rc=$?
+  fi
+  if (( ! held )); then unlock_mutation; fi
+  INFLIGHT_ID=""
+  return 0
+}
+
+# --- retry and recover -----------------------------------------------------------
+# delivery_control CMD — shared start of retry and recover: a stopped runner
+# (runner exclusion, held until this process exits), the mutation lock, token
+# and state checks, and the named record loaded into D_*/A_*.
+delivery_control() {
+  local cmd="$1" rc=0
+  [[ -n "$OPT_TOKEN_FILE" ]] || rt_die 2 "$cmd: --token-file is required"
+  [[ -n "$OPT_DELIVERY" ]]   || rt_die 2 "$cmd: --delivery is required"
+  [[ "$OPT_DELIVERY" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || rt_die 2 "$cmd: --delivery is not a delivery id"
+  if [[ "$cmd" == recover ]]; then
+    case "$OPT_DECISION" in
+      retry|accept) ;;
+      "") rt_die 2 "recover: --decision retry|accept is required" ;;
+      *)  rt_die 2 "recover: --decision must be retry or accept" ;;
+    esac
+  fi
+  rt_begin "$cmd"
+  token_read "$OPT_TOKEN_FILE"
+  lock_runner_try || rc=$?
+  if (( rc == 1 )); then rt_die 4 "$cmd: a runner is still alive; stop it first"; fi
+  (( rc == 0 )) || rt_die 6 "$cmd: cannot test the runner lock"
+  lock_mutation_or_die "$cmd"
+  control_check "$cmd"
+  [[ -f "$RT_DIR/deliveries/$OPT_DELIVERY.json" ]] || rt_die 5 "$cmd: there is no delivery record $OPT_DELIVERY"
+  drec_load "$RT_DIR/deliveries/$OPT_DELIVERY.json" || rt_die 5 "$cmd: the record of delivery $OPT_DELIVERY is unreadable or of an unsupported shape; it was not changed"
+}
+
+delivery_save_or_die() {
+  local rc=0
+  drec_save || rc=$?
+  if (( rc != 0 )); then rt_die 6 "$1: could not write the record of delivery $D_ID (it may or may not have changed; run status to see)"; fi
+}
+
+cmd_retry() {
+  parse_opts retry token-file delivery -- "$@"
+  delivery_control retry
+  case "$D_STATE" in
+    failed)
+      D_STATE=pending; D_REASON=""
+      delivery_save_or_die retry
+      unlock_mutation
+      echo "retried: delivery $D_ID is pending; the next run creates a new attempt"
+      ;;
+    pending)
+      unlock_mutation
+      echo "delivery $D_ID is already pending"
+      ;;
+    in_flight|uncertain)
+      rt_die 5 "retry: delivery $D_ID has an unresolved attempt; use 'recover' once you have established that the consumer call finished"
+      ;;
+    *)
+      rt_die 5 "retry: delivery $D_ID is $D_STATE; only a failed delivery can be retried"
+      ;;
+  esac
+}
+
+cmd_recover() {
+  parse_opts recover token-file delivery decision -- "$@"
+  delivery_control recover
+  local n now
+  case "$D_STATE" in
+    in_flight|uncertain) ;;
+    *) rt_die 5 "recover: delivery $D_ID is $D_STATE; only an unresolved (in flight or uncertain) delivery can be recovered" ;;
+  esac
+  if [[ "$D_STATE" == in_flight ]]; then
+    # An abandoned in-flight attempt: the runner is stopped, so nothing records its result.
+    drec_mark_uncertain result_not_recorded "the runner that started this attempt ended before recording its result; the consumer may or may not have finished"
+  fi
+  n=$(( ${#A_ID[@]} - 1 ))
+  (( n >= 0 )) || rt_die 5 "recover: delivery $D_ID has no attempt to decide"
+  now="\"$(now_utc)\""
+  A_DEC[n]="$OPT_DECISION"; A_DECAT[n]="$now"
+  if [[ "$OPT_DECISION" == accept ]]; then D_STATE=accepted; else D_STATE=pending; fi
+  D_REASON=""
+  delivery_save_or_die recover
+  unlock_mutation
+  if [[ "$OPT_DECISION" == accept ]]; then
+    echo "recovered: delivery $D_ID is accepted on your say-so; no consumer was invoked"
+  else
+    echo "recovered: delivery $D_ID is pending; the next run creates a new attempt if no other attempt is unresolved"
+  fi
+}
+
 # --- the runner --------------------------------------------------------------
 RUNNER_ID=""
 RUNNER_RECORDED=0
@@ -2166,6 +3238,7 @@ runner_on_exit() {
   local rc=$?
   trap '' INT TERM HUP
   if (( RUNNER_RECORDED )); then
+    runner_finalize_inflight || true
     runner_record_exit "$rc" || true
   fi
   exit "$rc"
@@ -2232,21 +3305,18 @@ runner_cycle() {
   runner_handoff_pending
 }
 
-# gh-consumer-dispatch fills these two. Both belong under the mutation lock,
-# check pause and the stop request before admitting anything, and must start
-# any consumer child with `8>&- 9>&-` so it cannot inherit the locks.
-runner_reconcile_deliveries() { :; }   # abandoned in_flight -> uncertain; prepared firings
-runner_handoff_pending() { :; }        # serial consumer calls for eligible pending deliveries
-
-# runner_tick — the firing admission. Under the mutation lock: revalidate the
-# token, honor a stop request, honor the global pause, then tick once.
-runner_tick() {
-  local rc=0 status=0
-  if (( GH_SIGNALED )); then RUNNER_STOP=1; return 0; fi
+# runner_enter — the start of every admission: take the mutation lock, reload
+# state, check the token and any stop request addressed to this runner. Returns
+# 0 holding the lock; 1 without it (lock busy, signal, or stop requested, in
+# which case RUNNER_STOP is set). A changed owner or unusable state ends the
+# runner.
+runner_enter() {
+  local rc=0
+  if (( GH_SIGNALED )); then RUNNER_STOP=1; return 1; fi
   lock_mutation || rc=$?
   if (( rc != 0 )); then
-    runner_log "cycle skipped: the mutation lock is busy"
-    return 0
+    runner_log "step skipped: the mutation lock is busy"
+    return 1
   fi
   if ! rt_load; then
     unlock_mutation
@@ -2257,35 +3327,42 @@ runner_tick() {
     runner_fail 3 owner_changed "the owner record no longer matches this runner's token; the runner stops"
   fi
   if [[ "$R_STOPREQ" == "$RUNNER_ID" ]]; then
-    RUNNER_STOP=1; unlock_mutation; return 0
+    RUNNER_STOP=1; unlock_mutation; return 1
   fi
+  return 0
+}
+
+# runner_reconcile_deliveries — complete or discard interrupted firings, turn
+# abandoned in-flight attempts into uncertain, mark vanished pending paths
+# missing, import legacy out/ entries. Runs whatever the pause bit says: it
+# records facts and admits nothing.
+runner_reconcile_deliveries() {
+  runner_enter || return 0
+  if ! recon_prepared || ! recon_records || ! recon_legacy_import; then
+    unlock_mutation
+    runner_fail 6 reconcile_failed "could not reconcile the delivery journal; the runner stops and ownership is retained"
+  fi
+  unlock_mutation
+  return 0
+}
+
+# runner_tick — the firing admission. Under the mutation lock: revalidate the
+# token, honor a stop request, honor the global pause, then tick once with the
+# journaled tick.
+runner_tick() {
+  local status=0
+  runner_enter || return 0
   if [[ "$S_PAUSED" == true ]]; then
     if (( ! RUNNER_PAUSE_LOGGED )); then runner_log "paused: nothing is admitted until resume"; RUNNER_PAUSE_LOGGED=1; fi
     unlock_mutation
     return 0
   fi
   RUNNER_PAUSE_LOGGED=0
-  # errexit must be live inside the tick but must not end the runner: run it
-  # in a subshell, with errexit off around the call.
-  set +e
-  ( set -e; tick_body )
-  status=$?
-  set -e
+  tick_runtime || status=$?
   unlock_mutation
   if (( status != 0 )); then
     runner_fail 6 tick_failed "tick failed (exit $status); ownership and pause are retained"
   fi
-}
-
-# runner_config_check — startup validation of runtime/config.json. Structure
-# only; the consumer stitch adds executable and cwd checks.
-runner_config_check() {
-  local f="$RT_DIR/config.json"
-  [[ -e "$f" || -L "$f" ]] || return 0
-  if ! read_text "$f"; then echo "runtime/config.json exists but is not a readable regular file"; return 1; fi
-  if ! jp_parse "$TEXT"; then echo "runtime/config.json is not valid JSON ($JP_ERR)"; return 1; fi
-  if ! config_check; then echo "runtime/config.json: $VERR"; return 1; fi
-  return 0
 }
 
 cmd_run() {
@@ -2299,7 +3376,7 @@ cmd_run() {
   rt_begin run
   token_read "$OPT_TOKEN_FILE"
 
-  local rc=0 cerr
+  local rc=0
   lock_runner_try || rc=$?
   if (( rc == 1 )); then rt_die 4 "run: another runner already holds this instance"; fi
   (( rc == 0 )) || rt_die 6 "run: cannot take the runner lock"
@@ -2311,9 +3388,21 @@ cmd_run() {
 
   lock_mutation_or_die run
   control_check run
-  if ! cerr="$(runner_config_check)"; then
+  # The configuration is validated and frozen before anything is ticked or
+  # handed off; a change needs stop and run. Invalid is a visible failure, not
+  # "no consumer".
+  if ! runner_config_load; then
     unlock_mutation
-    rt_die 2 "run: $cerr; nothing was ticked"
+    rt_die 2 "run: $RUNNER_CFG_ERR; nothing was ticked"
+  fi
+  if (( CFG_PRESENT )) && [[ -z "$GH_ISOLATE" ]]; then
+    unlock_mutation
+    rt_die 5 "run: this host has neither perl (POSIX::setsid) nor setsid(1), so it cannot start a consumer in its own session; nothing was ticked"
+  fi
+  if (( CFG_PRESENT )); then
+    json_str "$CFG_DIGEST"; S_DIGEST="$JSTR"
+  else
+    S_DIGEST=null
   fi
   R_RUNNER_ID="$RUNNER_ID"; R_RUNNER_PID="$$"; R_RUNNER_START="$(proc_start_id $$)"; R_STOPREQ=""
   S_RUNNER_STATE=running; S_RUNNER_ERROR=null
@@ -2357,6 +3446,8 @@ main() {
     resume)  shift; cmd_setpause false "$@" ;;
     stop)    shift; cmd_stop    "$@" ;;
     release) shift; cmd_release "$@" ;;
+    retry)   shift; cmd_retry   "$@" ;;
+    recover) shift; cmd_recover "$@" ;;
     -h|--help|help|"") usage ;;
     *) die "unknown command '$cmd'" ;;
   esac
