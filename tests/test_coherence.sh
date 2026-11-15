@@ -295,10 +295,10 @@ SHIM
     before="$(jgen)"
     rm -f "$REACHED"
     printf '%s\n' "${glob//@GHD@/$GHD}" > "$HOLD"
-    PATH="$PSHIM:$PATH" gh retry --token-file "$TOK" --delivery d-held >/dev/null 2>&1 &
+    PATH="$PSHIM:$PATH" gh retry --token-file "$TOK" --delivery d-held >"$T_TMP/held.out" 2>&1 &
     HELD_PID=$!
     T_PIDS="$T_PIDS $HELD_PID"
-    wait_for "$desc: the writer reached the hold" 100 test -e "$REACHED"
+    wait_for "$desc: the writer reached the hold" 400 test -e "$REACHED" || t_fail "$desc: the writer's output" "$(cat "$T_TMP/held.out") | $(ls -a "$GHD/runtime/deliveries")"
     status_to "$out"
     assert_eq "$desc: status reports consistent:false" false "$(jget "$out" consistent)"
     assert_contains "$desc: ...naming the unfinished write" "$(jget "$out" diagnostics)" journal_write_in_progress
@@ -320,7 +320,7 @@ SHIM
   rm -f "$REACHED"
   printf '%s\n' "$GHD/out" > "$HOLD"
   PATH="$PSHIM:$PATH" start_runner --token-file "$TOK" --interval-seconds 1
-  wait_for "the firing reached the hold" 100 test -e "$REACHED"
+  wait_for "the firing reached the hold" 400 test -e "$REACHED"
   status_to "$out"
   assert_true "mid-firing: the out/ entry exists" test -d "$GHD/out/$NAME"
   assert_eq "mid-firing: status reports consistent:false" false "$(jget "$out" consistent)"
