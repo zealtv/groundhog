@@ -380,6 +380,9 @@ cmd_add() {
   local path="$SCHED/$when/$id"
   [[ ! -e "$path" ]] || die "item already exists: $path"
   mkdir -p "$path"
+  LINT_INCLUDE_PAUSED=0
+  lint_scan
+  note_shared_names "$id"
   echo "$path"
 }
 
@@ -444,6 +447,7 @@ tick_body() {
       printf 'warning: %s already exists in out/; recording firing without overwrite\n' "$(basename "$dst")" >&2
       mkdir -p "$(dirname "$marker")"
       touch "$marker"
+      legacy_note_collision "out/$(basename "$dst")" "${src#"$GH_DIR"/}" "$now_t" "$slot"
     else
       tmp="${dst}.landing"
       [[ -e "$tmp" ]] && rm -rf -- "$tmp"
@@ -641,10 +645,35 @@ lint_scan() {
   shopt -u nullglob
 }
 
+# note_shared_names [ID] — after lint_scan: a note on stderr for every item id
+# (or only ID) that exists at more than one schedule path. A firing lands in
+# out/<id>-<date>[-<slot>], so two such items that fire on the same date share
+# one out name: the later firing is recorded in fired/ but not delivered (and a
+# one-shot is still removed). Advisory only; it changes no output or exit code.
+note_shared_names() {
+  local id ids p list n
+  if (( ${#LINT_ITEMS[@]} == 0 )); then return 0; fi
+  if [[ -n "${1:-}" ]]; then ids="$1"
+  else ids="$(printf '%s\n' "${LINT_ITEMS[@]}" | sed 's#.*/##' | LC_ALL=C sort | uniq -d)"; fi
+  [[ -n "$ids" ]] || return 0
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    list=""; n=0
+    for p in "${LINT_ITEMS[@]}"; do
+      if [[ "${p##*/}" == "$id" ]]; then list+="${list:+, }${p#"$GH_DIR"/}"; n=$((n + 1)); fi
+    done
+    if (( n > 1 )); then
+      printf "note: item id '%s' exists at %d schedule paths (%s); firings on one date share out/%s-<date>[-<slot>], and only the first is delivered\n" "$id" "$n" "$list" "$id" >&2
+    fi
+  done <<< "$ids"
+  return 0
+}
+
 cmd_lint() {
   require_root
   LINT_INCLUDE_PAUSED=0
   lint_scan
+  note_shared_names
 
   if (( ${#LINT_ORPHANS[@]} == 0 )); then
     echo "schedule is clean"
@@ -2607,12 +2636,14 @@ ix_set() {
   IX_ID[i]="$D_ID"; IX_STATE[i]="$D_STATE"; IX_PATH[i]="$D_PATH"; IX_REG[i]="$D_REGAT"; IX_UN[i]="$un"
 }
 
-# ix_find_path PATH — sets IXI to the first record claiming PATH, or -1.
+# ix_find_path PATH — sets IXI to the first record claiming PATH whose delivery
+# is not missing (a path can be reused after the first generation vanished), or
+# -1.
 ix_find_path() {
   local i n=${#IX_ID[@]}
   IXI=-1
   for (( i = 0; i < n; i++ )); do
-    if [[ "${IX_PATH[i]}" == "$1" ]]; then IXI=$i; return 0; fi
+    if [[ "${IX_PATH[i]}" == "$1" && "${IX_STATE[i]}" != missing ]]; then IXI=$i; return 0; fi
   done
   return 0
 }
@@ -2828,6 +2859,28 @@ recon_legacy_import() {
   return 0
 }
 RECON_CLAIMED=""
+
+# legacy_note_collision OUT_REL SRC_REL DATE SLOT — the standalone tick found
+# out/ NAME already taken. On an instance that has delivery records (it was
+# supervised once), attach the same out_collision the runner would, so status
+# shows the lost firing instead of leaving it to one line on stderr. Never
+# fails the tick; an instance without records is left exactly as before.
+legacy_note_collision() {
+  local f
+  [[ -d "$RT_DIR/deliveries" && -n "$GH_LOCK_HELPER" && -z "$GH_RT_MISSING" ]] || return 0
+  shopt -s nullglob
+  for f in "$RT_DIR"/deliveries/*.json; do
+    drec_load "$f" || continue
+    [[ "$D_PATH" == "$1" && "$D_STATE" != missing ]] || continue
+    if (( ${#D_COLL[@]} < 20 )); then
+      D_COLL+=("$3$US$4$US$2")
+      drec_save || echo "warning: could not record the out_collision for $1" >&2
+    fi
+    break
+  done
+  shopt -u nullglob
+  return 0
+}
 
 # --- the journaled tick --------------------------------------------------------
 # Same schedule semantics as tick_body, but every firing is journaled and every

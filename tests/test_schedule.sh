@@ -17,7 +17,7 @@ build_fixture() {
            once/2026-11-15/13-00/o-today-late once/2026-12-01/o-future \
            every/15m/e-15 every/3h/e-3h every/7m/e-7 \
            daily/twin weekly/sun/twin monthly/15/twin; do
-    gh add "${w%/*}" "${w##*/}" >/dev/null
+    gh add "${w%/*}" "${w##*/}" >/dev/null 2>&1
   done
   # Paused at the item, at a time folder, at a day folder and at an axis.
   mkdir -p "$GHD/schedule/daily/p-item.paused" \
