@@ -24,7 +24,7 @@ assert_eq "no state: instance is the canonical directory" "\"$GHD\"" "$(jget "$o
 
 # --- a stopped, owned, paused instance ----------------------------------------
 fresh
-state '{"schema_version":1,"revision":12,"paused":true,"owner":{"id":"o-demo","generation":1,"label":"demo-session","token_verifier":"SECRETVERIFIER"},"runner":{"state":"stopped","last_error":null},"config_digest":null,"instance":"/elsewhere","pid":4242}'
+state '{"schema_version":1,"revision":12,"paused":true,"owner":{"id":"o-demo","generation":1,"label":"demo-session","token_verifier":"SECRETVERIFIER"},"runner":{"state":"stopped","last_error":null},"config_digest":null,"pid":4242}'
 status_to "$out"
 assert_json_valid "$out"
 assert_eq "revision" 12 "$(jget "$out" revision)"
