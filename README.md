@@ -4,9 +4,11 @@ A tiny, file-based protocol for recurring items.
 
 The script remains passive: it materializes deliveries when explicitly ticked.
 The [optional runtime contract](docs/runtime-contract.md) specifies supervision,
-ownership, pause and consumer handoff. Bob accepted the design on 2026-11-15;
-it remains **unimplemented**, and all runtime commands in that contract are
-unavailable in this version. Groundhog works with or without AI. The accepted
+ownership, pause and consumer handoff. Bob accepted the design on 2026-11-15.
+Of it, only the read-only inspection commands (`capabilities --json` and
+`status --json`, see [Inspection](#inspection)) exist in this version; the
+ownership, runner, pause and consumer commands remain **unimplemented**.
+Groundhog works with or without AI. The accepted
 design supports ordinary scripts through literal
 argv, a documented cwd, an absolute delivery path and ordinary exit status. A
 script can finish its work synchronously and exit 0; no SDK, queue, model or AI
@@ -232,6 +234,86 @@ each vendored copy is self-contained.
 ./groundhog.sh drop <item-id>           # remove from schedule/
 ./groundhog.sh out                      # ls out/
 ./groundhog.sh sweep [days]             # remove out/ entries older than N days (default 14)
+./groundhog.sh capabilities --json      # which runtime capabilities this script implements (read-only)
+./groundhog.sh status --json            # one JSON snapshot of schedule, state and deliveries (read-only)
 ```
 
 `<when>` is the schedule path: `daily`, `daily/09`, `daily/09-30`, `weekly`, `weekly/mon`, `weekly/mon/09`, `weekly/mon/09-30`, `monthly`, `monthly/1`, `monthly/15/09`, `monthly/15/09-30`, `yearly`, `yearly/03-15`, `yearly/03-15/09-30`, `once`, `once/2026-05-01`, `once/2026-05-01/09-30`, `every/15m`, `every/3h`. A bare axis (`weekly`, `monthly`, `yearly`, `once`) takes the default slot. `every/` has no default — the bucket is required.
+
+## Inspection
+
+`capabilities --json` and `status --json` are the machine-readable view of an
+instance. Each prints one JSON object and a newline on stdout; diagnostics go to
+stderr. They take exactly `--json` (anything else exits 2), and `status` needs the
+script to sit in a `.groundhog/` directory (otherwise exit 2). Output is UTF-8;
+human output from the other commands is not an API.
+
+They are **strictly read-only**, even on an uninitialized instance: no
+directories, lock files or markers are created, nothing is ticked, repaired or
+overwritten, and payload contents are never read or evaluated (only directory
+names are looked at). The `due`, `list`, `out` and other legacy commands keep
+their behavior, including creating the trays.
+
+```
+$ ./groundhog.sh capabilities --json
+{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1"]}
+```
+
+`capabilities` lists only what this script implements; today that is
+`status-json-v1`. A client needs all six capabilities in the contract before it
+may offer supervised control, so this version supports inspection only. An older
+script answers `capabilities` with its ordinary `unknown command` error (exit 1).
+
+`status --json` follows the projection in the
+[runtime contract](docs/runtime-contract.md#read-only-json-projection):
+
+* `schedule` has one record per recognized item: its `path` (the identity,
+  relative to the instance, so same-named items at different paths stay
+  distinct), `item_id` (the last path component, verbatim), `paused_by` (the
+  `.paused` components above or at the item), `eligible_now`, `fired_marker`,
+  `fired`, `firing_allowed` and `blocked_by`. `eligible_now` and `fired_marker`
+  come from the same `walk_due` and `fired_marker_for` that `tick` and `due` use,
+  so they agree with `due` at any moment. `fired_marker` names the marker for
+  the occurrence due right now and is `null` when none is. Paths the schedule
+  grammar rejects are listed in `diagnostics` (the ones `lint` reports); an item
+  that `tick` would nonetheless fire is also listed, because status says what
+  `tick` would do.
+* `deliveries` lists the records under `runtime/deliveries/` plus, read-only,
+  every other directory in `out/` as `origin: "legacy_out"`, state `pending`,
+  reason `unregistered`, `id: null`. Status registers nothing.
+* `owner`, `paused`, `revision`, `runner` and `consumer` come from
+  `runtime/state.json` and `runtime/config.json` when they exist, and default
+  (`owner: null`, `paused: false`, `revision: 0`, runner `stopped`, consumer not
+  configured) when they do not. Nothing in this version writes those files yet;
+  status parses them so that the later runtime commands and tests have one reader.
+  Secrets (the owner token verifier, consumer argv and environment) are never
+  printed.
+* `consistent` is `false`, with `diagnostics`, when `state.json` or a delivery
+  record is unreadable, malformed or of an unsupported `schema_version`, or when
+  `state.json` changes while status reads it. An unusable `state.json` also
+  shows the runner as `unknown`, owner `null`, and adds `invalid_state` to every
+  item's `blocked_by`. A bad `config.json` only sets `consumer.valid: false`.
+  Clients must refresh before acting. `observed_at` is UTC; schedule times use
+  the local clock, as `tick` does.
+
+Item names containing a tab or newline break `walk_due`'s own row format (as they
+do for `tick`); status skips the fragments rather than inventing items.
+
+## Tests
+
+```
+tests/run.sh                  # every test, under each bash found
+tests/run.sh test_state.sh    # one test file
+TEST_BASHES=/bin/bash tests/run.sh
+```
+
+`tests/run.sh` runs each `tests/test_*.sh` under macOS's stock `/bin/bash` 3.2
+and under any newer bash installed (`/opt/homebrew/bin/bash`,
+`/usr/local/bin/bash`, or `bash` on `PATH`). It needs `python3` to parse the JSON
+output (the script itself uses no python) and optionally `jq`, which then parses
+every document as a second opinion. Tests copy the script into temporary
+directories under `$TMPDIR` and never touch a real schedule. To test a chosen
+moment they put a `date` shim first on `PATH`, so the script needs no test hook.
+New tests: add `tests/test_<area>.sh`, source `tests/lib.sh`, and finish with
+`t_finish`.
+

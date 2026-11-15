@@ -1,12 +1,14 @@
 # Optional runtime contract — accepted v1 design
 
-**Design accepted by Bob on 2026-11-15; unimplemented.** None of the commands or
-runtime files specified here exists in the current script. This document
-records the accepted interface for later implementation; it does not enable a
-runner. The existing commands in [README.md](../README.md) remain the current
-passive interface. Basis: the source `groundhog.sh` and Easyhog's `docs/design.md`
-and ownership/ordinary-consumer findings, read on 2026-11-15. Design acceptance
-does not authorize dependent runtime implementation.
+**Design accepted by Bob on 2026-11-15; partly implemented.** As of the
+`gh-inspection-api` stitch (2026-11-15), `groundhog.sh capabilities --json` and
+`groundhog.sh status --json` exist and advertise `status-json-v1` only. Every
+other command and runtime file specified here, and the other five capabilities,
+remain unimplemented. This document records the accepted interface; it does not
+enable a runner. The existing commands in [README.md](../README.md) remain the
+current passive interface. Basis: the source `groundhog.sh` and Easyhog's
+`docs/design.md` and ownership/ordinary-consumer findings, read on 2026-11-15.
+Design acceptance does not authorize dependent runtime implementation.
 
 ## Boundaries and vocabulary
 
