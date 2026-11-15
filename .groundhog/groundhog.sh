@@ -2608,12 +2608,14 @@ ix_set() {
   IX_ID[i]="$D_ID"; IX_STATE[i]="$D_STATE"; IX_PATH[i]="$D_PATH"; IX_REG[i]="$D_REGAT"; IX_UN[i]="$un"
 }
 
-# ix_find_path PATH — sets IXI to the first record claiming PATH, or -1.
+# ix_find_path PATH — sets IXI to the first record claiming PATH whose delivery
+# is not missing (a path can be reused after the first generation vanished), or
+# -1.
 ix_find_path() {
   local i n=${#IX_ID[@]}
   IXI=-1
   for (( i = 0; i < n; i++ )); do
-    if [[ "${IX_PATH[i]}" == "$1" ]]; then IXI=$i; return 0; fi
+    if [[ "${IX_PATH[i]}" == "$1" && "${IX_STATE[i]}" != missing ]]; then IXI=$i; return 0; fi
   done
   return 0
 }
