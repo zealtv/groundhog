@@ -196,7 +196,7 @@ fresh_consumer 'echo x >> "$PWD/calls.txt"'
 mkdir -p "$GHD/out/waiting"                 # a delivery that predates the pause (legacy, imported by run)
 gh pause --token-file "$TOK" >/dev/null 2>&1
 start_runner --token-file "$TOK" --interval-seconds 1
-wait_for "the paused runner registered the delivery" 100 state_is waiting pending
+wait_for "the paused runner registered the delivery" 100 registered waiting
 sleep 2.5
 assert_eq "paused: pending stays pending" '"pending"' "$(dstate waiting)"
 assert_eq "paused: the consumer was not invoked" 0 "$(lines "$INST/calls.txt")"

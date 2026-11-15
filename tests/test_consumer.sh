@@ -233,7 +233,7 @@ write_config "$INST/consumer-copy.sh"
 mkdir -p "$GHD/out/waiting-thing"          # a pending delivery to hand off (legacy, imported by run)
 gh pause --token-file "$TOK" >/dev/null 2>&1
 start_runner --token-file "$TOK" --interval-seconds 1
-wait_for "paused runner imports the delivery" 100 state_is "waiting-thing" pending
+wait_for "paused runner imports the delivery" 100 registered waiting-thing
 rm -f "$INST/consumer-copy.sh"
 gh resume --token-file "$TOK" >/dev/null 2>&1
 wait_exit "the runner ends when its consumer is gone" 60 "$RUNNER_PID"

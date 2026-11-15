@@ -346,6 +346,9 @@ today() { date +%Y-%m-%d; }
 # dstate NAME — state of the delivery at out/NAME.
 dstate() { dget path "out/$1" state; }
 state_is() { [ "$(dstate "$1")" = "\"$2\"" ]; }
+# registered NAME — has a runner imported or fired out/NAME as a delivery with an
+# id? (status alone shows an unrecorded entry as pending/unregistered, id null.)
+registered() { local v; v="$(dget path "out/$1" id)"; [ "$v" != null ] && [ "$v" != "<missing>" ]; }
 # did NAME — the delivery ID at out/NAME, unquoted.
 did() { local v; v="$(dget path "out/$1" id)"; v="${v#\"}"; v="${v%\"}"; printf '%s' "$v"; }
 
