@@ -173,3 +173,18 @@ tree_hash() {
 age_tree() {
   find "$1" -exec touch -h -t 202001010000 {} + 2>/dev/null || find "$1" -exec touch -t 202001010000 {} + 2>/dev/null
 }
+
+# --- runtime support ---------------------------------------------------------
+# have_runtime_support — does this host have what the script needs for the
+# runner (a lock helper, a hash tool, durable writes)? Mirrors rt_detect.
+have_runtime_support() {
+  local lock=0 hash=0 sync=0 v
+  if command -v flock >/dev/null 2>&1; then
+    v="$(flock --version 2>&1 || true)"; case "$v" in *util-linux*) lock=1 ;; esac
+  fi
+  if [ "$lock" -eq 0 ] && command -v perl >/dev/null 2>&1 && perl -MFcntl=:flock -e 'exit 0' >/dev/null 2>&1; then lock=1; fi
+  for v in sha256sum shasum openssl; do command -v "$v" >/dev/null 2>&1 && hash=1; done
+  if command -v perl >/dev/null 2>&1 && perl -MIO::Handle -e 'exit 0' >/dev/null 2>&1; then sync=1
+  elif command -v sync >/dev/null 2>&1; then sync=1; fi
+  [ "$lock" -eq 1 ] && [ "$hash" -eq 1 ] && [ "$sync" -eq 1 ] && [ -r /dev/urandom ]
+}
