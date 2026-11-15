@@ -7,6 +7,8 @@
   jsonq.py find FILE ARR KEY VAL   compact JSON of the first ARR element whose KEY == VAL
   jsonq.py col FILE ARR KEY        KEY of every ARR element, one compact JSON per line
   jsonq.py strings FILE ARR KEY    KEY decoded and written raw, NUL-terminated
+  jsonq.py dget FILE KEY VAL PATH  compact JSON at the dotted PATH inside the first delivery whose
+                                   KEY equals the string VAL, or the text <missing>
   jsonq.py out-names FILE DIR      delivery paths == the entries of DIR (minus *.landing and dotfiles, as `out` lists)
   jsonq.py where FILE ARR KEY JSON OUT
                                    OUT (raw text) of every ARR element whose KEY equals
@@ -65,6 +67,20 @@ def main(argv):
         out = sys.stdout.buffer
         for rec in doc[argv[3]]:
             out.write(rec[argv[4]].encode("utf-8") + b"\0")
+        return 0
+    if cmd == "dget":
+        for rec in doc["deliveries"]:
+            if rec.get(argv[3]) == argv[4]:
+                cur = rec
+                for part in argv[5].split("."):
+                    try:
+                        cur = cur[int(part)] if isinstance(cur, list) else cur[part]
+                    except (KeyError, IndexError, ValueError, TypeError):
+                        print("<missing>")
+                        return 0
+                print(dump(cur))
+                return 0
+        print("<missing>")
         return 0
     if cmd == "out-names":
         import os

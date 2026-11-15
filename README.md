@@ -5,14 +5,17 @@ A tiny, file-based protocol for recurring items.
 The script remains passive: it materializes deliveries when explicitly ticked.
 The [optional runtime contract](docs/runtime-contract.md) specifies supervision,
 ownership, pause and consumer handoff. Bob accepted the design on 2026-11-15.
-Of it, only the read-only inspection commands (`capabilities --json` and
-`status --json`, see [Inspection](#inspection)) exist in this version; the
-ownership, runner, pause and consumer commands remain **unimplemented**.
-Groundhog works with or without AI. The accepted
-design supports ordinary scripts through literal
-argv, a documented cwd, an absolute delivery path and ordinary exit status. A
-script can finish its work synchronously and exit 0; no SDK, queue, model or AI
-account is required. Without a configured consumer, it remains delivery-only.
+This version implements all of it on hosts with the lock and process tools it
+needs: the read-only inspection commands (`capabilities --json` and
+`status --json`, see [Inspection](#inspection)); ownership, the runner and the
+persistent pause ([Runner, ownership and pause](#runner-ownership-and-pause));
+and the optional consumer, the delivery journal, `retry` and `recover`
+([Consumers and deliveries](#consumers-and-deliveries)).
+Groundhog works with or without AI. A consumer is a plain executable run with
+literal argv, a documented cwd, an absolute delivery path and ordinary exit
+status. A script can finish its work synchronously and exit 0; no SDK, queue,
+model or AI account is required. Without a configured consumer, it remains
+delivery-only.
 
 An *item* is a directory. Its position under `schedule/` is when it returns. Each time it's due, a fresh copy lands in `out/`.
 
@@ -239,6 +242,8 @@ each vendored copy is self-contained.
 ./groundhog.sh enroll --owner-label LABEL --token-file ABSENT_ABSOLUTE_PATH
 ./groundhog.sh run --token-file PATH [--interval-seconds N]   # foreground heartbeat (default 60)
 ./groundhog.sh pause|resume|stop|release --token-file PATH
+./groundhog.sh retry --token-file PATH --delivery ID                    # failed -> pending
+./groundhog.sh recover --token-file PATH --delivery ID --decision retry|accept
 ```
 
 `<when>` is the schedule path: `daily`, `daily/09`, `daily/09-30`, `weekly`, `weekly/mon`, `weekly/mon/09`, `weekly/mon/09-30`, `monthly`, `monthly/1`, `monthly/15/09`, `monthly/15/09-30`, `yearly`, `yearly/03-15`, `yearly/03-15/09-30`, `once`, `once/2026-05-01`, `once/2026-05-01/09-30`, `every/15m`, `every/3h`. A bare axis (`weekly`, `monthly`, `yearly`, `once`) takes the default slot. `every/` has no default — the bucket is required.
@@ -268,11 +273,14 @@ $ ./groundhog.sh release --token-file /private/dir/token    # then delete the to
   token and reconcile with `status --json`. The secret never goes into argv,
   `status` or any child's environment.
 * **`run`** takes the runner lock for its lifetime, then repeats a cycle every
-  interval: tick once (unless paused) and, in a later release, reconcile and hand
-  off deliveries. It never enrolls and never clears the pause. A second `run`,
+  interval: reconcile the delivery journal, tick once (unless paused), then hand
+  off pending deliveries to the consumer, if one is configured (see
+  [Consumers and deliveries](#consumers-and-deliveries)). It never enrolls and
+  never clears the pause. A second `run`,
   even with the same token, exits 4. SIGINT, SIGTERM, SIGHUP and `stop` close
-  admission, interrupt the sleep and exit 0, keeping ownership and pause. A
-  failing tick ends the runner with exit 6 and a `runner.last_error`.
+  admission, interrupt the sleep and exit 0, keeping ownership and pause; a
+  consumer call in progress is detached, not killed. A failing tick ends the
+  runner with exit 6 and a `runner.last_error`.
 * **`pause`/`resume`** set the instance-wide pause (idempotently) under the
   mutation lock. Pause survives stop, restart, release and re-enrollment, and is
   independent of the `.paused` suffix on schedule components.
@@ -313,7 +321,7 @@ when the shell exits, however it exits (checked with `kill -9`).
 
 The catch: a child that inherits the descriptor keeps the lock alive after its
 parent dies. The runner therefore starts its long-lived children (`sleep`
-between cycles; later, consumers) with `8>&- 9>&-`. Short-lived tools such as
+between cycles, and every consumer) with `8>&- 9>&-`. Short-lived tools such as
 `cp` hold the descriptors for milliseconds.
 
 **Requirements.** The runner commands and the three capabilities
@@ -321,8 +329,12 @@ between cycles; later, consumers) with `8>&- 9>&-`. Short-lived tools such as
 helper (util-linux `flock` or perl with `Fcntl`); a SHA-256 tool (`sha256sum`,
 `shasum` or `openssl`); `perl` with `IO::Handle` or `sync(1)` for durable writes;
 `od` and `/dev/urandom`. Without them `capabilities` lists `status-json-v1` only,
-`enroll`, `run`, `pause`, `resume`, `stop` and `release` exit 5 with a message,
-and every legacy command works as before without taking any lock. Support is
+`enroll`, `run`, `pause`, `resume`, `stop`, `release`, `retry` and `recover` exit
+5 with a message, and every legacy command works as before without taking any
+lock. `consumer-v1` and `delivery-v1` additionally need a way to start a consumer
+in a session of its own: perl with `POSIX` (it ships with macOS), else
+`setsid(1)`. Without that, the host lists the first four capabilities and `run`
+refuses a configured consumer with exit 5. Support is
 single host, local filesystem; do not share an instance over a network
 filesystem. On macOS `fsync` does not force the drive's write cache to the
 platter.
@@ -342,6 +354,169 @@ a state bound to another directory), `last_generation`, the owner's
 state makes every control command exit 5 and is never overwritten; `status`
 shows it with `consistent: false`.
 
+## Consumers and deliveries
+
+A *delivery* is one directory in `out/`. A *consumer* is whatever you configure
+to receive deliveries: any executable or script, with or without AI. Nothing is
+discovered: a `consume.sh` lying around, in an instance or inside a payload,
+enables nothing. Only an explicit `runtime/config.json` does.
+
+```json
+{
+  "schema_version": 1,
+  "consumer": {
+    "argv": ["/bin/sh", "/example/project/copy-note.sh"],
+    "cwd": "..",
+    "env": {"EXAMPLE_QUEUE": "demo"}
+  }
+}
+```
+
+* `argv` is a nonempty array of literal strings. Element zero must be an
+  absolute path to an existing executable file. A script that is not executable
+  works with an explicit interpreter as above. There is no shell expansion and
+  no PATH search.
+* `cwd` is required, resolved relative to the canonical instance directory
+  (`..` is the project containing `.groundhog/`), and must exist.
+* `env` (optional) is a map of strings. Names must be plain identifiers, and the
+  three reserved names below are refused.
+
+`run` reads and validates the file before it ticks anything, and freezes it for
+the runner's lifetime (a change needs `stop` and `run`). An invalid file,
+a missing executable or cwd, or a reserved name makes `run` exit 2 with the
+reason on stderr and ticks nothing; `status` shows `consumer.valid: false` and a
+`consumer_config_invalid` diagnostic. That differs on purpose from having no
+file: with no `config.json`, `run` still ticks and registers deliveries as
+`pending` with reason `no_consumer`, and invokes nothing. An unowned standalone
+`tick` never invokes a consumer even when a config exists.
+
+**Invocation.** The runner executes `argv` plus one extra argument: the
+canonical absolute delivery directory. The consumer starts in `cwd`, with stdin
+from `/dev/null`, with the runner's environment, then the `env` map, then:
+
+```
+GROUNDHOG_INSTANCE=/absolute/project/.groundhog
+GROUNDHOG_DELIVERY_ID=d-…
+GROUNDHOG_ATTEMPT_ID=a-…
+```
+
+The owner token and the token file's path never reach it. It inherits no lock
+descriptor, so a consumer that outlives a crashed runner cannot hold the runner's
+locks. `argv`, `env` and the consumer's output never appear in `status`;
+stdout and stderr go to the runner's own streams.
+
+**Its own session.** A consumer must survive Ctrl-C on the runner's terminal.
+bash 3.2 on macOS has no `setsid(1)`, so the runner starts the consumer through
+`perl -MPOSIX -e 'POSIX::setsid(); exec …'` when perl has `POSIX`, which is the
+case wherever perl is already the lock helper. The consumer becomes leader of a
+new session and process group (its pgid equals its pid) and replaces perl by
+`exec`, so the pid the runner waits on is the consumer's. The same step restores
+SIGINT and SIGQUIT, which a background job of a non-interactive shell inherits
+as ignored. Where perl lacks `POSIX`, `setsid -w` is used if present (untested
+here, since this was built on macOS); with neither, the host does not offer
+`consumer-v1`. `tests/test_delivery.sh` checks the separate group and that a
+SIGINT to the runner's group leaves the consumer running.
+
+**Acknowledgement.** Exit status 0 is the whole acknowledgement. It means the
+consumer accepted responsibility before returning: either it finished
+synchronous work, or it durably accepted asynchronous work (starting a process is
+not durable acceptance). The delivery becomes `accepted` and stays in `out/`
+unchanged. Any other status, a signal or a failure to start becomes `failed` with
+the exit code and a structured error. bash reports a signal death as 128 plus the
+signal number, and a script can exit with such a number itself, so the record
+carries the status as `exit_code` and, for 129 to 159, also the `signal` name with
+a message that says both readings are possible. A consumer that cannot be started
+exits 126 or 127, with its reason on stderr, likewise ambiguous with a script that
+returns them. `execution` stays `unknown` in every case: Groundhog records the
+handoff, not whether the work succeeded. Groundhog never retries by itself and
+promises no exactly-once effects; consumers deduplicate on `GROUNDHOG_DELIVERY_ID`.
+
+**The journal.** Delivery records live in `runtime/deliveries/<id>.json`, one
+file per delivery, each replaced atomically. The runner's firings are journaled:
+a prepared record (`runtime/prepared/<id>.json`) naming the schedule path,
+fired marker, occurrence and the original source's identity (inode and mtime)
+is written first; the item is copied into `runtime/staging/<id>/`, renamed
+into `out/`, marked in `fired/`, recorded as a pending delivery, and only then
+is the prepared record removed. Each step can be redone or finished by the next
+`run`. The `.landing` names of the passive tick never appear for these.
+Standalone `tick` keeps its legacy behavior.
+
+**Serial handoff.** One consumer call at a time per instance, across stop,
+crash and restart:
+
+1. under the mutation lock the runner checks the token, a stop request, the
+   pause, and the barrier below, picks the oldest pending delivery, and writes an
+   attempt as `in_flight` durably;
+2. it releases the lock and starts the consumer (so `pause`, `stop` and the
+   status commands never wait for a running consumer; `status` takes no locks);
+3. it takes the lock again and records `accepted` or `failed`.
+
+A slow consumer delays only its own instance's later cycles; cycles never
+overlap, and missed slots are skipped, not queued. A paused instance admits no
+new handoff (pending stays pending); a call admitted before the pause finishes
+and records.
+
+**The barrier.** While any attempt is `in_flight`, or any delivery is
+`uncertain`, or any delivery record cannot be read, the runner admits no
+consumer call at all: not for other deliveries, not under a new configuration.
+Ticks still register new deliveries meanwhile (they wait as pending).
+
+**Crash and shutdown.** If the runner dies between step 1 and step 3 (`kill -9`,
+power loss), the record stays `in_flight` with an unknown outcome; `status` shows
+it as such and repairs nothing. The next `run` reconciles it to `uncertain`
+without replaying it. SIGINT, SIGTERM and `stop` do not kill the consumer: they
+close admission, detach and leave the delivery `uncertain` with the error code
+`consumer_detached`. Nothing reports `accepted` merely because a shutdown
+succeeded. A consumer never gets killed by Groundhog.
+
+**`retry` and `recover`** both need the token and a stopped runner (a live one
+makes them exit 4), and both write the record durably before they return.
+
+* `retry --delivery ID` turns a `failed` delivery `pending` (same delivery ID;
+  history kept; the next admission makes a new attempt). Retrying a `pending`
+  delivery changes nothing. Any other state exits 5. If the failed handoff might
+  have had side effects, reconcile them first.
+* `recover --delivery ID --decision accept|retry` settles an `uncertain` (or
+  abandoned `in_flight`) delivery. First establish by your own means that the
+  original consumer call has finished; a lock, a dead runner or a missing pid
+  proves nothing. `accept` records the delivery as `accepted` on your say-so,
+  `retry` makes it `pending`. The decision and its time go on the attempt, whose
+  outcome stays `unknown`. Recovery invokes nothing. Another unresolved attempt
+  keeps the barrier up.
+
+`release` exits 5 while any attempt is unresolved or any record unreadable.
+
+**Reconciliation on `run`**, under the mutation lock, at the start of each cycle
+and whatever the pause says:
+
+* an interrupted firing is completed, or discarded when nothing was exposed
+  (and refired if still due); evidence that conflicts (a fired marker but no
+  `out/` entry, or an unreadable prepared record) is set aside as
+  `runtime/prepared/<id>.blocked`, reported by `status` as
+  `firing_reconciliation_error`, and its occurrence is not fired again;
+* abandoned `in_flight` attempts become `uncertain`;
+* complete `out/` directories without a record become `pending` deliveries with
+  `origin: legacy_out` and an unknown occurrence, ignoring `*.landing`; this
+  imports metadata only and never implies a handoff;
+* pending deliveries whose path vanished become `missing`, never recreated;
+* an `out/` name that already exists when an occurrence fires follows the legacy
+  no-overwrite rule (the firing is recorded, one-shots are still removed), no
+  second delivery is invented, and the existing delivery's record carries an
+  `out_collision` that `status` reports.
+
+One compatibility note: a one-shot whose fired marker already exists is still
+removed by the next tick, as in the legacy script; the source-identity check
+only protects the runner's own recovery from deleting a replacement.
+
+**`sweep` on a supervised instance** (one with delivery records or `state.json`)
+keeps every out entry whose delivery is pending, failed, in flight or
+uncertain, and every unregistered entry, plus the `fired/<date>/` directories
+their markers live in, and reports each as `skipped`. Accepted entries leave
+together with their record; a record whose path is already gone leaves once it is
+old enough, as do terminal `missing` records. An unreadable record stops the
+sweep before it removes anything. An instance with no runtime state sweeps
+exactly as before.
+
 ## Inspection
 
 `capabilities --json` and `status --json` are the machine-readable view of an
@@ -358,14 +533,15 @@ their behavior, including creating the trays.
 
 ```
 $ ./groundhog.sh capabilities --json
-{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","ownership-v1","runner-v1","pause-v1"]}
+{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1"]}
 ```
 
 `capabilities` lists only what this script implements on this host: `status-json-v1`
-always, and `ownership-v1`, `runner-v1` and `pause-v1` where the locking tools
-exist (see [Runner, ownership and pause](#runner-ownership-and-pause)). A client
-needs all six capabilities in the contract before it may offer supervised
-control, and `consumer-v1` and `delivery-v1` are not implemented yet. An older
+always, `ownership-v1`, `runner-v1` and `pause-v1` where the locking tools
+exist (see [Runner, ownership and pause](#runner-ownership-and-pause)), and
+`consumer-v1` and `delivery-v1` where a consumer can also be started in a
+session of its own. A client needs all six capabilities in the contract before
+it may offer supervised control. An older
 script answers `capabilities` with its ordinary `unknown command` error (exit 1).
 
 `status --json` follows the projection in the
@@ -396,19 +572,26 @@ script answers `capabilities` with its ordinary `unknown command` error (exit 1)
   recognize. Paused items keep their cadence.
 * `deliveries` lists the records under `runtime/deliveries/` plus, read-only,
   every other directory in `out/` as `origin: "legacy_out"`, state `pending`,
-  reason `unregistered`, `id: null`. Status registers nothing.
+  reason `unregistered`, `id: null`. Status registers nothing. Reasons the
+  runtime writes: `no_consumer` (pending, no config), `path_missing` (missing),
+  `result_not_recorded` and `consumer_detached` (uncertain).
 * `owner`, `paused`, `revision`, `runner` and `consumer` come from
   `runtime/state.json` and `runtime/config.json` when they exist, and default
   (`owner: null`, `paused: false`, `revision: 0`, runner `stopped`, consumer not
   configured) when they do not. `enroll`, `run`, `pause`, `resume`, `stop` and
-  `release` write `state.json`; nothing writes `config.json` or delivery records
-  yet. Secrets (the owner token verifier, consumer argv and environment) are never
+  `release` write `state.json`; `run`, `retry` and `recover` write delivery
+  records; nothing writes `config.json`. `consumer.valid` also reflects the
+  executable, cwd and environment names (status stats them and runs nothing), and
+  `consumer.config_digest` is the SHA-256 of the file the last `run` froze.
+  Secrets (the owner token verifier, consumer argv and environment) are never
   printed.
 * `consistent` is `false`, with `diagnostics`, when `state.json` or a delivery
   record is unreadable, malformed or of an unsupported `schema_version`, or when
   `state.json` changes while status reads it. An unusable `state.json` also
   shows the runner as `unknown`, owner `null`, and adds `invalid_state` to every
   item's `blocked_by`. A bad `config.json` only sets `consumer.valid: false`.
+  An `out_collision` or a `firing_reconciliation_error` is a diagnostic, not an
+  inconsistency.
   Clients must refresh before acting. `observed_at` is UTC; schedule times use
   the local clock, as `tick` does.
 
@@ -434,6 +617,12 @@ The runner tests start real `run` processes in the background (own process group
 short `--interval-seconds`, bounded waits), prove the lock with Python's
 `fcntl.flock`, and fail if a test leaves a runner behind. `test_runtime_gate.sh`
 simulates a host with no lock helper. Hosts that lack the runner's tools skip the
-runner tests.
+runner tests. The consumer tests (`test_consumer.sh`, `test_delivery.sh`,
+`test_journal.sh`) use plain `/bin/sh` consumers that write marker files, kill
+the runner with `kill -9` or signal its process group while a consumer sleeps,
+hand-write delivery and prepared records for crashes that cannot be timed from
+outside, and skip on hosts without the lock and process-isolation tools. Run them
+from a foreground shell: a runner started from a background job of a
+non-interactive shell inherits an ignored SIGINT and cannot catch it.
 New tests: add `tests/test_<area>.sh`, source `tests/lib.sh`, and finish with
 `t_finish`.

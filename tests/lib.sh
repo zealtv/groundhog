@@ -25,10 +25,13 @@ command -v jq >/dev/null 2>&1 && T_HAVE_JQ=1
 
 # Runner processes the test started; t_finish and t_cleanup make sure none outlives it.
 T_PIDS=""
+# Process groups (consumers run in sessions of their own) that t_cleanup kills.
+T_GROUPS=""
 
 t_cleanup() {
   local p
   for p in $T_PIDS; do kill -9 "$p" 2>/dev/null || true; done
+  for p in $T_GROUPS; do kill -9 -- "-$p" 2>/dev/null || true; done
   chmod -R u+rwx "$T_TMP" 2>/dev/null || true
   rm -rf "$T_TMP"
 }
@@ -301,3 +304,72 @@ time.sleep(float(sys.argv[2]))' "$1" "$2" "$ready" &
 # out_count — number of entries in the instance's out/.
 out_count() { find "$GHD/out" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '; }
 out_is() { [ "$(out_count)" = "$1" ]; }
+
+# --- consumers and deliveries --------------------------------------------------
+# have_isolation — can this host start a consumer in a session of its own?
+have_isolation() {
+  if command -v perl >/dev/null 2>&1 && perl -MPOSIX -e 'exit 0' >/dev/null 2>&1; then return 0; fi
+  command -v setsid >/dev/null 2>&1
+}
+
+CONS=""
+# consumer_script NAME BODY — an executable /bin/sh script in the project
+# directory (the parent of .groundhog). Sets CONS.
+consumer_script() {
+  CONS="$INST/$1"
+  printf '#!/bin/sh\n%s\n' "$2" > "$CONS"
+  chmod +x "$CONS"
+}
+
+CFG_ENV_JSON='{}'
+CFG_CWD=".."
+# write_config ARGV… — runtime/config.json with literal argv (no quotes inside
+# the words), cwd $CFG_CWD and env $CFG_ENV_JSON.
+write_config() {
+  local argv="" a
+  for a in "$@"; do argv="$argv${argv:+,}\"$a\""; done
+  mkdir -p "$GHD/runtime"
+  printf '{"schema_version":1,"consumer":{"argv":[%s],"cwd":"%s","env":%s}}\n' "$argv" "$CFG_CWD" "$CFG_ENV_JSON" > "$GHD/runtime/config.json"
+}
+
+# dget BY VALUE PATH — a field of the delivery whose BY (id or path) equals
+# VALUE, from a fresh status.
+# While DG_CACHED is 1, dget reads the last snapshot instead of running status
+# again (assertion-heavy blocks take one with snap).
+DG_CACHED=0
+snap() { status_to "$T_TMP/dg.json" || true; DG_CACHED=1; }
+dget() {
+  if [ "$DG_CACHED" != 1 ]; then status_to "$T_TMP/dg.json" || true; fi
+  jq_py dget "$T_TMP/dg.json" "$1" "$2" "$3"
+}
+today() { date +%Y-%m-%d; }
+# dstate NAME — state of the delivery at out/NAME.
+dstate() { dget path "out/$1" state; }
+state_is() { [ "$(dstate "$1")" = "\"$2\"" ]; }
+# registered NAME — has a runner imported or fired out/NAME as a delivery with an
+# id? (status alone shows an unrecorded entry as pending/unregistered, id null.)
+registered() { local v; v="$(dget path "out/$1" id)"; [ "$v" != null ] && [ "$v" != "<missing>" ]; }
+# did NAME — the delivery ID at out/NAME, unquoted.
+did() { local v; v="$(dget path "out/$1" id)"; v="${v#\"}"; v="${v%\"}"; printf '%s' "$v"; }
+
+# fresh_consumer BODY — an enrolled instance with one due item (nudge, holding
+# note.txt) and a plain /bin/sh consumer. Sets TOK, CONS and NAME (the
+# delivery's out name).
+fresh_consumer() {
+  new_instance
+  gh init >/dev/null
+  gh add daily nudge >/dev/null
+  echo "hello" > "$GHD/schedule/daily/nudge/note.txt"
+  enroll_ok || return 1
+  consumer_script consumer.sh "$1"
+  write_config /bin/sh "$CONS"
+  NAME="nudge-$(today)"
+}
+
+# pid_alive FILE — does the pid written in FILE name a live process?
+pid_alive() { [ -s "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+# lines FILE — number of lines (0 if absent).
+lines() { if [ -f "$1" ]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
+file_has() { [ -s "$1" ]; }
+# lines_eq FILE N — for wait_for (a command substitution in its arguments would be evaluated only once).
+lines_eq() { [ "$(lines "$1")" -eq "$2" ]; }

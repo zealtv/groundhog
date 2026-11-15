@@ -15,9 +15,14 @@ assert_eq "implementation_version is a string" 'str' \
   "$(jq_py get "$out" implementation_version | cut -c1 | sed 's/"/str/')"
 # Advertise only what exists. The three runtime capabilities appear exactly on
 # hosts that have the locking, hashing and durability tools the runner needs;
-# consumer-v1 and delivery-v1 belong to a later stitch and never appear here.
-if have_runtime_support; then
-  assert_eq "capabilities on a host with locking" \
+# consumer-v1 and delivery-v1 also need a way to start a consumer in a session
+# of its own (perl's POSIX::setsid or setsid(1)). With all six present a client
+# may supervise the instance.
+if have_runtime_support && have_isolation; then
+  assert_eq "capabilities on a host with locking and process isolation" \
+    '["status-json-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1"]' "$(jget "$out" capabilities)"
+elif have_runtime_support; then
+  assert_eq "capabilities on a host with locking but no process isolation" \
     '["status-json-v1","ownership-v1","runner-v1","pause-v1"]' "$(jget "$out" capabilities)"
 else
   assert_eq "capabilities on a host without locking" '["status-json-v1"]' "$(jget "$out" capabilities)"
