@@ -1,12 +1,12 @@
-# Optional runtime contract — proposed v1
+# Optional runtime contract — accepted v1 design
 
-**Unimplemented design for review, 2026-11-15.** None of the commands or
+**Design accepted by Bob on 2026-11-15; unimplemented.** None of the commands or
 runtime files specified here exists in the current script. This document
-settles a proposed interface for later implementation; it does not enable a
+records the accepted interface for later implementation; it does not enable a
 runner. The existing commands in [README.md](../README.md) remain the current
 passive interface. Basis: the source `groundhog.sh` and Easyhog's `docs/design.md`
-and ownership/ordinary-consumer findings, read on 2026-11-15. Bob's design
-acceptance is pending.
+and ownership/ordinary-consumer findings, read on 2026-11-15. Design acceptance
+does not authorize dependent runtime implementation.
 
 ## Boundaries and vocabulary
 
@@ -653,7 +653,7 @@ Enrollment failure examples (no new command is needed):
 | Reconciliation sees another owner ID/generation with the same label | Token is stale/unused for current ownership; label grants no control or takeover. |
 | Reconciliation read is inconsistent or reports storage/state errors | Outcome unresolved; retain token, no work or automatic enrollment. |
 
-## Compatibility and acceptance points
+## Compatibility and accepted design choices
 
 No payload fields, schedule grammar or consumer migration is required for
 passive users. Existing out paths and fired-marker paths retain their meaning.
@@ -669,7 +669,7 @@ a firing without overwrite, and one-shot cleanup still follows. Neither its
 fired marker nor a missing out entry demonstrates execution. Proposed status
 must not reuse those directory-creating code paths for inspection.
 
-Decisions for Bob before implementation: persistent ownership with manual
+Bob accepted these design choices on 2026-11-15: persistent ownership with manual
 lost-token repair; explicit configured argv rather than an automatic hook;
 exit-zero acceptance (synchronous completion or durable delegation) rather than
 stdout JSON; retained payloads and manual retries/recovery; cooperative local
