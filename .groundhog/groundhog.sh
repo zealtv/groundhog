@@ -1183,6 +1183,16 @@ jp_errobj() {
   JR="{\"code\":$code,\"message\":$message,\"path\":$path}"
 }
 
+# canonical_dir DIR — the physical path as the file system spells it. The
+# external pwd asks the kernel (getcwd); bash's builtin `pwd -P` keeps the case
+# the caller typed, which differs on a case-insensitive file system.
+canonical_dir() {
+  local d
+  if [[ -x /bin/pwd ]]; then d="$(cd "$1" && /bin/pwd -P)" || return 1
+  else d="$(cd "$1" && pwd -P)" || return 1; fi
+  printf '%s\n' "$d"
+}
+
 # --- inspection state --------------------------------------------------------
 CONSISTENT=1
 DIAGS=()
@@ -1294,9 +1304,21 @@ inspect_state() {
     diag_add "$VCODE" "runtime/state.json: $VERR" "$rel"
     state_reset_invalid
   else
+    state_bound_check
     state_liveness
   fi
   return 0
+}
+
+# A state bound to another directory (the project moved, or was reached by a
+# different path) stays usable while unowned: the next save rebinds it. While
+# owned, control fails closed (exit 5); status says why and asks for a refresh.
+state_bound_check() {
+  jp_get "${US}instance"
+  if [[ "$JP_GT" == s && "$JP_GV" != "$INSTANCE" ]] && (( S_OWNER_PRESENT )); then
+    CONSISTENT=0
+    diag_add state_bound_elsewhere "runtime/state.json is owned and bound to a different instance directory; control commands exit 5 until it is repaired (see README.md)" "runtime/state.json"
+  fi
 }
 
 # A state file that says a runner is running or stopping may be left over from
@@ -1765,7 +1787,7 @@ cmd_status() {
   json_only_args status "$@"
   GH_BAD_INSTALL_EXIT=2
   resolve_paths
-  INSTANCE="$(cd "$GH_DIR" && pwd -P)"
+  INSTANCE="$(canonical_dir "$GH_DIR")"
   OBSERVED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   inspect_state
@@ -1877,7 +1899,7 @@ rt_paths() {
   RT_DIR="$GH_DIR/runtime"
   RT_LOCKS="$RT_DIR/locks"
   RT_STATE="$RT_DIR/state.json"
-  INSTANCE="$(cd "$GH_DIR" && pwd -P)"
+  INSTANCE="$(canonical_dir "$GH_DIR")"
 }
 
 # rt_begin CMD — common start of the new runtime commands.
@@ -1977,9 +1999,10 @@ rt_fsync() {
   esac
 }
 
-# proc_start_id PID — a normalized process start time, or empty.
+# proc_start_id PID — a normalized process start time, or empty. Fixed to UTC
+# and the C locale so every caller, whatever its TZ, reads the same string.
 proc_start_id() {
-  LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//' || true
+  TZ=UTC0 LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //; s/ $//' || true
 }
 
 # --- state -------------------------------------------------------------------
@@ -2007,7 +2030,7 @@ rt_load() {
   if ! jp_parse "$TEXT"; then RT_ERR="runtime/state.json is not valid JSON ($JP_ERR)"; return 1; fi
   if ! state_check; then RT_ERR="runtime/state.json: $VERR"; return 1; fi
   jp_get "${US}instance"
-  if [[ "$JP_GT" == s && "$JP_GV" != "$INSTANCE" ]]; then
+  if [[ "$JP_GT" == s && "$JP_GV" != "$INSTANCE" ]] && (( S_OWNER_PRESENT )); then
     RT_ERR="runtime/state.json is bound to a different instance directory"; return 1
   fi
   if (( S_OWNER_PRESENT )); then
