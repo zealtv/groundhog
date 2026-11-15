@@ -367,15 +367,14 @@ The `instance` binding exists to protect tokens, so it matters only while the
 instance is owned. A released instance that has moved (or was reached by another
 spelling of its path) simply ignores the stale binding, and the next state write
 records the current directory. An owned instance whose state names another
-directory fails closed: `tick`, `add`, `drop`, `sweep`, `enroll` and the control
-commands exit 5, and `status --json` reports `consistent: false` with the
+directory fails closed: `tick`, `add`, `drop`, `sweep` and `enroll` exit 5, and `status --json` reports `consistent: false` with the
 diagnostic `state_bound_elsewhere`. (A token file names the directory too, so a
 command that reads the old token file stops at the foreign-token check, exit 3,
 before it reads the state.) Offline repair, with no runner running: edit
 `instance` in `runtime/state.json` and in the token file to the directory
 `status` now reports. Moving the project back also works.
-The
-runner's recorded `start_id` is a process start time in UTC with the C locale,
+
+The runner's recorded `start_id` is a process start time in UTC with the C locale,
 so `status` reads the same value from any `TZ`; a runner started by a copy of
 this script from before that change shows `runner_not_observed` until it is
 restarted.
