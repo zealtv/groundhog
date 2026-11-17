@@ -158,8 +158,10 @@ before its first tick. Invalid configuration fails visibly without ticking.
 
 `pause` persists the instance-wide pause and acts as an admission barrier.
 `resume` clears that bit but does not start a runner, enroll or immediately
-execute work itself. `stop` requests shutdown and waits until this runner can
-admit no further work; it neither clears ownership nor changes pause. `release`
+execute work itself. `stop` requests shutdown: the runner admits no further work,
+finishes the consumer call it already admitted and records its result, and then
+exits; `stop` waits until it has (SIGTERM to the runner detaches from the call at
+once instead). It neither clears ownership nor changes pause. `release`
 requires a stopped runner and no unresolved in-flight or uncertain attempt; it
 removes ownership, invalidates the token and leaves pause and delivery records
 intact. Absent a live runner, pause/resume/stop still work with the current token;
@@ -514,17 +516,28 @@ a visible reconciliation error and blocks that occurrence rather than guessing.
 Runtime journals do not retroactively make legacy tick copy/marker operations
 transactional. Ambiguous unjournaled legacy evidence remains diagnostic.
 
-SIGINT/SIGTERM and `stop` close admission, interrupt sleep, and detach from an
+SIGINT/SIGTERM/SIGHUP close admission, interrupt sleep, and detach from an
 already admitted consumer call without killing it or any independent processes
-it launched. If its result cannot be collected before runner exit, record/retain
-`uncertain` and require recovery; never report accepted merely because shutdown succeeded.
-Runner exit and stop success do not establish that this invocation finished.
+it launched. `stop` closes admission and interrupts sleep too, but does not detach:
+the runner keeps waiting for the call it already admitted, records `accepted` or
+`failed` from its result, and only then exits; while `stop` waits it says on
+stderr that it is waiting on a delivery and that SIGTERM on the runner detaches
+now. Amended on 2026-11-17, accepted by Bob; before that, `stop` detached like a
+signal. A consumer call that outlasts a supervisor's wait for `stop` should be
+ended by the supervisor with SIGTERM to the runner; a long job should accept
+quickly and run on its own, or expect a recovery after such a stop timed out
+during it. If a result cannot be collected before runner exit (a signal, a crash),
+record/retain `uncertain` and require recovery; never report accepted merely
+because shutdown succeeded. Runner exit after a signal does not establish that
+this invocation finished; `stop` success means every call the runner admitted has
+recorded a result unless a signal detached it.
 On restart the durable barrier blocks all new consumer invocations until the
 operator establishes completion and records recovery. Release fails while an
 unresolved attempt remains. A hanging consumer therefore cannot silently lose
 its delivery, and supervisor shutdown can leave retained ownership with an
 actionable error. Stop returns once runner exclusion is released; it does not
-prove a detached handoff invocation ended or wait for independent execution.
+prove a detached handoff invocation ended or wait for independent execution
+(it waits for the admitted call itself, not for work that call started).
 A runner failure sets a structured runner error and exits nonzero, retaining
 ownership and pause. Unsupported or malformed state fails closed for execution;
 read-only inspection remains available with diagnostics where possible.
@@ -660,7 +673,7 @@ GH=/example/project/.groundhog/groundhog.sh
 | Synchronous script completes but runner dies before recording exit | in_flight → uncertain on next run; establish invocation finished and verify completed work before recover accept; no automatic replay. |
 | Consumer exits 7 for d-demo-2 | in_flight → failed; later cycles do not retry. |
 | Stop, retry d-demo-2, run | failed → pending → new in_flight attempt; delivery ID unchanged. |
-| Stop detaches d-demo-3 consumer A, explicit restart while A may still act | in_flight → uncertain; consumer B and all other consumer admissions blocked, including with new config; enabled ticks may add pending deliveries. |
+| SIGTERM to the runner detaches d-demo-3 consumer A, explicit restart while A may still act | in_flight → uncertain; consumer B and all other consumer admissions blocked, including with new config; enabled ticks may add pending deliveries. |
 | Crash during d-demo-3 invocation, explicit restart | Same barrier; runner exclusion does not establish that A ended. |
 | Stop, cannot establish A finished | No accept/retry recovery decision; barrier and ownership retained; release fails. |
 | Stop, establish A finished and durable acceptance, recover d-demo-3 with decision accept | uncertain → accepted with decision, no consumer invocation; accepted independent work may continue; next explicit run can admit B if no other unresolved attempt. |

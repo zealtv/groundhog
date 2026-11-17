@@ -286,15 +286,20 @@ $ ./groundhog.sh release --token-file /private/dir/token    # then delete the to
   [Consumers and deliveries](#consumers-and-deliveries)). It never enrolls and
   never clears the pause. A second `run`,
   even with the same token, exits 4. SIGINT, SIGTERM, SIGHUP and `stop` close
-  admission, interrupt the sleep and exit 0, keeping ownership and pause; a
-  consumer call in progress is detached, not killed. A failing tick ends the
+  admission, interrupt the sleep and exit 0, keeping ownership and pause. A
+  signal detaches from a consumer call in progress (it is not killed); `stop`
+  waits for that call to finish and records its result first. A failing tick ends the
   runner with exit 6 and a `runner.last_error`.
 * **`pause`/`resume`** set the instance-wide pause (idempotently) under the
   mutation lock. Pause survives stop, restart, release and re-enrollment, and is
   independent of the `.paused` suffix on schedule components.
 * **`stop`** records a request under the mutation lock, then waits, holding
-  nothing, until the runner has released its lock. With no live runner it returns
-  at once. **`release`** needs a stopped runner and no unresolved delivery
+  nothing, until the runner has released its lock. The runner admits nothing more
+  but finishes the consumer call it already admitted and records `accepted` or
+  `failed` before it exits, so `stop` can take as long as that call. While it
+  waits, `stop` says on stderr that it is waiting on a delivery and that SIGTERM
+  to the runner detaches now (the delivery then becomes `uncertain`). With no live
+  runner, or no call in flight, it returns at once. **`release`** needs a stopped runner and no unresolved delivery
   attempt; it removes the owner and leaves the pause. The generation counter
   persists, so the next `enroll` issues generation + 1.
 * **Standalone `tick`** fails 3 while the instance is owned (ownership wins over
@@ -637,10 +642,16 @@ Ticks still register new deliveries meanwhile (they wait as pending).
 **Crash and shutdown.** If the runner dies between step 1 and step 3 (`kill -9`,
 power loss), the record stays `in_flight` with an unknown outcome; `status` shows
 it as such and repairs nothing. The next `run` reconciles it to `uncertain`
-without replaying it. SIGINT, SIGTERM and `stop` do not kill the consumer: they
+without replaying it. SIGINT, SIGTERM and SIGHUP do not kill the consumer: they
 close admission, detach and leave the delivery `uncertain` with the error code
-`consumer_detached`. Nothing reports `accepted` merely because a shutdown
-succeeded. A consumer never gets killed by Groundhog.
+`consumer_detached`. `stop` closes admission but does not detach: the runner waits
+for the admitted call, records its result, then exits. Nothing reports `accepted`
+merely because a shutdown succeeded. A consumer never gets killed by Groundhog.
+
+A consumer that takes long should therefore accept quickly (hand the job to
+something that runs on its own, then exit 0) or expect a recovery: a supervisor
+whose wait for `stop` runs out and that sends the runner SIGTERM leaves the
+delivery `uncertain`.
 
 **`retry` and `recover`** both need the token and a stopped runner (a live one
 makes them exit 4), and both write the record durably before they return.
