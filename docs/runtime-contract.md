@@ -71,7 +71,7 @@ groundhog.sh run --token-file PATH [--interval-seconds N]
 groundhog.sh pause --token-file PATH
 groundhog.sh resume --token-file PATH
 groundhog.sh stop --token-file PATH
-groundhog.sh release --token-file PATH
+groundhog.sh release --token-file PATH [--leave-unresolved]
 groundhog.sh retry --token-file PATH --delivery ID
 groundhog.sh recover --token-file PATH --delivery ID --decision retry|accept
 ```
@@ -164,7 +164,13 @@ exits; `stop` waits until it has (SIGTERM to the runner detaches from the call a
 once instead). It neither clears ownership nor changes pause. `release`
 requires a stopped runner and no unresolved in-flight or uncertain attempt; it
 removes ownership, invalidates the token and leaves pause and delivery records
-intact. Absent a live runner, pause/resume/stop still work with the current token;
+intact. `release --leave-unresolved` drops the second requirement only: with a
+stopped runner it succeeds although an attempt is `in_flight` or `uncertain`
+(exit 4 with a live runner, as for plain `release`). It writes no delivery record.
+The barrier keys on the delivery records, not on ownership, so it keeps blocking
+every consumer admission after such a release and under any later owner, until
+`recover` settles the attempt; plain `release` keeps its refusal (exit 5, "recover
+it first"). Amended on 2026-11-17, accepted by Bob. Absent a live runner, pause/resume/stop still work with the current token;
 stop is idempotent. Repeated pause/resume set the requested value idempotently.
 Retry and recover require a stopped runner, making operator decisions explicit
 before the next run. Retry of another failed delivery does not lift an unresolved
@@ -229,8 +235,10 @@ remains external even when stopped.
 
 `stop` retains ownership. An owner may deliberately remain stopped but owned,
 keeping its token for later authorized control. To end ownership, explicitly
-`release` after safe stop and reconciliation of unresolved attempts, then delete
-the invalidated private token. Shutdown does not itself require release or
+`release` after safe stop and reconciliation of unresolved attempts (or, for a
+supervisor that cannot wait for that, `release --leave-unresolved`, which leaves
+the unresolved attempts and their barrier for the next owner), then delete the
+invalidated private token. Shutdown does not itself require release or
 clear persistent pause. If a requested stop/release fails, report the retained
 owner and keep its token instead of claiming cleanup. An uncertain enrollment
 likewise retains its token until read-only reconciliation above establishes its
@@ -610,6 +618,10 @@ include a diagnostic PID/start ID/heartbeat, but grants no control. Delivery
 states: `pending`, `in_flight`, `accepted`, `failed`, `uncertain`, `missing`.
 Each attempt has `id`, `started_at`, nullable `finished_at`, `outcome` (in_flight,
 accepted, failed, unknown), nullable `exit_code`, `signal` and structured `error`.
+An attempt admitted from 2026-11-17 on also has `owner_label`, the label of the owner
+that admitted it (additive; absent on earlier attempts, and clients that do not know
+it ignore it), so that `started_at` and `owner_label` together say whose call an
+unresolved attempt was, also after a release and under a later owner.
 Recovery adds `decision` and `decided_at`. Any unresolved `in_flight` or
 `uncertain` delivery blocks every consumer admission even when runner state is
 `stopped` or `running`. Status displays these records without deciding whether
@@ -675,7 +687,8 @@ GH=/example/project/.groundhog/groundhog.sh
 | Stop, retry d-demo-2, run | failed → pending → new in_flight attempt; delivery ID unchanged. |
 | SIGTERM to the runner detaches d-demo-3 consumer A, explicit restart while A may still act | in_flight → uncertain; consumer B and all other consumer admissions blocked, including with new config; enabled ticks may add pending deliveries. |
 | Crash during d-demo-3 invocation, explicit restart | Same barrier; runner exclusion does not establish that A ended. |
-| Stop, cannot establish A finished | No accept/retry recovery decision; barrier and ownership retained; release fails. |
+| Stop, cannot establish A finished | No accept/retry recovery decision; barrier retained; plain release fails (ownership retained). |
+| Stop, `release --leave-unresolved` with A unresolved, later enroll by another session | No owner; d-demo-3 stays uncertain with its attempt's `owner_label` and `started_at`; the new owner's runner admits nothing until `recover`. |
 | Stop, establish A finished and durable acceptance, recover d-demo-3 with decision accept | uncertain → accepted with decision, no consumer invocation; accepted independent work may continue; next explicit run can admit B if no other unresolved attempt. |
 | Stop, establish A finished and reconcile side effects, recover d-demo-3 with decision retry | uncertain → pending; next explicit run may create a new attempt if no other unresolved invocation. |
 | External supervisor stops without release | owner retained, runner stopped; other supervisor enroll fails 3. |
@@ -717,5 +730,7 @@ exit-zero acceptance (synchronous completion or durable delegation) rather than
 stdout JSON; retained payloads and manual retries/recovery; cooperative local
 locking and no mixed-version pause guarantee; upgraded standalone tick refusal
 while owned; and explicit release only after safe stop and reconciliation of
-unresolved handoffs. No dependent runtime implementation is authorized by this
-document.
+unresolved handoffs. Bob accepted on 2026-11-17 that `release --leave-unresolved` may
+release with an unresolved attempt, the handoff barrier staying until `recover`, and
+that an attempt records the admitting owner's label. No dependent runtime
+implementation is authorized by this document.

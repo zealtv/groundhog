@@ -250,6 +250,7 @@ Neither starts a runner, enrolls an owner or writes a configuration: see
 ./groundhog.sh enroll --owner-label LABEL --token-file ABSENT_ABSOLUTE_PATH
 ./groundhog.sh run --token-file PATH [--interval-seconds N]   # foreground heartbeat (default 60)
 ./groundhog.sh pause|resume|stop|release --token-file PATH
+./groundhog.sh release --token-file PATH --leave-unresolved   # also with an unresolved attempt; the barrier stays
 ./groundhog.sh retry --token-file PATH --delivery ID                    # failed -> pending
 ./groundhog.sh recover --token-file PATH --delivery ID --decision retry|accept
 ```
@@ -301,7 +302,11 @@ $ ./groundhog.sh release --token-file /private/dir/token    # then delete the to
   to the runner detaches now (the delivery then becomes `uncertain`). With no live
   runner, or no call in flight, it returns at once. **`release`** needs a stopped runner and no unresolved delivery
   attempt; it removes the owner and leaves the pause. The generation counter
-  persists, so the next `enroll` issues generation + 1.
+  persists, so the next `enroll` issues generation + 1. **`release --leave-unresolved`**
+  does the same while a delivery attempt is unresolved (a runner must still have ended
+  first: exit 4); plain `release` keeps refusing, exit 5. The delivery records stay as
+  they are, and the barrier, which keys on them and not on ownership, keeps blocking every
+  consumer admission under any later owner until `recover`.
 * **Standalone `tick`** fails 3 while the instance is owned (ownership wins over
   pause), succeeds without firing while paused, and otherwise ticks as always.
   `init`, `add`, `drop` and `sweep` also fail 3 while owned. All of them take the
@@ -668,7 +673,12 @@ makes them exit 4), and both write the record durably before they return.
   outcome stays `unknown`. Recovery invokes nothing. Another unresolved attempt
   keeps the barrier up.
 
-`release` exits 5 while any attempt is unresolved or any record unreadable.
+`release` exits 5 while any attempt is unresolved or any record unreadable, unless it
+is given `--leave-unresolved`; that releases and leaves the records and the barrier
+as they are. Each attempt records `owner_label`, the label of the owner that admitted
+the call, next to `started_at`, so after a release `status` still shows whose call an
+unresolved attempt was before the next owner chooses `recover`. (Attempts admitted
+before this field existed lack it; clients that do not know it ignore it.)
 
 **Reconciliation on `run`**, under the mutation lock, at the start of each cycle
 and whatever the pause says:
@@ -766,7 +776,8 @@ you.
 
 A service may keep the token across its own restarts and run again without
 re-enrolling: `stop` ends the runner and keeps the owner. `release`, after a
-safe stop and with no unresolved handoff, ends ownership; then delete the token
+safe stop and with no unresolved handoff (or with `--leave-unresolved`, which leaves the
+unresolved attempts and their barrier for the next owner), ends ownership; then delete the token
 file. The runtime has one rule for every supervisor, human or service. A client
 may choose a stricter policy for itself (for example never reusing a stored
 token after a restart); that is its own choice and not a limit of this script.
