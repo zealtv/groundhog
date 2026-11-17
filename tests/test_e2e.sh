@@ -51,7 +51,7 @@ assert_true "...an overdue one-shot fires on the next tick" test -d "$GHD/out/la
 assert_false "...and its source is removed" test -e "$GHD/schedule/once/2026-11-01/late"
 assert_true "...markers record both" test -e "$GHD/fired/2026-11-15/daily/nudge" -a -e "$GHD/fired/2026-11-15/once/2026-11-01/late"
 assert_eq "...a second tick fires nothing" "" "$(gh tick 2>&1)"
-assert_eq "...no state, config, owner or delivery record is written" "" "$(find "$GHD/runtime" -type f ! -name '*.lock' 2>/dev/null)"
+assert_eq "...no state, config, owner or delivery record is written" "" "$(find "$GHD/runtime" -type f ! -name '*.lock' ! -name last_tick 2>/dev/null)"
 status_to "$out"
 assert_eq "...status reads it as unowned" null "$(jget "$out" owner)"
 assert_eq "...and not paused" false "$(jget "$out" paused)"
@@ -78,7 +78,7 @@ if git -C "$T_REPO_DIR" cat-file -e "$OLD:.groundhog/groundhog.sh" 2>/dev/null; 
   status_to "$out"
   assert_eq "...unowned" null "$(jget "$out" owner)"
   assert_eq "...the old firing is not fired again" "" "$(gh tick 2>&1)"
-  assert_eq "...nothing was enrolled, configured or recorded" "" "$(find "$GHD/runtime" -type f ! -name '*.lock' 2>/dev/null)"
+  assert_eq "...nothing was enrolled, configured or recorded" "" "$(find "$GHD/runtime" -type f ! -name '*.lock' ! -name last_tick 2>/dev/null)"
   clear_clock
 else
   t_skip "the pre-runtime script ($OLD) is not in this checkout's history"
@@ -282,7 +282,7 @@ assert_eq "...the old token stays dead" 3 "$(rc_of gh pause --token-file "$TOK")
 host="$T_TMP/host12"; mkdir -p "$host"
 bash "$T_REPO_DIR/install.sh" "$host" >/dev/null 2>&1
 assert_true "install lays down the script and README" test -x "$host/.groundhog/groundhog.sh" -a -f "$host/.groundhog/README.md"
-assert_eq "...and no runtime state of any kind (only the lock files init takes)" "" "$(find "$host/.groundhog/runtime" -type f ! -name '*.lock' 2>/dev/null)"
+assert_eq "...and no runtime state of any kind (only the lock files init takes)" "" "$(find "$host/.groundhog/runtime" -type f ! -name '*.lock' ! -name last_tick 2>/dev/null)"
 assert_eq "...no process was left running" "" "$(pgrep -f "$host/.groundhog/groundhog.sh" || true)"
 GHD="$host/.groundhog"; status_to "$out"
 assert_eq "...status: unowned, unpaused, stopped" 'null false "stopped"' "$(jget "$out" owner) $(jget "$out" paused) $(jget "$out" runner.state)"

@@ -900,6 +900,16 @@ script answers `capabilities` with its ordinary `unknown command` error (exit 1)
   `consumer.config_digest` is the SHA-256 of the file the last `run` froze.
   Secrets (the owner token verifier, consumer argv and environment) are never
   printed.
+* `last_tick` is an additive field: `{"at": <UTC time>, "source": "runner" |
+  "standalone"}` for the newest tick that completed, or `null` when none was
+  recorded (or the record is missing or damaged). A tick that fires nothing
+  counts; **a paused tick counts too**, since the point is to show something is
+  calling `tick`, whether or not pause lets it fire. A tick refused because the
+  instance is owned, or one that fails, does not. `source` tells an owned
+  runner's cycle from a standalone `tick`; nothing names the caller, and the
+  field grants no control. It lives in `runtime/last_tick` (one line, replaced by
+  temp file and rename, taking no lock), and only the newest tick is kept.
+  Hosts without the lock helper record nothing.
 * `journal_generation` is an additive field: the change token for the delivery
   journal (see [Change tokens](#change-tokens-revision-and-journal_generation)).
 * `consistent` is `false`, with `diagnostics`, when `state.json` or a delivery

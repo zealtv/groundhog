@@ -324,7 +324,7 @@ assert_eq "legacy unowned tick exits 0" 0 "$rc"
 assert_contains "...prints the firing line" "$(cat "$out.o")" "fired nudge ->"
 assert_eq "...fires into out/" 1 "$(out_count)"
 assert_eq "...says nothing on stderr" "" "$(cat "$out.e")"
-assert_eq "...and leaves only lock state under runtime/" "locks" "$(ls -A "$GHD/runtime")"
+assert_eq "...and leaves only lock state and the last-tick record under runtime/" "last_tick locks" "$(ls -A "$GHD/runtime" | tr '\n' ' ' | sed 's/ $//')"
 assert_false "...no state file was created" test -e "$GHD/runtime/state.json"
 rc=0; gh tick >"$out.o" 2>&1 || rc=$?
 assert_eq "...a second tick the same day fires nothing" "" "$(cat "$out.o")"
