@@ -1848,9 +1848,10 @@ inspect_schedule() {
 
 # json_array NAME… helper: join an array's elements with commas into JR.
 join_by_comma() {
-  local out="" e
-  for e in "$@"; do out+="${out:+,}$e"; done
-  JR="$out"
+  # One expansion, not a loop of appends: appending to a growing string copies
+  # it each time, which made a list of thousands of deliveries take seconds.
+  local IFS=,
+  JR="$*"
 }
 
 # json_only_args COMMAND ARGS… — both new commands take exactly --json.
