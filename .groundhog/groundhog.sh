@@ -422,9 +422,11 @@ cmd_tick() {
   passive_enter tick
   if [[ "$PASSIVE_PAUSED" == true ]]; then
     echo "tick: the instance is paused; nothing fired" >&2
+    last_tick_record standalone
     return 0
   fi
   tick_body
+  last_tick_record standalone
 }
 
 # The tick itself. The runner calls it too, under its own admission checks.
@@ -1881,6 +1883,21 @@ cmd_capabilities() {
     "$GH_PROTOCOL" "$GH_PROTOCOL_VERSION" "$JSTR" "$caps"
 }
 
+# last_tick_peek — read runtime/last_tick without writing: LAST_TICK is the JSON
+# object {"at":…,"source":…}, or null when the file is absent or not exactly a
+# UTC time and a known source.
+LAST_TICK=null
+last_tick_peek() {
+  local f="$GH_DIR/runtime/last_tick"
+  LAST_TICK=null
+  if read_text "$f"; then
+    TEXT="${TEXT%$'\n'}"
+    if [[ "$TEXT" =~ ^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)\ (runner|standalone)$ ]]; then
+      LAST_TICK="{\"at\":\"${BASH_REMATCH[1]}\",\"source\":\"${BASH_REMATCH[2]}\"}"
+    fi
+  fi
+}
+
 # jgen_peek — read runtime/journal.gen without writing: JG_ST is ok, absent or
 # bad, JG_VAL the number (0 unless ok).
 JG_ST=""; JG_VAL=0
@@ -1908,6 +1925,7 @@ cmd_status() {
   local jg_st jg_val
   jgen_peek; jg_st="$JG_ST"; jg_val="$JG_VAL"
 
+  last_tick_peek
   inspect_state
   inspect_consumer
   inspect_deliveries
@@ -1947,10 +1965,10 @@ cmd_status() {
   join_by_comma ${DELIVERIES[@]+"${DELIVERIES[@]}"}; deliveries="$JR"
   join_by_comma ${DIAGS[@]+"${DIAGS[@]}"};          diags="$JR"
 
-  printf '{"protocol":"%s","protocol_version":%s,"instance":%s,"observed_at":%s,"revision":%s,"journal_generation":%s,"consistent":%s,"paused":%s,"owner":%s,"runner":{"state":"%s","last_error":%s},"consumer":{"configured":%s,"valid":%s,"config_digest":%s},"schedule":[%s],"deliveries":[%s],"diagnostics":[%s]}\n' \
+  printf '{"protocol":"%s","protocol_version":%s,"instance":%s,"observed_at":%s,"revision":%s,"journal_generation":%s,"consistent":%s,"paused":%s,"owner":%s,"runner":{"state":"%s","last_error":%s},"consumer":{"configured":%s,"valid":%s,"config_digest":%s},"last_tick":%s,"schedule":[%s],"deliveries":[%s],"diagnostics":[%s]}\n' \
     "$GH_PROTOCOL" "$GH_PROTOCOL_VERSION" "$instance_json" "$observed_json" \
     "$S_REV" "$jg_val" "$consistent" "$S_PAUSED" "$S_OWNER" "$S_RUNNER_STATE" "$S_RUNNER_ERROR" \
-    "$C_CONFIGURED" "$C_VALID" "$S_DIGEST" "$schedule" "$deliveries" "$diags"
+    "$C_CONFIGURED" "$C_VALID" "$S_DIGEST" "$LAST_TICK" "$schedule" "$deliveries" "$diags"
 }
 
 # ---------------------------------------------------------------------------
@@ -2577,6 +2595,23 @@ rt_atomic_write() {
   if ! rt_fsync "$tmp"; then rm -f "$tmp"; return 1; fi
   if ! mv -f "$tmp" "$f" 2>/dev/null; then rm -f "$tmp"; return 2; fi
   rt_fsync "$dir" || return 2
+  return 0
+}
+
+# --- the last tick ---------------------------------------------------------------
+# runtime/last_tick holds one line, "<UTC time> <source>", where source is
+# "runner" (the owned runner's tick) or "standalone" (a `tick` call). Every tick
+# that completes writes it, paused or not. It is liveness only: it names no
+# caller and grants nothing. The write is a temp file and a rename (no fsync: a
+# lost record only makes the tick look older), takes no lock, and never fails
+# the tick. status reads it without writing and treats anything unreadable as
+# "never recorded".
+last_tick_record() {
+  [[ -n "$RT_DIR" && -z "$GH_RT_MISSING" ]] || return 0
+  mkdir -p "$RT_DIR" 2>/dev/null || return 0
+  local f="$RT_DIR/last_tick" tmp="$RT_DIR/.last_tick.$$.tmp"
+  if printf '%s %s\n' "$(now_utc)" "$1" > "$tmp" 2>/dev/null \
+     && mv -f "$tmp" "$f" 2>/dev/null; then :; else rm -f "$tmp" 2>/dev/null; fi
   return 0
 }
 
@@ -4036,11 +4071,13 @@ runner_tick() {
   runner_enter || return 0
   if [[ "$S_PAUSED" == true ]]; then
     if (( ! RUNNER_PAUSE_LOGGED )); then runner_log "paused: nothing is admitted until resume"; RUNNER_PAUSE_LOGGED=1; fi
+    last_tick_record runner
     unlock_mutation
     return 0
   fi
   RUNNER_PAUSE_LOGGED=0
   tick_runtime || status=$?
+  (( status == 0 )) && last_tick_record runner
   unlock_mutation
   if (( status != 0 )); then
     runner_fail 6 tick_failed "tick failed (exit $status); ownership and pause are retained"

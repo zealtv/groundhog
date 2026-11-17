@@ -549,6 +549,7 @@ instance's local scheduling time. IDs and ordering carry no time semantics.
   "owner": {"id": "o-demo", "generation": 1, "label": "demo-session"},
   "runner": {"state": "stopped", "last_error": null},
   "consumer": {"configured": false, "valid": true, "config_digest": null},
+  "last_tick": {"at": "2026-11-15T00:00:30Z", "source": "standalone"},
   "schedule": [
     {
       "path": "schedule/daily/nudge",
@@ -577,6 +578,16 @@ instance's local scheduling time. IDs and ordering carry no time semantics.
   "diagnostics": []
 }
 ```
+
+`last_tick` (additive; accepted by Bob on 2026-11-17) says when the newest
+completed `tick` ran, as a UTC RFC 3339 `at`, and whether an owned runner's
+cycle (`runner`) or a standalone `tick` call (`standalone`) ran it. A tick that
+fires nothing counts, and so does a tick that finds the instance paused. A
+refused or failed tick does not. It is `null` when no tick was recorded, or the
+record is missing, damaged or from an older script. It is liveness only: it names
+no caller, grants no control and changes no ownership rule. Status reads it
+without a lock and without writing. Only the newest tick is kept, so a runner
+tick and a standalone tick overwrite one another.
 
 Owner is null when unowned; it never exposes the verifier/token secret. Its
 `id` and `generation` match the nonsecret metadata in the private token file for
