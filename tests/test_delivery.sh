@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Handoff durability: a crash between in_flight and the recorded result, the
-# instance-wide barrier, recover, detaching on stop and signals, pause, and a
+# instance-wide barrier, recover, stop waiting for the admitted call, detaching on signals, pause, and a
 # slow consumer. Consumers are plain /bin/sh scripts; the ones that sleep are
 # killed (by pid or process group) before each test ends.
 . "$(dirname "$0")/lib.sh"
@@ -145,16 +145,72 @@ assert_eq "...two attempts" 2 "$(attempts_of "$NAME")"
 gh stop --token-file "$TOK" >/dev/null 2>&1
 wait_exit "runner exited" 50 "$RUNNER_PID"
 
-# --- stop detaches from a running consumer, never accepts it -------------------
+# --- stop waits for the admitted call, records its result, then the runner exits
+# Admission closes at the stop request (the second delivery stays pending), the
+# call already admitted finishes and records, and only then does stop return.
+fresh_consumer 'echo x >> "$PWD/calls.txt"; sleep 4; echo done > "$PWD/finished.txt"'
+add_item other
+other_name="other-$(today)"
+start_runner --token-file "$TOK" --interval-seconds 1
+wait_for "the consumer started" 100 file_has "$INST/calls.txt"
+t0=$SECONDS
+rc=0; gh stop --token-file "$TOK" >"$out.o" 2>"$out.e" || rc=$?
+assert_eq "stop exits 0 after waiting for the consumer" 0 "$rc"
+assert_true "...it waited for the call (it does not detach)" test "$((SECONDS - t0))" -ge 2
+assert_true "...the consumer had finished when stop returned" test -f "$INST/finished.txt"
+assert_eq "...stdout still says only stopped" "stopped" "$(cat "$out.o")"
+assert_contains "...stop said it was waiting on a delivery" "$(cat "$out.e")" "waiting on a delivery"
+assert_contains "...and that SIGTERM on the runner detaches now" "$(cat "$out.e")" "SIGTERM"
+wait_exit "the runner exited" 50 "$RUNNER_PID"
+assert_eq "...exit 0" 0 "$WAIT_RC"
+assert_contains "...the runner said it kept waiting" "$(cat "$RUN_ERR")" "waiting for the consumer"
+status_to "$out"
+assert_eq "the admitted delivery is accepted, recorded before the runner exited" 1 "$(jq_py where "$out" deliveries state '"accepted"' id | wc -l | tr -d ' ')"
+assert_eq "...the other stays pending: admission closed at the request" 1 "$(jq_py where "$out" deliveries state '"pending"' id | wc -l | tr -d ' ')"
+assert_eq "...no second call was made" 1 "$(lines "$INST/calls.txt")"
+assert_eq "...runner stopped" '"stopped"' "$(jget "$out" runner.state)"
+assert_true "...runner lock free" lock_is_free "$GHD/runtime/locks/runner.lock"
+assert_true "...mutation lock free" lock_is_free "$GHD/runtime/locks/mutation.lock"
+rc=0; gh release --token-file "$TOK" >/dev/null 2>&1 || rc=$?
+assert_eq "release can follow: nothing is unresolved" 0 "$rc"
+
+# A call that fails is recorded failed, the same way.
+fresh_consumer 'echo x >> "$PWD/calls.txt"; sleep 3; exit 7'
+start_runner --token-file "$TOK" --interval-seconds 1
+wait_for "the consumer started" 100 file_has "$INST/calls.txt"
+rc=0; gh stop --token-file "$TOK" >/dev/null 2>&1 || rc=$?
+assert_eq "stop exits 0 after a failing consumer" 0 "$rc"
+wait_exit "the runner exited" 50 "$RUNNER_PID"
+assert_eq "...exit 0" 0 "$WAIT_RC"
+assert_eq "the delivery is failed, with the exit status" '"failed"' "$(dstate "$NAME")"
+assert_eq "...attempt exit 7" 7 "$(dget path "out/$NAME" attempts.0.exit_code)"
+
+# With nothing in flight, stop is prompt and says nothing about waiting.
+fresh_consumer 'echo x >> "$PWD/calls.txt"'
+start_runner --token-file "$TOK" --interval-seconds 30
+wait_for "the call was accepted" 100 state_is "$NAME" accepted
+t0=$SECONDS
+rc=0; gh stop --token-file "$TOK" >"$out.o" 2>"$out.e" || rc=$?
+assert_eq "stop with nothing in flight exits 0" 0 "$rc"
+assert_true "...promptly" test "$((SECONDS - t0))" -le 3
+assert_eq "...silent on stderr" "" "$(cat "$out.e")"
+wait_exit "the runner exited" 50 "$RUNNER_PID"
+
+# A signal still detaches at once, also while stop is waiting: the delivery is
+# uncertain and the consumer keeps running.
 fresh_consumer "$SLEEPER"
 start_runner --token-file "$TOK" --interval-seconds 1
 wait_for "the consumer started" 100 file_has "$INST/calls.txt"
 track_consumer
-t0=$SECONDS
-rc=0; gh stop --token-file "$TOK" >/dev/null 2>&1 || rc=$?
-assert_eq "stop exits 0 while a consumer runs" 0 "$rc"
-assert_true "...within a few seconds (it detaches, it does not wait)" test "$((SECONDS - t0))" -le 6
-wait_exit "the runner exited" 50 "$RUNNER_PID"
+gh stop --token-file "$TOK" >"$out.o" 2>"$out.e" &
+stop_pid=$!
+wait_for "stop says it is waiting on a delivery" 100 grep -q "waiting on a delivery" "$out.e"
+assert_true "stop is still waiting (the consumer runs for 30 s)" kill -0 "$stop_pid"
+assert_true "...the consumer is running" pid_alive "$INST/c.pid"
+kill -TERM "$RUNNER_PID"
+wait_exit "SIGTERM detached the runner at once" 50 "$RUNNER_PID"
+assert_eq "...exit 0" 0 "$WAIT_RC"
+wait_exit "...and stop returned" 50 "$stop_pid"
 assert_eq "...exit 0" 0 "$WAIT_RC"
 assert_true "the detached consumer is still running" pid_alive "$INST/c.pid"
 assert_eq "the delivery is uncertain, not accepted" '"uncertain"' "$(dstate "$NAME")"
@@ -165,7 +221,7 @@ assert_true "...mutation lock free" lock_is_free "$GHD/runtime/locks/mutation.lo
 status_to "$out"
 assert_eq "...runner stopped" '"stopped"' "$(jget "$out" runner.state)"
 rc=0; gh release --token-file "$TOK" >/dev/null 2>&1 || rc=$?
-assert_eq "stop success did not resolve it: release still refuses" 5 "$rc"
+assert_eq "the detach did not resolve it: release still refuses" 5 "$rc"
 kill_consumer
 
 # --- SIGINT and SIGTERM: detach, the consumer survives, its group is separate --
