@@ -365,6 +365,14 @@ for args in "--active" "--json --active --active"; do
   assert_eq "...with no stdout" "" "$(cat "$act.o")"
 done
 
+# A record in both directories, and an out/ entry no record claims, still show.
+cp "$GHD/runtime/deliveries/d-00900000.json" "$GHD/$DONE/d-00900000.json"
+mkdir "$GHD/out/stray-entry"
+gh status --json --active > "$act" 2>/dev/null || true
+assert_contains "a record in both deliveries/ and done/ shows under --active" "$(jget "$act" diagnostics)" "also exists in runtime/deliveries/"
+assert_eq "an out/ entry no record claims is still listed, and the ones settled records claim are not" "out/stray-entry" "$(python3 -I -c 'import json,sys;print(" ".join(d["path"] for d in json.load(open(sys.argv[1]))["deliveries"] if d["origin"]=="legacy_out"))' "$act")"
+rm -f "$GHD/$DONE/d-00900000.json"; rmdir "$GHD/out/stray-entry"
+
 # The index decides what is trusted: a filed record it does not vouch for is parsed even
 # under --active, so damage to it still shows and it is not counted as accepted.
 printf '%s' '{"schema_version":1,"id":"d-00000001"' > "$GHD/$DONE/d-00000001.json"
