@@ -6,13 +6,14 @@
 exist, the upgraded `tick`, `init`, `add`, `drop` and `sweep` follow the lock,
 ownership and pause rules here, and `run` reconciles the delivery journal and
 hands pending deliveries to the consumer in `runtime/config.json`.
-`capabilities` advertises `status-json-v1` everywhere, `ownership-v1`, `runner-v1`
+`capabilities` advertises `status-json-v1` and `status-active-v1` everywhere, `ownership-v1`, `runner-v1`
 and `pause-v1` on hosts with the locking and durability tools described in
 [README.md](../README.md#runner-ownership-and-pause), and `consumer-v1`,
 `delivery-v1` and `release-unresolved-v1` where the host can also start a consumer
 in a session of its own ([README.md](../README.md#consumers-and-deliveries)); with
-the first six, this script satisfies "all six capabilities" for supervised control,
-and `release-unresolved-v1` adds `release --leave-unresolved`. The README records the
+the six required ones, this script satisfies "all six capabilities" for supervised control,
+`release-unresolved-v1` adds `release --leave-unresolved`, and `status-active-v1` adds
+`status --json --active`. The README records the
 points where the implementation chose a reading of this document (the extra
 `runtime/prepared/` journal, the exit-status record for signals, the legacy
 one-shot rule). Each schedule record of `status --json` also carries an
@@ -66,7 +67,7 @@ failure. Legacy command exit codes remain unchanged.
 
 ```text
 groundhog.sh capabilities --json
-groundhog.sh status --json
+groundhog.sh status --json [--active]
 groundhog.sh enroll --owner-label LABEL --token-file ABSENT_ABSOLUTE_PATH
 groundhog.sh run --token-file PATH [--interval-seconds N]
 groundhog.sh pause --token-file PATH
@@ -90,17 +91,20 @@ Synthetic capability response (not output from today's script):
   "protocol": "groundhog-runtime",
   "protocol_version": 1,
   "implementation_version": "example-build",
-  "capabilities": ["status-json-v1", "ownership-v1", "runner-v1", "pause-v1", "consumer-v1", "delivery-v1", "release-unresolved-v1"]
+  "capabilities": ["status-json-v1", "status-active-v1", "ownership-v1", "runner-v1", "pause-v1", "consumer-v1", "delivery-v1", "release-unresolved-v1"]
 }
 ```
 
 Protocol version is an integer for incompatible changes; implementation version
 is informational. Additive fields may appear. Clients ignore unknown fields
-and decline unknown enum values for control. The first six capabilities (through `delivery-v1`) and version
-1 are required for supervised control under this contract. `release-unresolved-v1`
-is the seventh, optional one: a client negotiates it, by finding it in the
-`capabilities` list, before it passes `--leave-unresolved` to `release`, and
-otherwise uses plain `release` (a script without it exits 2 on the flag). An old script
+and decline unknown enum values for control. Six capabilities (`status-json-v1` and
+`ownership-v1` through `delivery-v1`) and version 1 are required for supervised
+control under this contract. `release-unresolved-v1` is an optional one: a client
+negotiates it, by finding it in the `capabilities` list, before it passes
+`--leave-unresolved` to `release`, and otherwise uses plain `release` (a script without
+it exits 2 on the flag). `status-active-v1` is the other: a client finds it in the list
+before it passes `--active` to `status`, and otherwise reads the full `status --json` (a
+script without it exits 2 on the flag). An old script
 returns its existing unknown-command error: inspect its files as legacy, mark control unsupported,
 and do not probe by running `run`, `tick` or `init`. Capability discovery invokes
 only the deliberately selected instance's script; it is not a payload sandbox.
@@ -614,6 +618,26 @@ no caller, grants no control and changes no ownership rule. Status reads it
 without a lock and without writing. Only the newest tick is kept, so a runner
 tick and a standalone tick overwrite one another.
 
+`status --json --active` (capability `status-active-v1`; accepted by Bob on 2026-11-17,
+tour item 4: "let's go with your recommendation") reads for deliveries that can still
+change. Every delivery leaves a record, so the full `deliveries` array grows without
+bound; about two weeks of one `every/1m` item pass an 8 MiB client limit. With the flag,
+`deliveries` lists in full only the deliveries whose state is `pending`, `in_flight`,
+`failed` or `uncertain` (and the unregistered `legacy_out` entries, which are `pending`),
+and the document gains one top-level field after `deliveries`:
+`"settled": {"accepted": N, "missing": M}`, the number of accepted and of missing
+deliveries it leaves out. Everything else, the `diagnostics` and `consistent` included,
+is as in the full output. Without the flag the output is byte for byte as before and has
+no `settled` field. The flag changes the answer, never the checks: a settled record the
+script has not met before (or whose file changed) is still read, a damaged one still
+produces its diagnostic and `consistent:false`, and it is not counted. Time follows
+the output: the script trusts the runner's `runtime/deliveries/done/index` for settled
+records it has already read, so with the flag it neither parses nor collects them, and
+its cost is a listing of `done/` and of `out/`. The flag is a view, not a sweep: no
+record is removed and `status` stays read-only. A client that wants only the delivery
+count of settled records reads `settled`; one that wants a settled delivery's attempts
+reads the full output. The newest settled delivery per item is not reported.
+
 Owner is null when unowned; it never exposes the verifier/token secret. Its
 `id` and `generation` match the nonsecret metadata in the private token file for
 enrollment reconciliation; matching them alone grants no authority. Runner
@@ -736,5 +760,7 @@ locking and no mixed-version pause guarantee; upgraded standalone tick refusal
 while owned; and explicit release only after safe stop and reconciliation of
 unresolved handoffs. Bob accepted on 2026-11-17 that `release --leave-unresolved` may
 release with an unresolved attempt, the handoff barrier staying until `recover`, and
-that an attempt records the admitting owner's label. No dependent runtime
+that an attempt records the admitting owner's label. Bob accepted on 2026-11-17 that
+`status --json --active` leaves settled deliveries out and counts them, and that a later
+sweep removes old settled records. No dependent runtime
 implementation is authorized by this document.
