@@ -262,6 +262,128 @@ assert_eq "sweep removes the accepted entries" 0 "$(find "$GHD/out" -mindepth 1 
 assert_eq "...together with their filed records" 0 "$(find "$GHD/$DONE" -maxdepth 1 -name 'd-*.json' | wc -l | tr -d ' ')"
 assert_true "...and leaves an entry no record claims" test -d "$GHD/out/keep-me"
 
+# --- status --active: settled records are counted, and the time stays bounded -------
+# Every delivery leaves a record and status lists all of them; two weeks of one
+# `every/1m` item pass 8 MiB of output. status --active (capability status-active-v1)
+# lists the deliveries that can still change (pending, in_flight, failed, uncertain)
+# and counts the accepted and missing ones. Fixtures, written as the runner leaves
+# them and not by running one: SETTLED records filed under done/ with a trusted index,
+# four active records in deliveries/, and one settled record the index has no line for.
+SETTLED=5000
+make_filed() { # N — see above; nine in ten settled records are accepted, the rest missing (no out/ entry)
+  python3 -I - "$GHD" "$1" <<'PY'
+import json, os, sys
+ghd, n = sys.argv[1], int(sys.argv[2])
+US = "\x1f"
+rt = os.path.join(ghd, "runtime", "deliveries")
+done = os.path.join(rt, "done")
+os.makedirs(done, exist_ok=True)
+os.makedirs(os.path.join(ghd, "out"), exist_ok=True)
+def record(i, state, attempts):
+    return {"schema_version": 1, "id": "d-%08x" % i, "path": "out/item-%05d" % i, "origin": "runtime",
+            "schedule_path": "schedule/every/1m/x", "occurrence": {"date": "2026-11-10", "slot": "%04d" % i},
+            "state": state, "reason": None, "registered_at": "2026-11-10T00:00:00Z",
+            "fired_marker": None, "attempts": attempts, "collisions": []}
+def attempt(i, outcome):
+    return {"id": "a-%08x" % i, "started_at": "2026-11-10T00:00:00Z",
+            "finished_at": None if outcome == "in_flight" else "2026-11-10T00:00:01Z",
+            "outcome": outcome, "exit_code": 0 if outcome == "accepted" else None, "signal": None, "error": None}
+def write(d, rec):
+    if rec["state"] != "missing":
+        os.makedirs(os.path.join(ghd, rec["path"]), exist_ok=True)
+        open(os.path.join(ghd, rec["path"], "note.txt"), "w").write("x")
+    with open(os.path.join(d, rec["id"] + ".json"), "w") as f:
+        json.dump(rec, f, separators=(",", ":")); f.write("\n")
+lines = ["groundhog-done-index 1"]
+for i in range(n):
+    state = "missing" if i % 10 == 0 else "accepted"
+    rec = record(i, state, [] if state == "missing" else [attempt(i, "accepted")])
+    write(done, rec)
+    st = os.stat(os.path.join(done, rec["id"] + ".json"))
+    view = {"id": rec["id"], "path": rec["path"], "origin": "runtime", "schedule_path": rec["schedule_path"],
+            "occurrence": rec["occurrence"], "state": state, "reason": None, "attempts": rec["attempts"], "execution": "unknown"}
+    lines.append(US.join(["./" + rec["id"] + ".json", str(st.st_ino), str(st.st_size), str(int(st.st_mtime)),
+                          "%o" % (st.st_mode & 0o7777), state, rec["path"], json.dumps(view, separators=(",", ":"))]))
+lines.sort()
+open(os.path.join(done, "index"), "w").write("\n".join(lines) + "\n")
+write(done, record(n, "accepted", [attempt(n, "accepted")]))     # the index has no line for this one
+for k, (state, outcome) in enumerate([("pending", None), ("in_flight", "in_flight"), ("failed", "failed"), ("uncertain", "unknown")]):
+    i = 0x900000 + k
+    write(rt, record(i, state, [] if outcome is None else [attempt(i, outcome)]))
+PY
+}
+active_ids() { # FILE — ids of the deliveries listed in FILE that are not settled, sorted
+  python3 -I -c 'import json,sys;print(" ".join(sorted(d["id"] for d in json.load(open(sys.argv[1]))["deliveries"] if d["state"] not in ("accepted","missing"))))' "$1"
+}
+count_state() { # FILE STATE — deliveries listed in FILE in STATE
+  python3 -I -c 'import json,sys;print(sum(1 for d in json.load(open(sys.argv[1]))["deliveries"] if d["state"]==sys.argv[2]))' "$1" "$2"
+}
+has_key() { python3 -I -c 'import json,sys;print("yes" if sys.argv[2] in json.load(open(sys.argv[1])) else "no")' "$1" "$2"; }
+without_keys() { # FILE KEY… — the document minus those keys, canonical
+  python3 -I -c 'import json,sys;d=json.load(open(sys.argv[1]));[d.pop(k,None) for k in sys.argv[2:]];print(json.dumps(d,sort_keys=True))' "$@"
+}
+
+plain_consumer "$FAST"
+make_filed "$SETTLED"
+ACCEPTED_N=$((SETTLED - SETTLED / 10 + 1)); MISSING_N=$((SETTLED / 10))
+t0="$(now_s)"; status_to "$out"; t1="$(now_s)"
+full_time="$(secs "$t0" "$t1")"
+full_bytes="$(wc -c < "$out" | tr -d ' ')"
+assert_eq "status lists every delivery by default" "$((SETTLED + 5))" "$(jq_py where "$out" deliveries origin '"runtime"' id | wc -l | tr -d ' ')"
+assert_eq "...with no settled count in the document" no "$(has_key "$out" settled)"
+assert_eq "...consistent, no diagnostics" '[]' "$(jget "$out" diagnostics)"
+assert_true "...within bounds for $((SETTLED + 5)) records (${full_time} s)" under "$full_time" 25
+default_active="$(active_ids "$out")"
+
+act="$T_TMP/active.json"
+rc=0; t0="$(now_s)"; gh status --json --active > "$act" 2> "$act.err" || rc=$?; t1="$(now_s)"
+active_time="$(secs "$t0" "$t1")"
+active_bytes="$(wc -c < "$act" | tr -d ' ')"
+printf 'info: status with %s settled deliveries (%s): default %s s, %s bytes; --active %s s, %s bytes\n' \
+  "$((SETTLED + 1))" "$TEST_BASH" "$full_time" "$full_bytes" "$active_time" "$active_bytes" >&2
+assert_eq "status --json --active exits 0" 0 "$rc"
+assert_eq "...with nothing on stderr" "" "$(cat "$act.err")"
+assert_json_valid "$act"
+assert_eq "...it lists exactly the deliveries that can still change" "d-00900000 d-00900001 d-00900002 d-00900003" "$(active_ids "$act")"
+assert_eq "...the ones the default output also shows as active" "$default_active" "$(active_ids "$act")"
+assert_eq "...and no settled one" 0 "$(( $(count_state "$act" accepted) + $(count_state "$act" missing) ))"
+assert_eq "...it counts the accepted ones, with the one the index lacked" "$ACCEPTED_N" "$(jget "$act" settled.accepted)"
+assert_eq "...and the missing ones" "$MISSING_N" "$(jget "$act" settled.missing)"
+assert_eq "...consistent, no diagnostics" '[]' "$(jget "$act" diagnostics)"
+assert_true "...its output stays small ($active_bytes bytes against $full_bytes)" test "$active_bytes" -lt 20000
+assert_true "...its time stays bounded (${active_time} s)" under "$active_time" 15
+assert_true "...and is under the default's (${active_time} s against ${full_time} s)" under "$active_time" "$full_time"
+assert_eq "...everything else in the document is as in the default output" \
+  "$(without_keys "$out" observed_at deliveries)" "$(without_keys "$act" observed_at deliveries settled)"
+assert_eq "--active may come before --json" "$ACCEPTED_N" \
+  "$(gh status --active --json | python3 -I -c 'import json,sys;print(json.load(sys.stdin)["settled"]["accepted"])')"
+for args in "--active" "--json --active --active"; do
+  rc=0
+  # shellcheck disable=SC2086
+  gh status $args > "$act.o" 2> "$act.e" || rc=$?
+  assert_eq "status $args exits 2" 2 "$rc"
+  assert_eq "...with no stdout" "" "$(cat "$act.o")"
+done
+
+# The index decides what is trusted: a filed record it does not vouch for is parsed even
+# under --active, so damage to it still shows and it is not counted as accepted.
+printf '%s' '{"schema_version":1,"id":"d-00000001"' > "$GHD/$DONE/d-00000001.json"
+gh status --json --active > "$act" 2>/dev/null || true
+assert_contains "a damaged filed record shows under --active too" "$(jget "$act" diagnostics)" delivery_record_malformed
+assert_eq "...status is then not consistent" false "$(jget "$act" consistent)"
+assert_eq "...and the record is not counted" "$((ACCEPTED_N - 1))" "$(jget "$act" settled.accepted)"
+
+# With no index at all every filed record is parsed, as before; the answer is the same.
+plain_consumer "$FAST"
+make_filed 150
+rm -f "$GHD/$DONE/index"
+gh status --json > "$out" 2>/dev/null
+gh status --json --active > "$act" 2>/dev/null
+assert_eq "without done/index, --active lists the same active deliveries" "$(active_ids "$out")" "$(active_ids "$act")"
+assert_eq "...counts the accepted ones" "$((150 - 15 + 1))" "$(jget "$act" settled.accepted)"
+assert_eq "...and the missing ones" 15 "$(jget "$act" settled.missing)"
+assert_eq "...consistent, no diagnostics" '[]' "$(jget "$act" diagnostics)"
+
 # --- names that are not valid UTF-8 are not fired or imported (finding 9) ----------------
 # The predicate itself, on every host: extract it from the script.
 sed -n '/^json_str() {/,/^}/p;/^utf8_valid() {/,/^}/p' "$GH_SCRIPT" > "$T_TMP/utf8fn.sh"

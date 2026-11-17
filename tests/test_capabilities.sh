@@ -17,16 +17,18 @@ assert_eq "implementation_version is a string" 'str' \
 # hosts that have the locking, hashing and durability tools the runner needs;
 # consumer-v1 and delivery-v1 also need a way to start a consumer in a session
 # of its own (perl's POSIX::setsid or setsid(1)); they bring release-unresolved-v1
-# (release --leave-unresolved) with them. With the first six present a client
-# may supervise the instance; the seventh is for the flag alone.
+# (release --leave-unresolved) with them. status-active-v1 (status --active) needs
+# nothing of the host, so it is offered everywhere. With ownership-v1 through
+# delivery-v1 present a client may supervise the instance; release-unresolved-v1
+# is for its flag alone.
 if have_runtime_support && have_isolation; then
   assert_eq "capabilities on a host with locking and process isolation" \
-    '["status-json-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1","release-unresolved-v1"]' "$(jget "$out" capabilities)"
+    '["status-json-v1","status-active-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1","release-unresolved-v1"]' "$(jget "$out" capabilities)"
 elif have_runtime_support; then
   assert_eq "capabilities on a host with locking but no process isolation" \
-    '["status-json-v1","ownership-v1","runner-v1","pause-v1"]' "$(jget "$out" capabilities)"
+    '["status-json-v1","status-active-v1","ownership-v1","runner-v1","pause-v1"]' "$(jget "$out" capabilities)"
 else
-  assert_eq "capabilities on a host without locking" '["status-json-v1"]' "$(jget "$out" capabilities)"
+  assert_eq "capabilities on a host without locking" '["status-json-v1","status-active-v1"]' "$(jget "$out" capabilities)"
 fi
 
 # It needs no initialized instance and creates nothing.
@@ -50,6 +52,14 @@ for args in "" "--json --json" "--human" "--json extra" "extra --json" "-j"; do
   gh status $args > "$out.o" 2> "$out.e" || rc=$?
   assert_eq "status $args exits 2" 2 "$rc"
   assert_eq "status $args prints no stdout" "" "$(cat "$out.o")"
+done
+# --active belongs to status alone, once, and still needs --json.
+for args in "--json --active" "--active --json"; do
+  rc=0
+  # shellcheck disable=SC2086
+  gh capabilities $args > "$out.o" 2> "$out.e" || rc=$?
+  assert_eq "capabilities $args exits 2" 2 "$rc"
+  assert_eq "capabilities $args prints no stdout" "" "$(cat "$out.o")"
 done
 assert_eq "bad arguments created nothing" "groundhog.sh" "$(ls -A "$GHD")"
 
