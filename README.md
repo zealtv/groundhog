@@ -246,7 +246,7 @@ Neither starts a runner, enrolls an owner or writes a configuration: see
 ./groundhog.sh out                      # ls out/
 ./groundhog.sh sweep [days]             # remove out/ entries older than N days (default 14)
 ./groundhog.sh capabilities --json      # which runtime capabilities this script implements (read-only)
-./groundhog.sh status --json            # one JSON snapshot of schedule, state and deliveries (read-only)
+./groundhog.sh status --json [--active] # one JSON snapshot of schedule, state and deliveries (read-only); --active counts settled deliveries instead of listing them
 ./groundhog.sh enroll --owner-label LABEL --token-file ABSENT_ABSOLUTE_PATH
 ./groundhog.sh run --token-file PATH [--interval-seconds N]   # foreground heartbeat (default 60)
 ./groundhog.sh pause|resume|stop|release --token-file PATH
@@ -371,7 +371,7 @@ between cycles, and every consumer) with `8>&- 9>&-`. Short-lived tools such as
 `ownership-v1`, `runner-v1` and `pause-v1` appear only when the host has: a lock
 helper (util-linux `flock` or perl with `Fcntl`); a SHA-256 tool (`sha256sum`,
 `shasum` or `openssl`); `perl` with `IO::Handle` or `sync(1)` for durable writes;
-`od` and `/dev/urandom`. Without them `capabilities` lists `status-json-v1` only,
+`od` and `/dev/urandom`. Without them `capabilities` lists `status-json-v1` and `status-active-v1` only,
 `enroll`, `run`, `pause`, `resume`, `stop`, `release`, `retry` and `recover` exit
 5 with a message, and every legacy command works as before without taking any
 lock. `consumer-v1`, `delivery-v1` and `release-unresolved-v1` additionally need a way to start a consumer
@@ -587,7 +587,8 @@ cycle (a rename; `retry`, `recover`, `sweep` and `release` look in both
 directories). Next to those files sits `done/index`, a cache the runner
 writes: per filed record, the inode, size, mtime and mode the file had when the
 runner last read it, and the JSON `status` prints for it. This keeps the cost of a
-cycle, of `release` and of `status` from growing with every settled delivery:
+cycle, of `release` and of `status` from growing with every settled delivery
+(`status --json --active` also leaves them out of its output, see [Inspection](#inspection)):
 
 * A cycle lists `done/` with one `find` and one `stat`. A record whose signature
   matches the index is trusted without being parsed; any other (new, edited,
@@ -748,8 +749,8 @@ you.
 
 1. **Check the host.** `./groundhog.sh capabilities --json` should list all six
    capabilities (`status-json-v1`, `ownership-v1`, `runner-v1`, `pause-v1`,
-   `consumer-v1`, `delivery-v1`), and `release-unresolved-v1` (the flag for
-   `release`). Without `consumer-v1` and `delivery-v1` the instance can still be
+   `consumer-v1`, `delivery-v1`), plus `release-unresolved-v1` (the flag for
+   `release`) and `status-active-v1` (the flag for `status`). Without `consumer-v1` and `delivery-v1` the instance can still be
    owned, paused and run delivery-only.
 2. **Stop whatever else writes to the instance.** Other `tick` loops, cron lines,
    and any process that moves entries out of `out/` (see the next section). An
@@ -859,7 +860,7 @@ day, give them different ids.
 
 `capabilities --json` and `status --json` are the machine-readable view of an
 instance. Each prints one JSON object and a newline on stdout; diagnostics go to
-stderr. They take exactly `--json` (anything else exits 2), and `status` needs the
+stderr. They take exactly `--json` (anything else exits 2; `status` also takes `--active`, below), and `status` needs the
 script to sit in a `.groundhog/` directory (otherwise exit 2). Output is UTF-8;
 human output from the other commands is not an API.
 
@@ -871,16 +872,17 @@ their behavior, including creating the trays.
 
 ```
 $ ./groundhog.sh capabilities --json
-{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1","release-unresolved-v1"]}
+{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","status-active-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1","release-unresolved-v1"]}
 ```
 
 `capabilities` lists only what this script implements on this host: `status-json-v1`
-always, `ownership-v1`, `runner-v1` and `pause-v1` where the locking tools
+and `status-active-v1` always, `ownership-v1`, `runner-v1` and `pause-v1` where the locking tools
 exist (see [Runner, ownership and pause](#runner-ownership-and-pause)), and
 `consumer-v1`, `delivery-v1` and `release-unresolved-v1` where a consumer can also be
-started in a session of its own. A client needs the first six capabilities in the
-contract before it may offer supervised control, and `release-unresolved-v1` before
-it passes `--leave-unresolved` to `release`. An older
+started in a session of its own. A client needs the six capabilities the contract
+names (`status-json-v1`, `ownership-v1` through `delivery-v1`) before it may offer
+supervised control, `release-unresolved-v1` before it passes `--leave-unresolved` to
+`release`, and `status-active-v1` before it passes `--active` to `status`. An older
 script answers `capabilities` with its ordinary `unknown command` error (exit 1).
 
 `status --json` follows the projection in the
@@ -914,6 +916,21 @@ script answers `capabilities` with its ordinary `unknown command` error (exit 1)
   reason `unregistered`, `id: null`. Status registers nothing. Reasons the
   runtime writes: `no_consumer` (pending, no config), `path_missing` (missing),
   `result_not_recorded` and `consumer_detached` (uncertain).
+* `status --json --active` (capability `status-active-v1`, accepted by Bob on
+  2026-11-17) is the same document with the settled deliveries left out of
+  `deliveries`: only `pending`, `in_flight`, `failed` and `uncertain` ones (and the
+  `legacy_out` entries) are listed, and a new top-level `"settled":
+  {"accepted": N, "missing": M}` counts the others. The default output has no
+  `settled` field and is unchanged. Every delivery leaves a record, so the full list
+  grows for as long as the instance runs (about 360 bytes per delivery: a year of one
+  `every/1m` item is roughly 190 MB); a client that needs the list to stay readable
+  passes the flag, after finding `status-active-v1` in `capabilities`. The flag also
+  keeps the work down: records the runner's `done/index` vouches for (see
+  [Terminal records and the lock](#runner-ownership-and-pause)) are counted in one
+  pass and neither parsed nor collected, so the cost is a listing of `done/` and
+  `out/`, not a read of every record. A filed record the index does not vouch for is
+  still parsed, so damage to it shows as the usual diagnostic and is not counted.
+  The newest settled delivery per item is not reported.
 * `owner`, `paused`, `revision`, `runner` and `consumer` come from
   `runtime/state.json` and `runtime/config.json` when they exist, and default
   (`owner: null`, `paused: false`, `revision: 0`, runner `stopped`, consumer not
@@ -974,7 +991,9 @@ simulates a host with no lock helper. Hosts that lack the runner's tools skip th
 runner tests. `test_e2e.sh` is one readable walk of the operator's path (tick-only use, the
 upgrade, recurring and overdue delivery, ownership, pause, synchronous and
 asynchronous consumers, shutdown, token reuse, release); `test_collisions.sh`
-covers [Output name collisions](#output-name-collisions); `test_streams.sh` closes
+covers [Output name collisions](#output-name-collisions); `test_scale.sh` writes thousands
+of settled records as fixtures, with no runner running for hours, and checks that
+`status --json --active` stays small and quick while the default output grows; `test_streams.sh` closes
 the runner's output pipes while a consumer runs. The consumer tests
 (`test_consumer.sh`, `test_delivery.sh`, `test_journal.sh`) use plain `/bin/sh` consumers that write marker files, kill
 the runner with `kill -9` or signal its process group while a consumer sleeps,

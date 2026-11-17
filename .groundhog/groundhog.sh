@@ -870,7 +870,7 @@ GH_IMPLEMENTATION_VERSION="dev"
 # and durability tools, and consumer-v1, delivery-v1 and release-unresolved-v1
 # (release --leave-unresolved) where it also finds a way to start a consumer in
 # its own session.
-GH_CAPABILITIES=("status-json-v1")
+GH_CAPABILITIES=("status-json-v1" "status-active-v1")
 
 JSON_LOSSY=0        # set when json_str had to replace bytes that are not UTF-8
 JSTR=""
@@ -1444,6 +1444,7 @@ inspect_consumer() {
 # cannot travel through those tools and is checked the slow way, as is every
 # name on a host without comm or sort: slower, never wrong.
 UNCL_SET=""
+REG_NL=""        # status --active: newline-separated out/ paths that settled records claim (set by done_classify)
 out_unclaimed() {
   local entry name cand="" line fast=1
   UNCL_SET=""
@@ -1463,7 +1464,7 @@ out_unclaimed() {
     while IFS= read -r line; do
       [[ -n "$line" ]] || continue
       UNCL_SET+="$US$line$US"
-    done < <( LC_ALL=C comm -23 <(printf '%s' "$cand" | LC_ALL=C sort) <(printf '%s' "$1" | tr "$US" '\n' | LC_ALL=C sort -u) )
+    done < <( LC_ALL=C comm -23 <(printf '%s' "$cand" | LC_ALL=C sort) <( { printf '%s' "$1" | tr "$US" '\n'; [[ -z "$REG_NL" ]] || printf '%s\n' "$REG_NL"; } | LC_ALL=C sort -u) )
   fi
   return 0
 }
@@ -1605,6 +1606,22 @@ delivery_collision_diags() {
 # status_record FILE REL — read one record file for status: its JSON joins
 # DELIVERIES, or a diagnostic says why it cannot.
 LIVE_IDS=""      # US-delimited ids listed from deliveries/ (a record the runner files meanwhile is not listed twice)
+LIVE_FILES=""    # status --active: US-delimited file names listed from deliveries/
+STATUS_ACTIVE=0  # status --active: settled deliveries are counted, not listed
+SETTLED_ACCEPTED=0; SETTLED_MISSING=0
+
+# status_list_or_count STATE — the record whose JSON is JR joins DELIVERIES, or
+# under --active, when it is settled (accepted or missing), only the count does.
+status_list_or_count() {
+  if (( STATUS_ACTIVE )); then
+    case "$1" in
+      accepted) SETTLED_ACCEPTED=$((SETTLED_ACCEPTED + 1)); return 0 ;;
+      missing)  SETTLED_MISSING=$((SETTLED_MISSING + 1)); return 0 ;;
+    esac
+  fi
+  DELIVERIES+=("$JR")
+}
+
 status_record() {
   local f="$1" rel="$2" stem
   stem="${f##*/}"; stem="${stem%.json}"
@@ -1623,7 +1640,7 @@ status_record() {
     diag_add delivery_record_malformed "$rel: $VERR" "$rel"
     return 0
   fi
-  DELIVERIES+=("$JR")
+  status_list_or_count "$DEL_STATE"
   REG_LIST+="$US$DEL_PATH$US"
   LIVE_IDS+="$US$stem$US"
   delivery_collision_diags "$DEL_PATH"
@@ -1641,6 +1658,7 @@ inspect_deliveries() {
   local dir="$GH_DIR/runtime/deliveries" f entry name key i stem
   shopt -s nullglob
   for f in "$dir"/*.json; do
+    if (( STATUS_ACTIVE )); then LIVE_FILES+="$US${f##*/}$US"; fi
     status_record "$f" "runtime/deliveries/${f##*/}"
   done
 
@@ -1648,6 +1666,8 @@ inspect_deliveries() {
   # for (same inode, size, mtime and mode as when it last parsed them) are not
   # parsed again; any other is read exactly like a record in deliveries/.
   DN_DIR="$dir/done"; DN_LAST=""
+  DN_COUNT_MODE=0
+  if (( STATUS_ACTIVE )) && done_count_possible; then DN_COUNT_MODE=1; fi
   done_classify
   if (( DN_LISTING_BAD )); then
     CONSISTENT=0
@@ -1656,7 +1676,15 @@ inspect_deliveries() {
   for (( i = 0; i < ${#DN_KEY[@]}; i++ )); do
     key="${DN_KEY[i]#./}"
     [[ "$LIVE_IDS" != *"$US${key%.json}$US"* ]] || continue
-    DELIVERIES+=("${DN_VIEW[i]}")
+    if (( STATUS_ACTIVE )); then
+      case "${DN_STATE[i]}" in
+        accepted) SETTLED_ACCEPTED=$((SETTLED_ACCEPTED + 1)) ;;
+        missing)  SETTLED_MISSING=$((SETTLED_MISSING + 1)) ;;
+        *)        DELIVERIES+=("${DN_VIEW[i]}") ;;
+      esac
+    else
+      DELIVERIES+=("${DN_VIEW[i]}")
+    fi
     REG_LIST+="$US${DN_PATH[i]}$US"
   done
   for key in ${DN_TODO[@]+"${DN_TODO[@]}"}; do
@@ -1848,9 +1876,10 @@ inspect_schedule() {
 
 # json_array NAME… helper: join an array's elements with commas into JR.
 join_by_comma() {
-  local out="" e
-  for e in "$@"; do out+="${out:+,}$e"; done
-  JR="$out"
+  # One expansion, not a loop of appends: appending to a growing string copies
+  # it each time, which made a list of thousands of deliveries take seconds.
+  local IFS=,
+  JR="$*"
 }
 
 # json_only_args COMMAND ARGS… — both new commands take exactly --json.
@@ -1922,7 +1951,18 @@ jgen_peek() {
 }
 
 cmd_status() {
-  json_only_args status "$@"
+  # status takes --json, and --active (status-active-v1) beside it: settled
+  # deliveries are counted instead of listed.
+  local arg rest=() seen_active=0
+  for arg in "$@"; do
+    if [[ "$arg" == --active ]]; then
+      if (( seen_active )); then echo "error: status: --active given more than once" >&2; exit 2; fi
+      seen_active=1; STATUS_ACTIVE=1
+    else
+      rest+=("$arg")
+    fi
+  done
+  json_only_args status ${rest[@]+"${rest[@]}"}
   GH_BAD_INSTALL_EXIT=2
   resolve_paths
   INSTANCE="$(canonical_dir "$GH_DIR")"
@@ -1974,10 +2014,14 @@ cmd_status() {
   join_by_comma ${DELIVERIES[@]+"${DELIVERIES[@]}"}; deliveries="$JR"
   join_by_comma ${DIAGS[@]+"${DIAGS[@]}"};          diags="$JR"
 
-  printf '{"protocol":"%s","protocol_version":%s,"instance":%s,"observed_at":%s,"revision":%s,"journal_generation":%s,"consistent":%s,"paused":%s,"owner":%s,"runner":{"state":"%s","last_error":%s},"consumer":{"configured":%s,"valid":%s,"config_digest":%s},"last_tick":%s,"schedule":[%s],"deliveries":[%s],"diagnostics":[%s]}\n' \
+  local settled=""
+  if (( STATUS_ACTIVE )); then
+    settled="\"settled\":{\"accepted\":$SETTLED_ACCEPTED,\"missing\":$SETTLED_MISSING},"
+  fi
+  printf '{"protocol":"%s","protocol_version":%s,"instance":%s,"observed_at":%s,"revision":%s,"journal_generation":%s,"consistent":%s,"paused":%s,"owner":%s,"runner":{"state":"%s","last_error":%s},"consumer":{"configured":%s,"valid":%s,"config_digest":%s},"last_tick":%s,"schedule":[%s],"deliveries":[%s],%s"diagnostics":[%s]}\n' \
     "$GH_PROTOCOL" "$GH_PROTOCOL_VERSION" "$instance_json" "$observed_json" \
     "$S_REV" "$jg_val" "$consistent" "$S_PAUSED" "$S_OWNER" "$S_RUNNER_STATE" "$S_RUNNER_ERROR" \
-    "$C_CONFIGURED" "$C_VALID" "$S_DIGEST" "$LAST_TICK" "$schedule" "$deliveries" "$diags"
+    "$C_CONFIGURED" "$C_VALID" "$S_DIGEST" "$LAST_TICK" "$schedule" "$deliveries" "$settled" "$diags"
 }
 
 # ---------------------------------------------------------------------------
@@ -3051,6 +3095,54 @@ DN_BADN=0                     # records in done/ that failed the barrier closed
 DN_LAST=""                    # the scan the arrays above describe (runner only)
 DN_DIRTY=0                    # the index needs rewriting
 DN_LISTING_BAD=0              # the listing of done/ disagrees with the directory
+DN_COUNT_MODE=0               # status --active: count what the index vouches for, do not collect it
+
+# done_count_possible — can the counting pass run here? It needs awk and the
+# tools out_unclaimed's fast path uses; without them status --active takes the
+# ordinary pass and filters its result (slower, the same answer).
+done_count_possible() {
+  local t
+  for t in awk grep comm sort tr; do command -v "$t" >/dev/null 2>&1 || return 1; done
+  return 0
+}
+
+# done_count_awk JOINED — the counting twin of the classification loop in
+# done_classify, for status --active: one awk pass over the joined scan and
+# index instead of a shell iteration per record. A record the index vouches for
+# (same signature, a terminal state, a cached view) adds to SETTLED_ACCEPTED or
+# SETTLED_MISSING and its out/ path to REG_NL; nothing about it is collected.
+# What the index does not vouch for goes to DN_TODO to be parsed, as in the
+# ordinary pass. A file that deliveries/ listed a moment ago is looked at the
+# slow way (there are few: a record the runner filed while status ran).
+done_count_awk() {
+  local res ctl tag key acc
+  res="$( printf '%s\n' "$1" | GH_LIVE_FILES="$LIVE_FILES" LC_ALL=C awk -F "$US" -v US="$US" '
+    BEGIN { live = ENVIRON["GH_LIVE_FILES"] }
+    $1 == "" { next }
+    {
+      k = $1; sub(/^\.\//, "", k)
+      if (live != "" && index(live, US k US) > 0) { print "L" US $1; next }
+      sig = $2 US $3 US $4 US $5
+      if ($12 != "" && ($10 == "accepted" || $10 == "missing") && sig == $6 US $7 US $8 US $9) {
+        if ($10 == "accepted") acc++; else miss++
+        print "R" $11
+      } else {
+        print "T" US $1
+      }
+    }
+    END { print "C" US (acc + 0) US (miss + 0) }
+  ' )" || res=""
+  ctl="$(printf '%s\n' "$res" | LC_ALL=C grep -a -v '^R')" || true
+  REG_NL="$(printf '%s\n' "$res" | LC_ALL=C sed -n 's/^R//p')"
+  while IFS="$US" read -r tag key acc; do
+    case "$tag" in
+      C) SETTLED_ACCEPTED=$((SETTLED_ACCEPTED + key)); SETTLED_MISSING=$((SETTLED_MISSING + acc)) ;;   # C <accepted> <missing>
+      T) DN_TODO+=("$key") ;;
+      L)
+        if [[ -e "${DN_DIR%/done}/${key#./}" || -L "${DN_DIR%/done}/${key#./}" ]]; then DN_DUP+=("$key"); else DN_TODO+=("$key"); fi ;;
+    esac
+  done <<< "$ctl"
+}
 
 # done_classify — scan done/ (one find, one stat, no parse) and sort each file
 # into trusted (DN_*), to-parse (DN_TODO) or duplicate (DN_DUP). A scan equal
@@ -3093,6 +3185,7 @@ done_classify() {
       joined+="$line$US$US$US$US$US$US$US"$'\n'
     done <<< "$scan"
   fi
+  if (( DN_COUNT_MODE )); then done_count_awk "$joined"; return 0; fi
   while IFS="$US" read -r key ino size mtime mode xi xs xm xo xstate xpath xview; do
     [[ -n "$key" ]] || continue
     if [[ -e "${DN_DIR%/done}/${key#./}" || -L "${DN_DIR%/done}/${key#./}" ]]; then

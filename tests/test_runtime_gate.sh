@@ -23,7 +23,7 @@ bare_gh() { PATH="$bare" "$bash_bin" "$GHD/groundhog.sh" "$@"; }
 out="$T_TMP/g.json"
 
 bare_gh capabilities --json > "$out"
-assert_eq "no lock helper: only status-json-v1 is advertised" '["status-json-v1"]' "$(jget "$out" capabilities)"
+assert_eq "no lock helper: only the two status capabilities are advertised" '["status-json-v1","status-active-v1"]' "$(jget "$out" capabilities)"
 
 new_token_path
 for c in "enroll --owner-label x --token-file $TOK" "run --token-file $TOK" "pause --token-file $TOK" \
