@@ -2404,12 +2404,31 @@ cmd_setpause() { # true|false
   if [[ "$want" == true ]]; then echo "paused"; else echo "resumed"; fi
 }
 
+# stop_inflight_id — set STOP_DID to the id of a delivery whose attempt is in
+# flight; returns 1 when there is none (only the live deliveries/ directory is
+# looked at; filed records are settled).
+STOP_DID=""
+stop_inflight_id() {
+  local f
+  shopt -s nullglob
+  for f in "$RT_DIR"/deliveries/*.json; do
+    if drec_load "$f" && [[ "$D_STATE" == in_flight ]]; then
+      STOP_DID="$D_ID"; shopt -u nullglob; return 0
+    fi
+  done
+  shopt -u nullglob
+  return 1
+}
+
+# cmd_stop — a stop request closes admission, but the runner finishes the one
+# consumer call it already admitted and records its result before it exits, so
+# this waits for that call. SIGTERM to the runner detaches from it at once.
 cmd_stop() {
   parse_opts stop token-file -- "$@"
   [[ -n "$OPT_TOKEN_FILE" ]] || rt_die 2 "stop: --token-file is required"
   rt_begin stop
   token_read "$OPT_TOKEN_FILE"
-  local rc
+  local rc spins=0 told=0
   while :; do
     # Write the request under mutation, holding nothing else...
     lock_mutation_or_die stop
@@ -2447,6 +2466,12 @@ cmd_stop() {
       return 0
     elif (( rc != 1 )); then
       rt_die 6 "stop: cannot test the runner lock"
+    fi
+    spins=$((spins + 1))
+    # About once a second, until said once: say what the wait is for.
+    if (( ! told && spins % 5 == 0 )) && stop_inflight_id; then
+      told=1
+      echo "stop: waiting on a delivery ($STOP_DID): the runner (pid ${R_RUNNER_PID:-unknown}) finishes the consumer call it admitted and records its result before it exits; SIGTERM to that runner detaches now and leaves the delivery uncertain" >&2
     fi
     sleep 0.2 8>&- 9>&-
   done
@@ -3636,10 +3661,12 @@ consumer_start() {
   CPID=$!
 }
 
-# consumer_wait — wait for CPID without blocking signals or stop requests.
+# consumer_wait — wait for CPID without blocking signals.
 # Returns 0 with CSTATUS set once it exited; 1 when this runner should detach
-# (a signal, or a stop request) and leave it running. The child's own exit is
-# seen by bash's SIGCHLD handling: kill -0 turns false once it is reaped and
+# (a signal) and leave it running. A stop request does not detach: it closes
+# admission (RUNNER_STOP) and the wait goes on, so the result of the call
+# already admitted gets recorded; `stop` waits for that. The child's own exit
+# is seen by bash's SIGCHLD handling: kill -0 turns false once it is reaped and
 # `wait` then yields its status.
 consumer_wait() {
   local spid n=0
@@ -3649,7 +3676,9 @@ consumer_wait() {
     spid=$!
     wait "$spid" 2>/dev/null || true
     n=$((n + 1))
-    if (( n % 5 == 0 )) && runner_poll_stop; then return 1; fi
+    if (( ! RUNNER_STOP && n % 5 == 0 )) && runner_poll_stop; then
+      runner_log "stop requested: admission is closed; waiting for the consumer of delivery $H_ID to finish and record its result (SIGTERM to this runner detaches now)"
+    fi
   done
   CSTATUS=0
   wait "$CPID" 2>/dev/null || CSTATUS=$?
@@ -3786,7 +3815,7 @@ runner_handoff_pending() {
     consumer_start "$H_PATH" "$H_ID" "$H_ATTEMPT"
     runner_log "handoff: delivery $H_ID, attempt $H_ATTEMPT"
     if ! consumer_wait; then
-      runner_log "closing admission and detaching from the consumer of delivery $H_ID; it keeps running and the attempt stays unresolved"
+      runner_log "closing admission and detaching from the consumer of delivery $H_ID after a signal; it keeps running and the attempt stays unresolved"
       RUNNER_STOP=1
       return 0
     fi

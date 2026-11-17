@@ -218,7 +218,7 @@ worker() { local j; for j in "$SPOOL"/*.job; do [ -d "$j" ] || continue; cat "$j
 worker
 assert_eq "the worker, run separately, drains the spool from its own copy" "job-1" "$(cat "$SPOOL/$aid.done")"
 
-# --- 9. process shutdown with a consumer in flight --------------------------------------------
+# --- 9. signal shutdown with a consumer in flight (stop would wait for it) --------------------------------------------
 new_instance; gh init >/dev/null
 gh add daily nudge >/dev/null; echo z > "$GHD/schedule/daily/nudge/note.txt"
 enroll_ok
@@ -227,8 +227,9 @@ write_config /bin/sh "$CONS"
 run_bg
 wait_for "the consumer is running" 100 pid_alive "$INST/slow.pid"
 T_GROUPS="$T_GROUPS $(cat "$INST/slow.pid")"
-stop_bg
-assert_true "stop detached from it without killing it" pid_alive "$INST/slow.pid"
+kill -TERM "$RUNNER_PID"
+wait_exit "SIGTERM ends the runner" 80 "$RUNNER_PID"
+assert_true "the signal detached from it without killing it" pid_alive "$INST/slow.pid"
 status_to "$out"
 assert_eq "...the delivery is uncertain, never accepted by shutdown" '"uncertain"' "$(dstate "nudge-$(today)")"
 assert_eq "...ownership is kept" 1 "$(jget "$out" owner.generation)"
