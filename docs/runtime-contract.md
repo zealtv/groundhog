@@ -8,10 +8,11 @@ ownership and pause rules here, and `run` reconciles the delivery journal and
 hands pending deliveries to the consumer in `runtime/config.json`.
 `capabilities` advertises `status-json-v1` everywhere, `ownership-v1`, `runner-v1`
 and `pause-v1` on hosts with the locking and durability tools described in
-[README.md](../README.md#runner-ownership-and-pause), and `consumer-v1` and
-`delivery-v1` where the host can also start a consumer in a session of its own
-([README.md](../README.md#consumers-and-deliveries)); with all six, this script
-satisfies "all six capabilities" for supervised control. The README records the
+[README.md](../README.md#runner-ownership-and-pause), and `consumer-v1`,
+`delivery-v1` and `release-unresolved-v1` where the host can also start a consumer
+in a session of its own ([README.md](../README.md#consumers-and-deliveries)); with
+the first six, this script satisfies "all six capabilities" for supervised control,
+and `release-unresolved-v1` adds `release --leave-unresolved`. The README records the
 points where the implementation chose a reading of this document (the extra
 `runtime/prepared/` journal, the exit-status record for signals, the legacy
 one-shot rule). Each schedule record of `status --json` also carries an
@@ -89,14 +90,17 @@ Synthetic capability response (not output from today's script):
   "protocol": "groundhog-runtime",
   "protocol_version": 1,
   "implementation_version": "example-build",
-  "capabilities": ["status-json-v1", "ownership-v1", "runner-v1", "pause-v1", "consumer-v1", "delivery-v1"]
+  "capabilities": ["status-json-v1", "ownership-v1", "runner-v1", "pause-v1", "consumer-v1", "delivery-v1", "release-unresolved-v1"]
 }
 ```
 
 Protocol version is an integer for incompatible changes; implementation version
 is informational. Additive fields may appear. Clients ignore unknown fields
-and decline unknown enum values for control. All six capabilities and version
-1 are required for supervised control under this contract. An old script
+and decline unknown enum values for control. The first six capabilities (through `delivery-v1`) and version
+1 are required for supervised control under this contract. `release-unresolved-v1`
+is the seventh, optional one: a client negotiates it, by finding it in the
+`capabilities` list, before it passes `--leave-unresolved` to `release`, and
+otherwise uses plain `release` (a script without it exits 2 on the flag). An old script
 returns its existing unknown-command error: inspect its files as legacy, mark control unsupported,
 and do not probe by running `run`, `tick` or `init`. Capability discovery invokes
 only the deliberately selected instance's script; it is not a payload sandbox.

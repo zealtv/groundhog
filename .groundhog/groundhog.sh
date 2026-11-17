@@ -867,8 +867,9 @@ GH_PROTOCOL_VERSION=1
 GH_IMPLEMENTATION_VERSION="dev"
 # Advertise only what this script implements here. cmd_capabilities adds
 # ownership-v1, runner-v1 and pause-v1 on hosts where rt_detect finds the locking
-# and durability tools, and consumer-v1 and delivery-v1 where it also finds a way
-# to start a consumer in its own session.
+# and durability tools, and consumer-v1, delivery-v1 and release-unresolved-v1
+# (release --leave-unresolved) where it also finds a way to start a consumer in
+# its own session.
 GH_CAPABILITIES=("status-json-v1")
 
 JSON_LOSSY=0        # set when json_str had to replace bytes that are not UTF-8
@@ -1879,7 +1880,7 @@ cmd_capabilities() {
   if [[ -z "$GH_RT_MISSING" ]]; then
     GH_CAPABILITIES+=("ownership-v1" "runner-v1" "pause-v1")
     if [[ -n "$GH_ISOLATE" ]]; then
-      GH_CAPABILITIES+=("consumer-v1" "delivery-v1")
+      GH_CAPABILITIES+=("consumer-v1" "delivery-v1" "release-unresolved-v1")
     fi
   fi
   for c in "${GH_CAPABILITIES[@]}"; do

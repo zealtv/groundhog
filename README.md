@@ -374,7 +374,7 @@ helper (util-linux `flock` or perl with `Fcntl`); a SHA-256 tool (`sha256sum`,
 `od` and `/dev/urandom`. Without them `capabilities` lists `status-json-v1` only,
 `enroll`, `run`, `pause`, `resume`, `stop`, `release`, `retry` and `recover` exit
 5 with a message, and every legacy command works as before without taking any
-lock. `consumer-v1` and `delivery-v1` additionally need a way to start a consumer
+lock. `consumer-v1`, `delivery-v1` and `release-unresolved-v1` additionally need a way to start a consumer
 in a session of its own: perl with `POSIX` (it ships with macOS), else
 `setsid(1)`. Without that, the host lists the first four capabilities and `run`
 refuses a configured consumer with exit 5. Support is
@@ -748,7 +748,8 @@ you.
 
 1. **Check the host.** `./groundhog.sh capabilities --json` should list all six
    capabilities (`status-json-v1`, `ownership-v1`, `runner-v1`, `pause-v1`,
-   `consumer-v1`, `delivery-v1`). Without the last two the instance can still be
+   `consumer-v1`, `delivery-v1`), and `release-unresolved-v1` (the flag for
+   `release`). Without `consumer-v1` and `delivery-v1` the instance can still be
    owned, paused and run delivery-only.
 2. **Stop whatever else writes to the instance.** Other `tick` loops, cron lines,
    and any process that moves entries out of `out/` (see the next section). An
@@ -870,15 +871,16 @@ their behavior, including creating the trays.
 
 ```
 $ ./groundhog.sh capabilities --json
-{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1"]}
+{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1","release-unresolved-v1"]}
 ```
 
 `capabilities` lists only what this script implements on this host: `status-json-v1`
 always, `ownership-v1`, `runner-v1` and `pause-v1` where the locking tools
 exist (see [Runner, ownership and pause](#runner-ownership-and-pause)), and
-`consumer-v1` and `delivery-v1` where a consumer can also be started in a
-session of its own. A client needs all six capabilities in the contract before
-it may offer supervised control. An older
+`consumer-v1`, `delivery-v1` and `release-unresolved-v1` where a consumer can also be
+started in a session of its own. A client needs the first six capabilities in the
+contract before it may offer supervised control, and `release-unresolved-v1` before
+it passes `--leave-unresolved` to `release`. An older
 script answers `capabilities` with its ordinary `unknown command` error (exit 1).
 
 `status --json` follows the projection in the

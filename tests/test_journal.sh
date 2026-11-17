@@ -284,9 +284,9 @@ status_to "$out"
 assert_eq "...ownership gone" null "$(jget "$out" owner)"
 assert_eq "...records intact" 4 "$(jget "$out" deliveries | python3 -I -c 'import json,sys;print(len(json.load(sys.stdin)))')"
 
-# --- capabilities: all six where the host allows ---------------------------------
+# --- capabilities: all seven where the host allows ---------------------------------
 new_instance
 gh capabilities --json > "$out"
-assert_eq "all six capabilities are offered" '["status-json-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1"]' "$(jget "$out" capabilities)"
+assert_eq "all seven capabilities are offered" '["status-json-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1","release-unresolved-v1"]' "$(jget "$out" capabilities)"
 
 t_finish
