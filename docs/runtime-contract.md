@@ -234,8 +234,9 @@ pause or adopt pending out entries as accepted.
 Enrollment requires an explicit `enroll` request for an unowned, compatible
 instance. The caller may be a previously authorized noninteractive script or
 service; no new foreground human action is required for each session. An owner
-may retain and reuse its valid private token across its own restarts and invoke
-`run` under that authorization. Token identity, secret and generation are still
+may retain and reuse its valid private token across its own restarts, or (a
+client choice, as Easyhog's policy below shows) adopt one that an ended session of
+the same client left, and invoke `run` under that authorization. Token identity, secret and generation are still
 validated for every control command. `run` never clears pause: resuming requires
 an explicit `resume` command. Discovery alone never enrolls or grants control,
 and recognized application identity grants no exception. An external owner
@@ -261,8 +262,17 @@ file merely because a PID looks absent.
 
 Easyhog is one ordinary client with a session policy: explicit Play enrolls an
 unowned compatible instance, or resumes/runs one whose token that session holds.
-On reopen, it does not reuse persisted tokens or start work; explicit Play is
-required, and a retained external owner still prevents enrollment. On clean
+On reopen, it starts no work: explicit Play is required to enroll an unowned
+instance, and a retained external owner still prevents enrollment. A client may
+reuse a persisted token across its own sessions; this is a client choice, and
+nothing in the protocol requires or forbids it. Easyhog (as of 2026-11-17) does:
+a session adopts a token left by a session that has ended, proven by a lock the
+operating system releases, and treats it like its own token, applying the
+ownership rule (the token's `owner_id` and `generation` against `status.owner`;
+it deletes the token on a coherent status that shows another owner or none).
+Easyhog adopts only tokens for instances beneath its own root (as of 2026-11-18);
+a token for any other instance stays where it is, for a session on that
+instance's root. Adoption restarts nothing. On clean
 Quit it stops its owned runners, waits for the stop barrier, then releases and
 deletes tokens only after successful safe cleanup. Failed stop/release or an
 unresolved enrollment retains the token and reports the incomplete cleanup.
@@ -723,7 +733,7 @@ GH=/example/project/.groundhog/groundhog.sh
 | Authorized service stops without release, then restarts with its valid token and invokes run | Same owner/generation; pause retained; no re-enrollment required; unresolved handoff barrier still applies. |
 | Authorized service explicitly enrolls an unowned instance and invokes run | Same authorization checks as any caller; no foreground human session required; run does not clear pause. |
 | Owner stops, reconciles unresolved attempts, explicitly releases | No owner, runner stopped, pause retained; old token invalidated. |
-| Easyhog clean Quit completes stop/release, then reopen | No owner, runner stopped, pause retained; this client's policy requires explicit Play and does not reuse persisted tokens. |
+| Easyhog clean Quit completes stop/release, then reopen | No owner, runner stopped, pause retained; Quit deleted the token, so there is nothing to adopt, and this client's policy requires explicit Play. |
 
 Enrollment failure examples (no new command is needed):
 
