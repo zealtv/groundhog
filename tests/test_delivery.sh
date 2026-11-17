@@ -246,6 +246,71 @@ for sig in INT TERM; do
   kill_consumer
 done
 
+# --- release --leave-unresolved: ownership goes, the barrier stays -------------
+# The barrier keys on delivery records alone, so giving up ownership with an
+# unresolved attempt neither lifts it nor lets a new owner bypass it.
+fresh_consumer "$SLEEPER"
+OWNER_LABEL=test-session
+add_item other
+start_runner --token-file "$TOK" --interval-seconds 1
+wait_for "the consumer started" 100 file_has "$INST/calls.txt"
+track_consumer
+# Whichever delivery the runner admitted first is NAME; the other waits.
+status_to "$out"
+NAME="$(jq_py where "$out" deliveries state '"in_flight"' path)"; NAME="${NAME#out/}"
+other_name="$(jq_py where "$out" deliveries state '"pending"' path)"; other_name="${other_name#out/}"
+assert_true "(one delivery in flight, one pending)" test -n "$NAME" -a -n "$other_name"
+rc=0; gh release --token-file "$TOK" --leave-unresolved >/dev/null 2>"$out.e" || rc=$?
+assert_eq "release --leave-unresolved with a live runner still exits 4" 4 "$rc"
+kill -TERM "$RUNNER_PID"
+wait_exit "SIGTERM detached the runner" 50 "$RUNNER_PID"
+assert_eq "...the delivery is uncertain" '"uncertain"' "$(dstate "$NAME")"
+assert_eq "...the attempt names the owner that admitted it" "\"$OWNER_LABEL\"" "$(dget path "out/$NAME" attempts.0.owner_label)"
+assert_eq "...and when (started_at is the admission time)" 'str' "$(dget path "out/$NAME" attempts.0.started_at | cut -c1 | sed 's/"/str/')"
+rc=0; gh release --token-file "$TOK" >/dev/null 2>"$out.e" || rc=$?
+assert_eq "plain release still refuses (5)" 5 "$rc"
+assert_contains "...with the recover-it-first message" "$(cat "$out.e")" "recover it first"
+rc=0; gh stop --token-file "$TOK" --leave-unresolved >/dev/null 2>&1 || rc=$?
+assert_eq "--leave-unresolved is an option of release only (stop exits 2)" 2 "$rc"
+rc=0; gh release --token-file "$TOK" --leave-unresolved --leave-unresolved >/dev/null 2>&1 || rc=$?
+assert_eq "...given twice exits 2" 2 "$rc"
+status_to "$out"
+assert_eq "...plain release left the owner in place" 1 "$(jget "$out" owner.generation)"
+rc=0; gh release --token-file "$TOK" --leave-unresolved >/dev/null 2>"$out.e" || rc=$?
+assert_eq "release --leave-unresolved succeeds with an uncertain attempt" 0 "$rc"
+status_to "$out"
+assert_eq "...the instance has no owner" null "$(jget "$out" owner)"
+assert_eq "...the delivery is still uncertain" '"uncertain"' "$(dget path "out/$NAME" state)"
+assert_eq "...with its record untouched, owner label included" "\"$OWNER_LABEL\"" "$(dget path "out/$NAME" attempts.0.owner_label)"
+assert_eq "...the other delivery is still pending" '"pending"' "$(dget path "out/$other_name" state)"
+# A later owner enrolls, sees whose call it was, and meets the barrier.
+old_tok="$TOK"; new_token_path
+gh enroll --owner-label next-session --token-file "$TOK" >/dev/null 2>&1
+assert_eq "a new owner can enroll" "\"next-session\"" "$(status_to "$out"; jget "$out" owner.label)"
+assert_eq "...status still shows the earlier owner's label on the attempt" "\"$OWNER_LABEL\"" "$(dget path "out/$NAME" attempts.0.owner_label)"
+consumer_script consumer2.sh 'echo y >> "$PWD/calls2.txt"'
+write_config /bin/sh "$CONS"
+start_runner --token-file "$TOK" --interval-seconds 1
+sleep 3
+assert_eq "under the new owner the barrier still blocks every admission" 0 "$(lines "$INST/calls2.txt")"
+assert_eq "...the other delivery stays pending" '"pending"' "$(dget path "out/$other_name" state)"
+assert_contains "...and the runner says why" "$(cat "$RUN_ERR")" "blocked"
+gh stop --token-file "$TOK" >/dev/null 2>&1
+wait_exit "runner exited" 50 "$RUNNER_PID"
+kill_consumer
+rc=0; gh recover --token-file "$TOK" --delivery "$(did "$NAME")" --decision accept >/dev/null 2>"$out.e" || rc=$?
+assert_eq "recover under the new owner exits 0" 0 "$rc"
+assert_eq "...lifting the barrier: the delivery is accepted" '"accepted"' "$(dstate "$NAME")"
+assert_eq "...the attempt still names the owner that admitted it" "\"$OWNER_LABEL\"" "$(dget path "out/$NAME" attempts.0.owner_label)"
+start_runner --token-file "$TOK" --interval-seconds 1
+wait_for "the pending delivery is then handed off" 150 lines_eq "$INST/calls2.txt" 1
+wait_for "...and accepted" 100 state_is "$other_name" accepted
+gh stop --token-file "$TOK" >/dev/null 2>&1
+wait_exit "runner exited" 50 "$RUNNER_PID"
+rc=0; gh release --token-file "$TOK" >/dev/null 2>&1 || rc=$?
+assert_eq "plain release succeeds once nothing is unresolved" 0 "$rc"
+TOK="$old_tok"
+
 # --- pause ----------------------------------------------------------------------
 # A paused runner hands off nothing, pending stays pending; resume releases it.
 fresh_consumer 'echo x >> "$PWD/calls.txt"'

@@ -20,7 +20,7 @@ usage:
   groundhog.sh pause --token-file PATH
   groundhog.sh resume --token-file PATH
   groundhog.sh stop --token-file PATH
-  groundhog.sh release --token-file PATH
+  groundhog.sh release --token-file PATH [--leave-unresolved]
   groundhog.sh retry --token-file PATH --delivery ID
   groundhog.sh recover --token-file PATH --delivery ID --decision retry|accept
 
@@ -867,8 +867,9 @@ GH_PROTOCOL_VERSION=1
 GH_IMPLEMENTATION_VERSION="dev"
 # Advertise only what this script implements here. cmd_capabilities adds
 # ownership-v1, runner-v1 and pause-v1 on hosts where rt_detect finds the locking
-# and durability tools, and consumer-v1 and delivery-v1 where it also finds a way
-# to start a consumer in its own session.
+# and durability tools, and consumer-v1, delivery-v1 and release-unresolved-v1
+# (release --leave-unresolved) where it also finds a way to start a consumer in
+# its own session.
 GH_CAPABILITIES=("status-json-v1")
 
 JSON_LOSSY=0        # set when json_str had to replace bytes that are not UTF-8
@@ -1473,7 +1474,7 @@ REG_LIST=""      # US-separated out/ paths that a record claims
 
 # attempt_json KEY — one attempt object from the parsed record, in JR.
 attempt_json() {
-  local k="$1" id started finished outcome exit_code signal error decision decided_at extra=""
+  local k="$1" id started finished outcome exit_code signal error decision decided_at extra="" owner_extra=""
   jp_get "$k"
   [[ "$JP_GT" == o ]] || { VERR="an attempt is not an object"; return 1; }
   jp_get "$k${US}id"
@@ -1507,6 +1508,14 @@ attempt_json() {
   esac
   jp_nstr "$k${US}signal" || return 1; signal="$JR"
   jp_errobj "$k${US}error" || return 1; error="$JR"
+  # owner_label: whose call it was (the label of the owner that admitted it);
+  # absent on attempts admitted before it was recorded.
+  jp_get "$k${US}owner_label"
+  case "$JP_GT" in
+    ""|z) ;;
+    s) json_str "$JP_GV"; owner_extra=",\"owner_label\":$JSTR" ;;
+    *) VERR="an attempt owner_label has the wrong type"; return 1 ;;
+  esac
   jp_get "$k${US}decision"
   if [[ -n "$JP_GT" && "$JP_GT" != z ]]; then
     [[ "$JP_GT" == s && ( "$JP_GV" == retry || "$JP_GV" == accept ) ]] || { VERR="an attempt has an unknown decision"; return 1; }
@@ -1514,7 +1523,7 @@ attempt_json() {
     jp_nstr "$k${US}decided_at" || return 1; decided_at="$JR"
     extra=",\"decision\":$decision,\"decided_at\":$decided_at"
   fi
-  JR="{\"id\":$id,\"started_at\":$started,\"finished_at\":$finished,\"outcome\":$outcome,\"exit_code\":$exit_code,\"signal\":$signal,\"error\":$error$extra}"
+  JR="{\"id\":$id,\"started_at\":$started,\"finished_at\":$finished,\"outcome\":$outcome,\"exit_code\":$exit_code,\"signal\":$signal,\"error\":$error$owner_extra$extra}"
 }
 
 # delivery_check STEM — turn the parsed deliveries/<STEM>.json into JR.
@@ -1871,7 +1880,7 @@ cmd_capabilities() {
   if [[ -z "$GH_RT_MISSING" ]]; then
     GH_CAPABILITIES+=("ownership-v1" "runner-v1" "pause-v1")
     if [[ -n "$GH_ISOLATE" ]]; then
-      GH_CAPABILITIES+=("consumer-v1" "delivery-v1")
+      GH_CAPABILITIES+=("consumer-v1" "delivery-v1" "release-unresolved-v1")
     fi
   fi
   for c in "${GH_CAPABILITIES[@]}"; do
@@ -2285,9 +2294,15 @@ parse_opts() {
   shift
   while [[ "$1" != -- ]]; do allowed+="$1 "; shift; done
   shift
-  OPT_TOKEN_FILE=""; OPT_LABEL=""; OPT_INTERVAL=""; OPT_DELIVERY=""; OPT_DECISION=""
+  OPT_TOKEN_FILE=""; OPT_LABEL=""; OPT_INTERVAL=""; OPT_DELIVERY=""; OPT_DECISION=""; OPT_LEAVE=0
   while (( $# )); do
     case "$1" in
+      --leave-unresolved)
+        [[ "$allowed" == *" leave-unresolved "* ]] || rt_die 2 "$cmd: unknown option '$1'"
+        (( ! OPT_LEAVE )) || rt_die 2 "$cmd: --leave-unresolved given more than once"
+        OPT_LEAVE=1
+        shift
+        ;;
       --token-file|--owner-label|--interval-seconds|--delivery|--decision)
         name="${1#--}"
         [[ "$allowed" == *" $name "* ]] || rt_die 2 "$cmd: unknown option '$1'"
@@ -2499,7 +2514,7 @@ unresolved_attempt_exists() {
 }
 
 cmd_release() {
-  parse_opts release token-file -- "$@"
+  parse_opts release token-file leave-unresolved -- "$@"
   [[ -n "$OPT_TOKEN_FILE" ]] || rt_die 2 "release: --token-file is required"
   rt_begin release
   token_read "$OPT_TOKEN_FILE"
@@ -2509,7 +2524,12 @@ cmd_release() {
   (( rc == 0 )) || rt_die 6 "release: cannot test the runner lock"
   lock_mutation_or_die release
   control_check release
-  if unresolved_attempt_exists; then
+  # An unresolved attempt is protected by the handoff barrier (ix_blocked), which
+  # keys on the delivery records alone, so it keeps blocking every consumer
+  # admission after a release and under any later owner until `recover`. Plain
+  # release still refuses; --leave-unresolved lets the caller give up ownership
+  # anyway (the records stay as they are).
+  if (( ! OPT_LEAVE )) && unresolved_attempt_exists; then
     unlock_mutation
     rt_die 5 "release: a delivery attempt is unresolved (in flight or uncertain); recover it first. Ownership is retained."
   fi
@@ -2733,13 +2753,13 @@ D_ID=""; D_PATH=""; D_ORIGIN="runtime"; D_SCHED=""; D_HASOCC=0; D_DATE=""; D_SLO
 D_STATE="pending"; D_REASON=""; D_REGAT=""; D_MARKER=""
 D_COLL=()            # one per out_collision: date US slot US schedule_path
 D_FILE=""            # the file drec_load read; drec_save writes back to it
-A_ID=(); A_START=(); A_FIN=(); A_OUT=(); A_EXIT=(); A_SIG=(); A_ERR=(); A_DEC=(); A_DECAT=()
+A_ID=(); A_START=(); A_FIN=(); A_OUT=(); A_EXIT=(); A_SIG=(); A_ERR=(); A_DEC=(); A_DECAT=(); A_OWNER=()
 
 drec_reset() {
   D_ID=""; D_PATH=""; D_ORIGIN="runtime"; D_SCHED=""; D_HASOCC=0; D_DATE=""; D_SLOT=""
   D_STATE="pending"; D_REASON=""; D_REGAT=""; D_MARKER=""
   D_COLL=(); D_FILE=""
-  A_ID=(); A_START=(); A_FIN=(); A_OUT=(); A_EXIT=(); A_SIG=(); A_ERR=(); A_DEC=(); A_DECAT=()
+  A_ID=(); A_START=(); A_FIN=(); A_OUT=(); A_EXIT=(); A_SIG=(); A_ERR=(); A_DEC=(); A_DECAT=(); A_OWNER=()
 }
 
 # rawstr KEY — the string at KEY ("" for null or absent) in RAWS. Returns 1 if
@@ -2820,6 +2840,13 @@ drec_load() {
         esac
         jp_nstr "$k${US}signal" || return 1; A_SIG[i]="$JR"
         jp_errobj "$k${US}error" || return 1; A_ERR[i]="$JR"
+        jp_get "$k${US}owner_label"
+        A_OWNER[i]=""
+        case "$JP_GT" in
+          ""|z) ;;
+          s) A_OWNER[i]="$JP_GV" ;;
+          *) return 1 ;;
+        esac
         jp_get "$k${US}decision"
         A_DEC[i]=""; A_DECAT[i]=null
         if [[ -n "$JP_GT" && "$JP_GT" != z ]]; then
@@ -2874,6 +2901,9 @@ drec_render() {
     json_str "${A_START[i]}"; local ast="$JSTR"
     json_str "${A_OUT[i]}"; local aout="$JSTR"
     local one="{\"id\":$aid,\"started_at\":$ast,\"finished_at\":${A_FIN[i]},\"outcome\":$aout,\"exit_code\":${A_EXIT[i]},\"signal\":${A_SIG[i]},\"error\":${A_ERR[i]}"
+    if [[ -n "${A_OWNER[i]:-}" ]]; then
+      json_str "${A_OWNER[i]}"; one+=",\"owner_label\":$JSTR"
+    fi
     if [[ -n "${A_DEC[i]}" ]]; then
       json_str "${A_DEC[i]}"; one+=",\"decision\":$JSTR,\"decided_at\":${A_DECAT[i]}"
     fi
@@ -3735,6 +3765,7 @@ handoff_admit() {
   n=${#A_ID[@]}
   A_ID[n]="$aid"; A_START[n]="$(now_utc)"; A_FIN[n]=null; A_OUT[n]=in_flight
   A_EXIT[n]=null; A_SIG[n]=null; A_ERR[n]=null; A_DEC[n]=""; A_DECAT[n]=null
+  A_OWNER[n]="$R_OWNER_LABEL"
   D_STATE=in_flight; D_REASON=""
   # Durable before the consumer exists: a crash after this line leaves an
   # in_flight attempt that the next run turns into uncertain, never a replay.
