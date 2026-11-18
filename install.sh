@@ -21,7 +21,11 @@ trap 'rm -f "$tmp"' EXIT
 cp -f "$REPO_DIR/.groundhog/groundhog.sh" "$tmp"
 chmod 755 "$tmp"
 mv -f "$tmp" "$dest/groundhog.sh"
-cp -f "$REPO_DIR/README.md" "$dest/README.md"
+[ "$REPO_DIR/.groundhog/README.md" -ef "$dest/README.md" ] ||
+  cp -f "$REPO_DIR/.groundhog/README.md" "$dest/README.md"
+mkdir -p "$dest/docs"
+[ "$REPO_DIR/.groundhog/docs/runtime-contract.md" -ef "$dest/docs/runtime-contract.md" ] ||
+  cp -f "$REPO_DIR/.groundhog/docs/runtime-contract.md" "$dest/docs/runtime-contract.md"
 # An owned instance refuses `init` (exit 3): its trays already exist and its
 # owner's runner is the only writer. Leave them alone; any other failure stops us.
 rc=0
