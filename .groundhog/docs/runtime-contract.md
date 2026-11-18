@@ -13,8 +13,9 @@ in a session of its own ([README.md](../README.md#consumers-and-deliveries)); wi
 the six required ones, this script satisfies "all six capabilities" for supervised control,
 `release-unresolved-v1` adds `release --leave-unresolved`, `status-active-v1` adds
 `status --json --active`, `next-due-v1` adds `status --json --next-due`, `add-while-owned-v1` lets `add` work on an owned instance and adds
-`add --from DIR`, and `sweep-owner-v1` (offered with `ownership-v1`) adds
-`sweep --token-file`. The README records the
+`add --from DIR`, `sweep-owner-v1` (offered with `ownership-v1`) adds
+`sweep --token-file`, and `discard-v1` (also offered with `ownership-v1`) adds
+`discard --token-file`. The README records the
 points where the implementation chose a reading of this document (the extra
 `runtime/prepared/` journal, the exit-status record for signals, the legacy
 one-shot rule). Each schedule record of `status --json` also carries an
@@ -78,6 +79,7 @@ groundhog.sh release --token-file PATH [--leave-unresolved]
 groundhog.sh sweep --token-file PATH [days]
 groundhog.sh retry --token-file PATH --delivery ID
 groundhog.sh recover --token-file PATH --delivery ID --decision retry|accept
+groundhog.sh discard --token-file PATH --delivery ID
 ```
 
 `capabilities` and `status` are strictly read-only even before `init` or
@@ -93,7 +95,7 @@ Synthetic capability response (not output from today's script):
   "protocol": "groundhog-runtime",
   "protocol_version": 1,
   "implementation_version": "example-build",
-  "capabilities": ["status-json-v1", "status-active-v1", "next-due-v1", "add-while-owned-v1", "ownership-v1", "runner-v1", "pause-v1", "sweep-owner-v1", "consumer-v1", "delivery-v1", "release-unresolved-v1"]
+  "capabilities": ["status-json-v1", "status-active-v1", "next-due-v1", "add-while-owned-v1", "ownership-v1", "runner-v1", "pause-v1", "sweep-owner-v1", "discard-v1", "consumer-v1", "delivery-v1", "release-unresolved-v1"]
 }
 ```
 
@@ -112,7 +114,8 @@ as one it cannot sweep (a script without it refuses the option and sweeps nothin
 `add-while-owned-v1` is a fourth: a client finds it before it passes `--from` to `add`, and before it
 relies on `add` succeeding on an owned instance, and otherwise treats an owned instance as one it cannot add to
 (a script without it exits 3 on an owned instance, and on an unowned one ignores `--from` and creates an
-empty item). An old script
+empty item). `discard-v1` is a fifth: a client finds it in the list before it runs `discard`, and otherwise
+offers no discard (a script without it reports an unknown command). An old script
 returns its existing unknown-command error: inspect its files as legacy, mark control unsupported,
 and do not probe by running `run`, `tick` or `init`. Capability discovery invokes
 only the deliberately selected instance's script; it is not a payload sandbox.
@@ -188,7 +191,7 @@ every consumer admission after such a release and under any later owner, until
 `recover` settles the attempt; plain `release` keeps its refusal (exit 5, "recover
 it first"). Amended on 2026-11-17. Absent a live runner, pause/resume/stop still work with the current token;
 stop is idempotent. Repeated pause/resume set the requested value idempotently.
-Retry and recover require a stopped runner, making operator decisions explicit
+Retry, recover and discard require a stopped runner, making operator decisions explicit
 before the next run. Retry of another failed delivery does not lift an unresolved
 invocation barrier. Before either recovery decision, the operator must establish
 that the original consumer invocation has finished; runner exclusion or a PID
@@ -558,9 +561,29 @@ above removes, accepted and `missing` records with their `out/` entries and unre
 reported as skipped. A `pending` delivery with reason `no_consumer` is such a delivery: no
 consumer has seen it, so its payload is the only trace of the delivery and a sweep does not
 decide its disposition; it stays until a consumer is configured and takes it, or until the
-operator removes the entry and its record by hand. The sweep writes no state: ownership,
+owner discards it with `discard`. The sweep writes no state: ownership,
 pause, runner state and `revision` stay as they were, and it neither enrolls nor releases.
 Without `--token-file`, `sweep` keeps refusing an owned instance.
+
+`discard --token-file PATH --delivery ID` (capability `discard-v1`; proposed on 2026-11-18;
+text accepted by Bob on 2026-11-18) lets the token holder dispose of a delivery that no
+consumer took, so an instance that runs without one does not grow `out/` and its records
+without limit. It follows the rules of `retry` and `recover`: a stopped runner (exit 4 while one
+is alive), the token revalidated under the mutation lock (exit 3 for a stale or foreign one),
+exit 2 for a missing token file or a missing or malformed `--delivery`, 5 for a missing or
+unreadable record or a delivery in a state it does not discard, and 6 for an I/O failure. It
+discards a `pending` delivery with reason `no_consumer`, and no other. Under the lock it
+removes the delivery's `out/` entry and then writes the record, durably, as `missing` with
+reason `discarded`; it invokes nothing, leaves the delivery's attempts and its fired marker
+(so the occurrence does not fire again) and does not touch the handoff barrier, which it may
+run beside. A delivery whose `out/` entry is already gone is settled the same way, so a
+discard that stopped between its two steps repeats safely, and `discard` of a delivery that is
+already `missing` with reason `discarded` exits 0 and changes nothing. `discarded` is a
+reason beside `path_missing`, not a state: the record is terminal like any `missing` one, the
+runner files it, `status --json --active` counts it in `settled.missing`, and `sweep`
+removes it once older than the retention. The reason records what the owner decided; it
+does not say that the delivery was handled. Delivery state, owner, pause and runner state
+otherwise stay as they were.
 
 ## Crash and shutdown observations
 
@@ -691,6 +714,8 @@ enrollment reconciliation; matching them alone grants no authority. Runner
 states: `stopped`, `running`, `stopping`, `unknown`, `failed`. Liveness evidence may
 include a diagnostic PID/start ID/heartbeat, but grants no control. Delivery
 states: `pending`, `in_flight`, `accepted`, `failed`, `uncertain`, `missing`.
+A `missing` delivery carries reason `path_missing` (its `out/` entry vanished) or
+`discarded` (the owner removed it with `discard`).
 Each attempt has `id`, `started_at`, nullable `finished_at`, `outcome` (in_flight,
 accepted, failed, unknown), nullable `exit_code`, `signal` and structured `error`.
 An attempt admitted from 2026-11-17 on also has `owner_label`, the label of the owner
@@ -783,6 +808,7 @@ GH=/example/project/.groundhog/groundhog.sh
 | Authorized service explicitly enrolls an unowned instance and invokes run | Same authorization checks as any caller; no foreground human session required; run does not clear pause. |
 | Owner stops, reconciles unresolved attempts, explicitly releases | No owner, runner stopped, pause retained; old token invalidated. |
 | Owner stops, `sweep --token-file TOKEN 14` | Accepted and `missing` records older than 14 days leave with their `out/` entries; pending, failed, in-flight and uncertain ones, `pending/no_consumer` included, stay, listed as skipped; owner, pause and revision unchanged. |
+| Owner stops, `discard --token-file TOKEN --delivery d-demo-1` on pending/no_consumer | `out/` entry removed; d-demo-1 becomes `missing` with reason `discarded`; fired marker, other deliveries, owner, pause kept; a later sweep removes the record. |
 | Example client: clean quit completes stop/release, then reopen | No owner, runner stopped, pause retained; quit deleted the token, so there is nothing to adopt, and this client's policy requires an explicit start. |
 
 Enrollment failure examples (no new command is needed):
@@ -823,5 +849,6 @@ release with an unresolved attempt, the handoff barrier staying until `recover`,
 that an attempt records the admitting owner's label. It was accepted on 2026-11-17 that
 `status --json --active` leaves settled deliveries out and counts them, and that a later
 sweep removes old settled records; that sweep is `sweep --token-file` (accepted on
-2026-11-18), which keeps pending deliveries, those without a consumer included. No dependent runtime
+2026-11-18), which keeps pending deliveries, those without a consumer included. It was accepted on 2026-11-18 that `discard --token-file` disposes of a
+`pending/no_consumer` delivery as `missing` with reason `discarded`. No dependent runtime
 implementation is authorized by this document.

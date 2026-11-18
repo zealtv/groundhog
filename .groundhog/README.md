@@ -239,6 +239,7 @@ needs; `README.md` and `docs/` are documentation. Neither a copy nor
 ./groundhog.sh out                      # ls out/
 ./groundhog.sh sweep [days]             # remove out/ entries older than N days (default 14)
 ./groundhog.sh sweep --token-file PATH [days]  # the owner's sweep of an owned instance with a stopped runner
+./groundhog.sh discard --token-file PATH --delivery ID  # the owner discards a pending/no_consumer delivery (stopped runner)
 ./groundhog.sh capabilities --json      # which runtime capabilities this script implements (read-only)
 ./groundhog.sh status --json [--active] # one JSON snapshot of schedule, state and deliveries (read-only); --active counts settled deliveries instead of listing them
 ./groundhog.sh enroll --owner-label LABEL --token-file ABSENT_ABSOLUTE_PATH
@@ -689,6 +690,17 @@ makes them exit 4), and both write the record durably before they return.
   outcome stays `unknown`. Recovery invokes nothing. Another unresolved attempt
   keeps the barrier up.
 
+**`discard --delivery ID`** (capability `discard-v1`, accepted on 2026-11-18) lets the token holder dispose of a
+delivery no consumer took: the runner must be stopped (exit 4 while one is alive) and the
+token must match (exit 3; exit 2 for a missing token file or a missing or malformed id; 5 for
+a missing or unreadable record or any state but `pending` with reason `no_consumer`; 6 for an
+I/O failure). It removes the delivery's `out/` entry and records it as `missing` with reason
+`discarded`; nothing is invoked, the fired marker stays (the occurrence does not fire again),
+and the barrier is as it was. Run it again after an interruption and it finishes; on a delivery
+already discarded it changes nothing. Such a record is terminal: `status --json --active`
+counts it in `settled.missing` and `sweep` removes it once old enough. `failed` and
+`uncertain` deliveries are not discarded: retry them, or `recover --decision accept`.
+
 `release` exits 5 while any attempt is unresolved or any record unreadable, unless it
 is given `--leave-unresolved`; that releases and leaves the records and the barrier
 as they are. Each attempt records `owner_label`, the label of the owner that admitted
@@ -738,8 +750,7 @@ things as the sweep above, so pending, failed, in-flight and uncertain deliverie
 stay, and are reported as `skipped`, whatever their age. That includes `pending`
 deliveries with reason `no_consumer`: no consumer has seen them, and removing
 one would erase the only trace of a delivery nobody took. They stay until a
-consumer is configured and takes them, or until the operator removes the entry
-and its record by hand. The sweep writes no state, so ownership, pause and the
+consumer is configured and takes them, or until the owner discards them with `discard`. The sweep writes no state, so ownership, pause and the
 revision stay as they were.
 
 ## Deployment and migration
@@ -781,7 +792,8 @@ you.
    capabilities (`status-json-v1`, `ownership-v1`, `runner-v1`, `pause-v1`,
    `consumer-v1`, `delivery-v1`), plus `release-unresolved-v1` (the flag for
    `release`), `status-active-v1` and `next-due-v1` (flags for `status`), `add-while-owned-v1` (`add` on an
-   owned instance, and its `--from` flag) and `sweep-owner-v1` (the flag for `sweep`). Without `consumer-v1` and `delivery-v1` the instance can still be
+   owned instance, and its `--from` flag), `sweep-owner-v1` (the flag for `sweep`) and `discard-v1`
+   (the `discard` command). Without `consumer-v1` and `delivery-v1` the instance can still be
    owned, paused and run delivery-only.
 2. **Stop whatever else writes to the instance.** Other `tick` loops, cron lines,
    and any process that moves entries out of `out/` (see the next section). An
@@ -903,20 +915,20 @@ their behavior, including creating the trays.
 
 ```
 $ ./groundhog.sh capabilities --json
-{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","status-active-v1","next-due-v1","add-while-owned-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","consumer-v1","delivery-v1","release-unresolved-v1"]}
+{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","status-active-v1","next-due-v1","add-while-owned-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","discard-v1","consumer-v1","delivery-v1","release-unresolved-v1"]}
 ```
 
 `capabilities` lists only what this script implements on this host: `status-json-v1`,
 `status-active-v1`, `next-due-v1` and `add-while-owned-v1` always, `ownership-v1`, `runner-v1` and `pause-v1` where the locking tools
 exist (see [Runner, ownership and pause](#runner-ownership-and-pause)), and
-`sweep-owner-v1` with them, and
+`sweep-owner-v1` and `discard-v1` with them, and
 `consumer-v1`, `delivery-v1` and `release-unresolved-v1` where a consumer can also be
 started in a session of its own. A client needs the six capabilities the contract
 names (`status-json-v1`, `ownership-v1` through `delivery-v1`) before it may offer
 supervised control, `release-unresolved-v1` before it passes `--leave-unresolved` to
 `release`, `status-active-v1` before it passes `--active` to `status`, `next-due-v1` before it
-passes `--next-due`, `add-while-owned-v1` before it passes `--from` to `add` or relies on `add` while owned, and
-`sweep-owner-v1` before it passes `--token-file` to `sweep`. An older
+passes `--next-due`, `add-while-owned-v1` before it passes `--from` to `add` or relies on `add` while owned,
+`sweep-owner-v1` before it passes `--token-file` to `sweep`, and `discard-v1` before it runs `discard`. An older
 script answers `capabilities` with its ordinary `unknown command` error (exit 1).
 
 `status --json` follows the projection in the
@@ -972,8 +984,8 @@ script answers `capabilities` with its ordinary `unknown command` error (exit 1)
 * `deliveries` lists the records under `runtime/deliveries/` plus, read-only,
   every other directory in `out/` as `origin: "legacy_out"`, state `pending`,
   reason `unregistered`, `id: null`. Status registers nothing. Reasons the
-  runtime writes: `no_consumer` (pending, no config), `path_missing` (missing),
-  `result_not_recorded` and `consumer_detached` (uncertain).
+  runtime writes: `no_consumer` (pending, no config), `path_missing` and `discarded` (missing: its entry vanished, or the owner
+  removed it with `discard`), `result_not_recorded` and `consumer_detached` (uncertain).
 * `status --json --active` (capability `status-active-v1`, accepted on
   2026-11-17) is the same document with the settled deliveries left out of
   `deliveries`: only `pending`, `in_flight`, `failed` and `uncertain` ones (and the
