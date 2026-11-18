@@ -22,13 +22,14 @@ assert_eq "implementation_version is a string" 'str' \
 # add-while-owned-v1 (add on an owned instance, and add --from). sweep-owner-v1 (sweep --token-file)
 # needs the same tools as the owner commands and comes with them. With ownership-v1
 # through delivery-v1 present a client may supervise the instance; release-unresolved-v1
-# and sweep-owner-v1 are for their flags alone.
+# and sweep-owner-v1 are for their flags alone; discard-v1 (discard --token-file) comes
+# with sweep-owner-v1 and needs neither consumer-v1 nor delivery-v1.
 if have_runtime_support && have_isolation; then
   assert_eq "capabilities on a host with locking and process isolation" \
-    '["status-json-v1","status-active-v1","next-due-v1","add-while-owned-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","consumer-v1","delivery-v1","release-unresolved-v1"]' "$(jget "$out" capabilities)"
+    '["status-json-v1","status-active-v1","next-due-v1","add-while-owned-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","discard-v1","consumer-v1","delivery-v1","release-unresolved-v1"]' "$(jget "$out" capabilities)"
 elif have_runtime_support; then
   assert_eq "capabilities on a host with locking but no process isolation" \
-    '["status-json-v1","status-active-v1","next-due-v1","add-while-owned-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1"]' "$(jget "$out" capabilities)"
+    '["status-json-v1","status-active-v1","next-due-v1","add-while-owned-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","discard-v1"]' "$(jget "$out" capabilities)"
 else
   assert_eq "capabilities on a host without locking" '["status-json-v1","status-active-v1","next-due-v1","add-while-owned-v1"]' "$(jget "$out" capabilities)"
 fi

@@ -27,7 +27,8 @@ assert_eq "no lock helper: only the capabilities that need nothing of the host a
 
 new_token_path
 for c in "enroll --owner-label x --token-file $TOK" "run --token-file $TOK" "pause --token-file $TOK" \
-         "resume --token-file $TOK" "stop --token-file $TOK" "release --token-file $TOK"; do
+         "resume --token-file $TOK" "stop --token-file $TOK" "release --token-file $TOK" \
+         "discard --token-file $TOK --delivery d-x"; do
   rc=0; bare_gh $c >/dev/null 2>"$out.e" || rc=$?
   assert_eq "'${c%% *}' without a lock helper exits 5" 5 "$rc"
   assert_contains "'${c%% *}' explains what is missing" "$(cat "$out.e")" "flock"

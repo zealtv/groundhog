@@ -24,6 +24,7 @@ usage:
   groundhog.sh release --token-file PATH [--leave-unresolved]
   groundhog.sh retry --token-file PATH --delivery ID
   groundhog.sh recover --token-file PATH --delivery ID --decision retry|accept
+  groundhog.sh discard --token-file PATH --delivery ID
 
 notes:
   - this script operates on the .groundhog/ directory beside it
@@ -42,7 +43,7 @@ notes:
   - item contents are opaque to groundhog
   - capabilities and status are strictly read-only and print one JSON object;
     see README.md and docs/runtime-contract.md
-  - enroll, run, pause, resume, stop, release, retry and recover are the
+  - enroll, run, pause, resume, stop, release, retry, recover and discard are the
     optional runner commands; they need the OS-released locking described in
     README.md, and an owned instance refuses tick, init, drop and sweep
     (sweep --token-file is the owner's own sweep: a stopped runner and a valid token)
@@ -51,7 +52,8 @@ notes:
     no tick sees the item half-made, while plain add leaves an empty directory to fill
   - run hands pending deliveries to the consumer in runtime/config.json, if
     there is one; retry and recover are the operator's decisions about a
-    failed or uncertain handoff (see README.md)
+    failed or uncertain handoff, and discard is the owner's way to dispose of a
+    pending delivery that no consumer took (capability discard-v1; see README.md)
 USAGE
 }
 
@@ -1036,7 +1038,8 @@ GH_PROTOCOL_VERSION=1
 GH_IMPLEMENTATION_VERSION="dev"
 # Advertise only what this script implements here (add-while-owned-v1 needs
 # nothing from the host). cmd_capabilities adds
-# ownership-v1, runner-v1, pause-v1 and sweep-owner-v1 (sweep --token-file) on
+# ownership-v1, runner-v1, pause-v1, sweep-owner-v1 (sweep --token-file) and
+# discard-v1 (discard --token-file) on
 # hosts where rt_detect finds the locking
 # and durability tools, and consumer-v1, delivery-v1 and release-unresolved-v1
 # (release --leave-unresolved) where it also finds a way to start a consumer in
@@ -2344,7 +2347,7 @@ cmd_capabilities() {
   local caps="" c
   rt_detect
   if [[ -z "$GH_RT_MISSING" ]]; then
-    GH_CAPABILITIES+=("ownership-v1" "runner-v1" "pause-v1" "sweep-owner-v1")
+    GH_CAPABILITIES+=("ownership-v1" "runner-v1" "pause-v1" "sweep-owner-v1" "discard-v1")
     if [[ -n "$GH_ISOLATE" ]]; then
       GH_CAPABILITIES+=("consumer-v1" "delivery-v1" "release-unresolved-v1")
     fi
@@ -4490,6 +4493,44 @@ cmd_recover() {
   fi
 }
 
+# cmd_discard — `discard --token-file PATH --delivery ID` (capability discard-v1):
+# dispose of a pending delivery that no consumer took. Same rules as retry and
+# recover (stopped runner, token under the mutation lock). Only `pending` with
+# reason no_consumer is discarded: the out/ entry goes first, then the record is
+# written durably as missing/discarded, so a crash between the two leaves a
+# pending record whose path is gone, which the next run records as path_missing
+# and a repeated discard records as discarded. The fired marker, the attempts and
+# the handoff barrier are not touched, and nothing is invoked.
+cmd_discard() {
+  parse_opts discard token-file delivery -- "$@"
+  delivery_control discard
+  case "$D_STATE" in
+    missing)
+      if [[ "$D_REASON" == discarded ]]; then
+        unlock_mutation
+        echo "delivery $D_ID is already discarded"
+        return 0
+      fi
+      rt_die 5 "discard: delivery $D_ID is missing ($D_REASON); only a pending delivery with reason no_consumer can be discarded"
+      ;;
+    pending)
+      [[ "$D_REASON" == no_consumer ]] || rt_die 5 "discard: delivery $D_ID is pending with reason '${D_REASON:-none}'; only a pending delivery with reason no_consumer can be discarded"
+      ;;
+    *)
+      rt_die 5 "discard: delivery $D_ID is $D_STATE; only a pending delivery with reason no_consumer can be discarded"
+      ;;
+  esac
+  # D_PATH is out/<name> (drec_load checks the shape). rm removes a symlink, never follows it.
+  rm -rf -- "${GH_DIR:?}/$D_PATH" 2>/dev/null || true
+  if [[ -e "$GH_DIR/$D_PATH" || -L "$GH_DIR/$D_PATH" ]]; then
+    rt_die 6 "discard: could not remove $D_PATH; the record of delivery $D_ID was not changed"
+  fi
+  D_STATE=missing; D_REASON=discarded
+  delivery_save_or_die discard
+  unlock_mutation
+  echo "discarded: $D_PATH is removed and delivery $D_ID is recorded as missing (discarded); no consumer was invoked"
+}
+
 # --- the runner --------------------------------------------------------------
 RUNNER_ID=""
 RUNNER_RECORDED=0
@@ -4769,6 +4810,7 @@ main() {
     release) shift; cmd_release "$@" ;;
     retry)   shift; cmd_retry   "$@" ;;
     recover) shift; cmd_recover "$@" ;;
+    discard) shift; cmd_discard "$@" ;;
     -h|--help|help|"") usage ;;
     *) die "unknown command '$cmd'" ;;
   esac
