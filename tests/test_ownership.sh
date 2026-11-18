@@ -22,7 +22,8 @@ tok1="$TOK"
 rc=0; gh enroll --owner-label "demo session" --token-file "$tok1" >"$out.o" 2>"$out.e" || rc=$?
 assert_eq "enroll exits 0" 0 "$rc"
 assert_true "the token file exists" test -f "$tok1"
-mode="$(stat -f %Lp "$tok1" 2>/dev/null || stat -c %a "$tok1")"
+# GNU stat first: on GNU, `stat -f` reads the file system and prints a block of text, then fails on the format word.
+mode="$(stat -c %a "$tok1" 2>/dev/null || stat -f %Lp "$tok1")"
 assert_eq "the token file is mode 0600" 600 "$mode"
 assert_json_valid_loose() { if python3 -I -c 'import json,sys;d=json.load(open(sys.argv[1]));assert isinstance(d,dict)' "$1"; then t_ok; else t_fail "valid JSON object: $1"; fi; }
 assert_json_valid_loose "$tok1"
@@ -293,10 +294,12 @@ fi
 new_instance
 gh init >/dev/null
 enroll_ok
-hold_lock "$GHD/runtime/locks/mutation.lock" 6
+# The script waits 30 attempts (0.1 s apart, plus the time each lock helper takes: about 3 s on a quick host, far longer on a slow one),
+# so the lock is held until this test kills the holder, not for a fixed few seconds that a slow host could outlast.
+hold_lock "$GHD/runtime/locks/mutation.lock" 120
 ( rc=0; gh pause --token-file "$TOK" >/dev/null 2>"$out.e1" || rc=$?; echo "$rc" > "$out.r1" ) &
 ( rc=0; gh tick >/dev/null 2>"$out.e2" || rc=$?; echo "$rc" > "$out.r2" ) &
-wait_for "both blocked commands gave up" 80 test -s "$out.r1" -a -s "$out.r2"
+wait_for "both blocked commands gave up" 900 test -s "$out.r1" -a -s "$out.r2"
 assert_eq "pause against a held mutation lock fails 4" 4 "$(cat "$out.r1")"
 assert_eq "tick against a held mutation lock fails 4" 4 "$(cat "$out.r2")"
 kill "$HOLD_PID" 2>/dev/null || true

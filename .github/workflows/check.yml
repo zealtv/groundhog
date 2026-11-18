@@ -1,0 +1,57 @@
+name: Check
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  harness:
+    name: harness (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu ships bash 5.x only. Bash 3.2 is not built here: the macOS
+          # job runs the stock 3.2, and what 3.2 changes is the shell's
+          # behavior, not the kernel's, so a source build would test the same
+          # thing twice.
+          - name: ubuntu bash 5
+            os: ubuntu-latest
+            bash: /bin/bash
+          - name: macos bash 3.2
+            os: macos-latest
+            bash: /bin/bash
+          - name: macos bash (brew)
+            os: macos-latest
+            bash: brew
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # test_e2e.sh runs the pre-runtime script (252b705) from history; a
+          # shallow clone lacks it and the case skips.
+          fetch-depth: 0
+      - name: Newer bash on macOS
+        if: matrix.bash == 'brew'
+        run: brew list bash >/dev/null 2>&1 || brew install bash
+      - name: Tools the harness uses
+        run: |
+          # The harness needs python3 and, for the runner, a lock helper (util-linux
+          # flock or perl) and a session helper (perl or setsid); jq is optional.
+          # All of these come with the runner images. Print what is there, and
+          # fail early on python3 and perl, the two the harness cannot do without.
+          for t in python3 perl jq flock setsid sha256sum shasum od ps; do
+            if command -v "$t" >/dev/null 2>&1; then echo "$t: $(command -v "$t")"; else echo "$t: absent"; fi
+          done
+          command -v python3 >/dev/null && command -v perl >/dev/null
+      - name: Harness
+        run: |
+          if [ "${{ matrix.bash }}" = brew ]; then
+            export TEST_BASHES="$(brew --prefix)/bin/bash"
+          else
+            export TEST_BASHES="${{ matrix.bash }}"
+          fi
+          "${TEST_BASHES}" --version | head -1
+          tests/run.sh
