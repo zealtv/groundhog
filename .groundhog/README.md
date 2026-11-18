@@ -925,6 +925,26 @@ script answers `capabilities` with its ordinary `unknown command` error (exit 1)
   `"01-01"`, and once with `date: null` meaning the next tick. The whole object
   is `null` for an item that `tick` would fire but the grammar does not
   recognize. Paused items keep their cadence.
+* `next_due` is an additive field on each schedule record: the UTC time
+  (`"2026-11-19T07:45:00Z"`) at which the item's next occurrence that has not
+  fired begins, or `null`. It is computed by asking the same `walk_due` that
+  `tick`, `due` and `eligible_now` use about later local moments, so it
+  cannot disagree with `tick`. An item that a tick now would fire reads
+  `observed_at`, whether or not pause or an owner holds it (`firing_allowed`
+  and `blocked_by` say whether it will fire); an unfired past `once` item is
+  such an item. Otherwise it reads when the item's next occurrence begins:
+  its explicit time in local time (a skipped wall-clock time on a
+  spring-forward day reads the moment the clock jumps, a repeated one its
+  first pass), local 00:00 for an item with no time, the start of the next
+  slot for `every/` (00:00 the next day after the last, shorter slot), always
+  with seconds `00`. It is `null` for an item paused by its own or an
+  ancestor's `.paused`, a `once` item that has fired, an item the grammar does
+  not recognize that is not due now, and an item with no occurrence in the
+  next nine years (`yearly/02-30`). The item fires on the first tick at or
+  after `next_due`, not at it: a tick that comes later fires it, and an
+  occurrence that no tick reaches is missed, as under "Missed days", after
+  which `next_due` names the following one. Older scripts omit the field;
+  clients treat absent and `null` alike.
 * `deliveries` lists the records under `runtime/deliveries/` plus, read-only,
   every other directory in `out/` as `origin: "legacy_out"`, state `pending`,
   reason `unregistered`, `id: null`. Status registers nothing. Reasons the

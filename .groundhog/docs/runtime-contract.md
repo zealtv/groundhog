@@ -17,7 +17,8 @@ the six required ones, this script satisfies "all six capabilities" for supervis
 points where the implementation chose a reading of this document (the extra
 `runtime/prepared/` journal, the exit-status record for signals, the legacy
 one-shot rule). Each schedule record of `status --json` also carries an
-additive `cadence` object (see [README.md](../README.md#inspection)); clients
+additive `cadence` object and an additive `next_due` (see
+[README.md](../README.md#inspection)); clients
 ignore unknown fields, so the contract's required fields are unchanged. This
 document records the accepted interface. The existing commands in
 [README.md](../README.md) remain the passive interface. Basis: the source `groundhog.sh`.
@@ -618,7 +619,8 @@ instance's local scheduling time. IDs and ordering carry no time semantics.
       "fired_marker": "fired/2026-11-15/daily/nudge",
       "fired": true,
       "firing_allowed": false,
-      "blocked_by": ["already_fired", "instance_paused", "owned"]
+      "blocked_by": ["already_fired", "instance_paused", "owned"],
+      "next_due": "2026-11-16T00:00:00Z"
     }
   ],
   "deliveries": [
@@ -695,6 +697,15 @@ invalid state or lock conflict; the enrolled runner instead uses its token.
 `instance_paused`, `owned`, `invalid_state` and `busy` as applicable.
 `paused_by` lists schedule components ending in `.paused`. `fired_marker` is
 the current candidate marker, or null if no applicable occurrence exists.
+`next_due` (additive; proposed on 2026-11-18) is the UTC RFC 3339 time at which the
+item's next unfired occurrence begins, or `null`. It is derived from the same due
+calculation as `eligible_now`, probed at later local moments, so it agrees with when
+`tick` fires. It reads `observed_at` when `eligible_now` is true, held or not. It is
+`null` for an item paused by its own or an ancestor's `.paused`, a fired `once` item,
+an item that is not due and not recognized by the schedule grammar, and an item with
+no occurrence in the next nine years. An item fires on the first tick at or after
+`next_due`, not at it. A script that omits the field is read as `null`.
+
 Schedule records include recognized items even when not due; unrecognized
 paths appear in diagnostics, with no payload execution or recursive payload
 interpretation. Empty optional directories yield empty arrays and defaults.
