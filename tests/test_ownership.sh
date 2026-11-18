@@ -22,7 +22,8 @@ tok1="$TOK"
 rc=0; gh enroll --owner-label "demo session" --token-file "$tok1" >"$out.o" 2>"$out.e" || rc=$?
 assert_eq "enroll exits 0" 0 "$rc"
 assert_true "the token file exists" test -f "$tok1"
-mode="$(stat -f %Lp "$tok1" 2>/dev/null || stat -c %a "$tok1")"
+# GNU stat first: on GNU, `stat -f` reads the file system and prints a block of text, then fails on the format word.
+mode="$(stat -c %a "$tok1" 2>/dev/null || stat -f %Lp "$tok1")"
 assert_eq "the token file is mode 0600" 600 "$mode"
 assert_json_valid_loose() { if python3 -I -c 'import json,sys;d=json.load(open(sys.argv[1]));assert isinstance(d,dict)' "$1"; then t_ok; else t_fail "valid JSON object: $1"; fi; }
 assert_json_valid_loose "$tok1"
