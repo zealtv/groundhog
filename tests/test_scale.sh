@@ -422,7 +422,9 @@ assert_eq "utf8_valid: past U+10FFFF" invalid "$(utf8_probe 'x\364\220\200\200y'
 assert_eq "utf8_valid leaves the lossy flag alone" "0" "$("$TEST_BASH" -c '. "$1"; JSON_LOSSY=0; JSTR=keep; utf8_valid "$(printf "a\377b")" || true; echo "$JSON_LOSSY"' _ "$T_TMP/utf8fn.sh")"
 
 # The real thing, where the file system allows such names (Linux; APFS refuses them).
-fresh_consumer "$FAST"
+# The consumer logs the delivery it was given: the sound item is handed off too, so the number of calls alone cannot say
+# whether the bad entry was.
+fresh_consumer 'echo "$1" >> "$PWD/calls.txt"'
 badout="$GHD/out/$(printf 'bad\377name')"
 if mkdir "$badout" 2>/dev/null && [ -d "$badout" ]; then
   echo x > "$badout/f"
@@ -434,7 +436,7 @@ if mkdir "$badout" 2>/dev/null && [ -d "$badout" ]; then
   assert_contains "status reports the schedule item" "$(jget "$out" diagnostics)" schedule_name_not_utf8
   run_once 3.5
   assert_eq "the runner created no record for the out/ entry, cycle after cycle" 0 "$(live_count)"
-  assert_eq "...and the consumer was not called for it" 0 "$(lines "$INST/calls.txt")"
+  assert_eq "...and the consumer was called once, for the sound item and not for it" "1 $NAME" "$(lines "$INST/calls.txt") $(basename "$(head -n 1 "$INST/calls.txt")")"
   assert_true "...the entry is left in place" test -d "$badout"
   assert_contains "...and the runner says why" "$(cat "$RUN_ERR")" "not valid UTF-8"
   assert_false "the bad schedule item was not fired" test -e "$GHD/out/$(printf 'bad\377item')-$(today)"
