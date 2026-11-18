@@ -5,14 +5,15 @@
 exist, the upgraded `tick`, `init`, `add`, `drop` and `sweep` follow the lock,
 ownership and pause rules here, and `run` reconciles the delivery journal and
 hands pending deliveries to the consumer in `runtime/config.json`.
-`capabilities` advertises `status-json-v1` and `status-active-v1` everywhere, `ownership-v1`, `runner-v1`
+`capabilities` advertises `status-json-v1`, `status-active-v1` and `add-while-owned-v1` everywhere, `ownership-v1`, `runner-v1`
 and `pause-v1` on hosts with the locking and durability tools described in
 [README.md](../README.md#runner-ownership-and-pause), and `consumer-v1`,
 `delivery-v1` and `release-unresolved-v1` where the host can also start a consumer
 in a session of its own ([README.md](../README.md#consumers-and-deliveries)); with
 the six required ones, this script satisfies "all six capabilities" for supervised control,
 `release-unresolved-v1` adds `release --leave-unresolved`, `status-active-v1` adds
-`status --json --active`, and `sweep-owner-v1` (offered with `ownership-v1`) adds
+`status --json --active`, `add-while-owned-v1` lets `add` work on an owned instance and adds
+`add --from DIR`, and `sweep-owner-v1` (offered with `ownership-v1`) adds
 `sweep --token-file`. The README records the
 points where the implementation chose a reading of this document (the extra
 `runtime/prepared/` journal, the exit-status record for signals, the legacy
@@ -91,7 +92,7 @@ Synthetic capability response (not output from today's script):
   "protocol": "groundhog-runtime",
   "protocol_version": 1,
   "implementation_version": "example-build",
-  "capabilities": ["status-json-v1", "status-active-v1", "ownership-v1", "runner-v1", "pause-v1", "sweep-owner-v1", "consumer-v1", "delivery-v1", "release-unresolved-v1"]
+  "capabilities": ["status-json-v1", "status-active-v1", "add-while-owned-v1", "ownership-v1", "runner-v1", "pause-v1", "sweep-owner-v1", "consumer-v1", "delivery-v1", "release-unresolved-v1"]
 }
 ```
 
@@ -106,7 +107,11 @@ it exits 2 on the flag). `status-active-v1` is another: a client finds it in the
 before it passes `--active` to `status`, and otherwise reads the full `status --json` (a
 script without it exits 2 on the flag). `sweep-owner-v1` is a third: a client finds it in
 the list before it passes `--token-file` to `sweep`, and otherwise treats an owned instance
-as one it cannot sweep (a script without it refuses the option and sweeps nothing). An old script
+as one it cannot sweep (a script without it refuses the option and sweeps nothing).
+`add-while-owned-v1` is a fourth: a client finds it before it passes `--from` to `add`, and before it
+relies on `add` succeeding on an owned instance, and otherwise treats an owned instance as one it cannot add to
+(a script without it exits 3 on an owned instance, and on an unowned one ignores `--from` and creates an
+empty item). An old script
 returns its existing unknown-command error: inspect its files as legacy, mark control unsupported,
 and do not probe by running `run`, `tick` or `init`. Capability discovery invokes
 only the deliberately selected instance's script; it is not a payload sandbox.
@@ -320,14 +325,24 @@ tick succeeds without firing and prints a human diagnostic to stderr. With an
 owner present it fails ownership conflict: the runner calls the tick operation
 internally under its token. If both paused and owned, ownership conflict takes
 precedence for standalone tick. Upgraded `init`, `add`, `drop` and `sweep` also
-serialize mutations and refuse while owned; v1 provides no supervised schedule-edit command,
-and the owner's own `sweep --token-file` (see "Delivery journal, acknowledgement and retry") is
-the one exception. They do not clear pause or runtime state. No-owner, unpaused tick continues to materialize
+serialize mutations. `init`, `drop` and plain `sweep` refuse while owned; `add` does not
+(capability `add-while-owned-v1`, below), and the owner's own `sweep --token-file` (see "Delivery journal,
+acknowledgement and retry") is another exception. They do not clear pause or runtime state. No-owner, unpaused tick continues to materialize
 only, without enrollment or consumer invocation. No runtime directory is
 required for ordinary legacy-style use; lock coordination may create optional
 lock state, but never ownership or configuration. `due` continues to describe
 schedule eligibility irrespective of global pause; status reports eligibility
 and firing permission separately. `.paused` subtrees remain ineligible.
+
+`add <when> <item-id>` (capability `add-while-owned-v1`; proposed on 2026-11-18, text accepted by Bob on
+2026-11-18) works whether or not the instance is owned, for any caller, without a token. It takes the
+mutation lock, so it waits for a tick in progress (exit 4 if the lock stays busy), and it writes no runtime
+state. `add <when> <item-id> --from DIR` copies the prepared directory `DIR` into place with a single rename
+under that lock, so no tick sees the item incomplete; plain `add` makes an empty directory that the caller
+fills afterwards, which a tick can catch half-made. Exit codes: 1 for an invalid `<when>` or `<item-id>` or an
+existing item, 2 for a malformed `--from`, 4 busy, 5 unusable state, 6 I/O failure. A client finds
+`add-while-owned-v1` in `capabilities` before it passes `--from` or relies on `add` while owned; an older
+script ignores `--from` and creates an empty item. `drop` still refuses while owned.
 
 Older deployed scripts know nothing about the bit or locks and can bypass
 both. Never claim global pause across mixed versions or an independent legacy

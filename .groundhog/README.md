@@ -230,7 +230,7 @@ needs; `README.md` and `docs/` are documentation. Neither a copy nor
 
 ```
 ./groundhog.sh init
-./groundhog.sh add <when> <item-id>     # mkdir under schedule/<when>/<item-id>/; you fill the contents
+./groundhog.sh add <when> <item-id> [--from DIR]  # mkdir under schedule/<when>/<item-id>/ (you fill it), or with --from copy a prepared DIR in with one rename
 ./groundhog.sh tick                     # fire any due items into out/
 ./groundhog.sh due                      # what would fire now (read-only)
 ./groundhog.sh list                     # tree-like view of schedule/
@@ -303,9 +303,26 @@ $ ./groundhog.sh release --token-file /private/dir/token    # then delete the to
   consumer admission under any later owner until `recover`.
 * **Standalone `tick`** fails 3 while the instance is owned (ownership wins over
   pause), succeeds without firing while paused, and otherwise ticks as always.
-  `init`, `add`, `drop` and `sweep` also fail 3 while owned (`sweep --token-file`, below,
-  is the owner's own way in). All of them take the mutation lock and fail 4 if it stays
+  `init`, `drop` and `sweep` also fail 3 while owned (`add` does not, below; `sweep --token-file`,
+  below, is the owner's own way in). All of them take the mutation lock and fail 4 if it stays
   busy for about three seconds.
+* **`add` works while owned** (capability `add-while-owned-v1`, accepted on 2026-11-18),
+  for anyone and with no token: adding a schedule item is authoring, not runtime control, and
+  ownership keeps what it guards (the runner, the pause, the deliveries). It takes the mutation
+  lock, so it waits behind a tick in progress (exit 4 if the lock stays busy), and it writes no
+  runtime state: owner, pause and `revision` stay as they were. Plain `add` still makes an empty
+  item directory that you fill afterwards, and a tick between the two steps can fire the item
+  half-made, owned or not. **`add <when> <item-id> --from DIR`** closes that race: it copies the
+  prepared directory `DIR` (which must exist; it is copied, never moved, so it stays) into
+  `runtime/staging/add-<random>` and renames it to `schedule/<when>/<item-id>` under the lock, so
+  a tick sees the item whole or not at all. Prepare the payload, `prompt.md` included, before the
+  call. It runs the checks plain `add` runs (exit 1 for a bad `<when>` or `<item-id>` or an
+  existing item, with nothing staged), prints the new path, and exits 2 for a malformed `--from`
+  (no such directory, given twice, no argument, or extra arguments). Contents are copied as
+  `cp -R` copies them. A staging directory left by a crash is inert; a later `add` picks a new
+  name. `drop` still fails 3 while owned. An older script reads only the first two arguments of
+  `add` and ignores `--from`, creating an **empty** item and printing its path, so a client finds
+  `add-while-owned-v1` in `capabilities` before it passes `--from` or relies on `add` while owned.
 * Exit codes of the new commands: 0 success, 2 invalid arguments or
   configuration, 3 ownership conflict or stale token, 4 busy, 5 unsupported or
   unusable state, 6 I/O failure, 7 enrollment outcome uncertain.
@@ -366,7 +383,7 @@ between cycles, and every consumer) with `8>&- 9>&-`. Short-lived tools such as
 `ownership-v1`, `runner-v1` and `pause-v1` appear only when the host has: a lock
 helper (util-linux `flock` or perl with `Fcntl`); a SHA-256 tool (`sha256sum`,
 `shasum` or `openssl`); `perl` with `IO::Handle` or `sync(1)` for durable writes;
-`od` and `/dev/urandom`. Without them `capabilities` lists `status-json-v1` and `status-active-v1` only,
+`od` and `/dev/urandom`. Without them `capabilities` lists `status-json-v1`, `status-active-v1` and `add-while-owned-v1` only,
 `enroll`, `run`, `pause`, `resume`, `stop`, `release`, `retry` and `recover` exit
 5 with a message, and every legacy command works as before without taking any
 lock. `consumer-v1`, `delivery-v1` and `release-unresolved-v1` additionally need a way to start a consumer
@@ -761,8 +778,8 @@ you.
 1. **Check the host.** `./groundhog.sh capabilities --json` should list all six
    capabilities (`status-json-v1`, `ownership-v1`, `runner-v1`, `pause-v1`,
    `consumer-v1`, `delivery-v1`), plus `release-unresolved-v1` (the flag for
-   `release`), `status-active-v1` (the flag for `status`) and `sweep-owner-v1`
-   (the flag for `sweep`). Without `consumer-v1` and `delivery-v1` the instance can still be
+   `release`), `status-active-v1` (the flag for `status`), `add-while-owned-v1` (`add` on an
+   owned instance, and its `--from` flag) and `sweep-owner-v1` (the flag for `sweep`). Without `consumer-v1` and `delivery-v1` the instance can still be
    owned, paused and run delivery-only.
 2. **Stop whatever else writes to the instance.** Other `tick` loops, cron lines,
    and any process that moves entries out of `out/` (see the next section). An
@@ -884,18 +901,19 @@ their behavior, including creating the trays.
 
 ```
 $ ./groundhog.sh capabilities --json
-{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","status-active-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","consumer-v1","delivery-v1","release-unresolved-v1"]}
+{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","status-active-v1","add-while-owned-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","consumer-v1","delivery-v1","release-unresolved-v1"]}
 ```
 
-`capabilities` lists only what this script implements on this host: `status-json-v1`
-and `status-active-v1` always, `ownership-v1`, `runner-v1` and `pause-v1` where the locking tools
+`capabilities` lists only what this script implements on this host: `status-json-v1`,
+`status-active-v1` and `add-while-owned-v1` always, `ownership-v1`, `runner-v1` and `pause-v1` where the locking tools
 exist (see [Runner, ownership and pause](#runner-ownership-and-pause)), and
 `sweep-owner-v1` with them, and
 `consumer-v1`, `delivery-v1` and `release-unresolved-v1` where a consumer can also be
 started in a session of its own. A client needs the six capabilities the contract
 names (`status-json-v1`, `ownership-v1` through `delivery-v1`) before it may offer
 supervised control, `release-unresolved-v1` before it passes `--leave-unresolved` to
-`release`, `status-active-v1` before it passes `--active` to `status`, and
+`release`, `status-active-v1` before it passes `--active` to `status`,
+`add-while-owned-v1` before it passes `--from` to `add` or relies on `add` while owned, and
 `sweep-owner-v1` before it passes `--token-file` to `sweep`. An older
 script answers `capabilities` with its ordinary `unknown command` error (exit 1).
 
