@@ -4,7 +4,7 @@ A tiny, file-based protocol for recurring items.
 
 The script remains passive: it materializes deliveries when explicitly ticked.
 The [optional runtime contract](docs/runtime-contract.md) specifies supervision,
-ownership, pause and consumer handoff. Bob accepted the design on 2026-11-15.
+ownership, pause and consumer handoff. The design was accepted on 2026-11-15.
 This version implements all of it on hosts with the lock and process tools it
 needs: the read-only inspection commands (`capabilities --json` and
 `status --json`, see [Inspection](#inspection)); ownership, the runner and the
@@ -937,7 +937,7 @@ script answers `capabilities` with its ordinary `unknown command` error (exit 1)
   reason `unregistered`, `id: null`. Status registers nothing. Reasons the
   runtime writes: `no_consumer` (pending, no config), `path_missing` (missing),
   `result_not_recorded` and `consumer_detached` (uncertain).
-* `status --json --active` (capability `status-active-v1`, accepted by Bob on
+* `status --json --active` (capability `status-active-v1`, accepted on
   2026-11-17) is the same document with the settled deliveries left out of
   `deliveries`: only `pending`, `in_flight`, `failed` and `uncertain` ones (and the
   `legacy_out` entries) are listed, and a new top-level `"settled":
