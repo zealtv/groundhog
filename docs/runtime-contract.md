@@ -1,7 +1,6 @@
 # Optional runtime contract — accepted v1 design
 
-**Design accepted by Bob on 2026-11-15; implemented in this script.** As of the
-`gh-consumer-dispatch` stitch (2026-11-15), `capabilities --json`, `status --json`,
+**Design accepted on 2026-11-15; implemented in this script.** `capabilities --json`, `status --json`,
 `enroll`, `run`, `pause`, `resume`, `stop`, `release`, `retry` and `recover`
 exist, the upgraded `tick`, `init`, `add`, `drop` and `sweep` follow the lock,
 ownership and pause rules here, and `run` reconciles the delivery journal and
@@ -21,8 +20,7 @@ one-shot rule). Each schedule record of `status --json` also carries an
 additive `cadence` object (see [README.md](../README.md#inspection)); clients
 ignore unknown fields, so the contract's required fields are unchanged. This
 document records the accepted interface. The existing commands in
-[README.md](../README.md) remain the passive interface. Basis: the source `groundhog.sh` and Easyhog's
-`docs/design.md` and ownership/ordinary-consumer findings, read on 2026-11-15.
+[README.md](../README.md) remain the passive interface. Basis: the source `groundhog.sh`.
 Design acceptance does not authorize dependent runtime implementation.
 
 ## Boundaries and vocabulary
@@ -182,7 +180,7 @@ stopped runner it succeeds although an attempt is `in_flight` or `uncertain`
 The barrier keys on the delivery records, not on ownership, so it keeps blocking
 every consumer admission after such a release and under any later owner, until
 `recover` settles the attempt; plain `release` keeps its refusal (exit 5, "recover
-it first"). Amended on 2026-11-17, accepted by Bob. Absent a live runner, pause/resume/stop still work with the current token;
+it first"). Amended on 2026-11-17. Absent a live runner, pause/resume/stop still work with the current token;
 stop is idempotent. Repeated pause/resume set the requested value idempotently.
 Retry and recover require a stopped runner, making operator decisions explicit
 before the next run. Retry of another failed delivery does not lift an unresolved
@@ -239,7 +237,7 @@ Enrollment requires an explicit `enroll` request for an unowned, compatible
 instance. The caller may be a previously authorized noninteractive script or
 service; no new foreground human action is required for each session. An owner
 may retain and reuse its valid private token across its own restarts, or (a
-client choice, as Easyhog's policy below shows) adopt one that an ended session of
+client choice, as the example client's policy below shows) adopt one that an ended session of
 the same client left, and invoke `run` under that authorization. Token identity, secret and generation are still
 validated for every control command. `run` never clears pause: resuming requires
 an explicit `resume` command. Discovery alone never enrolls or grants control,
@@ -264,20 +262,20 @@ resolve ambiguous attempts, invalidate the old owner and advance generation.
 There is deliberately no automatic takeover command in v1. Never delete a lock
 file merely because a PID looks absent.
 
-Easyhog is one ordinary client with a session policy: explicit Play enrolls an
+An example client has a session policy: an explicit start action enrolls an
 unowned compatible instance, or resumes/runs one whose token that session holds.
-On reopen, it starts no work: explicit Play is required to enroll an unowned
+On reopen, it starts no work: an explicit start is required to enroll an unowned
 instance, and a retained external owner still prevents enrollment. A client may
 reuse a persisted token across its own sessions; this is a client choice, and
-nothing in the protocol requires or forbids it. Easyhog (as of 2026-11-17) does:
+nothing in the protocol requires or forbids it. This client does:
 a session adopts a token left by a session that has ended, proven by a lock the
 operating system releases, and treats it like its own token, applying the
 ownership rule (the token's `owner_id` and `generation` against `status.owner`;
 it deletes the token on a coherent status that shows another owner or none).
-Easyhog adopts only tokens for instances beneath its own root (as of 2026-11-18);
+This client adopts only tokens for instances beneath its own root;
 a token for any other instance stays where it is, for a session on that
 instance's root. Adoption restarts nothing. On clean
-Quit it stops its owned runners, waits for the stop barrier, then releases and
+quit it stops its owned runners, waits for the stop barrier, then releases and
 deletes tokens only after successful safe cleanup. Failed stop/release or an
 unresolved enrollment retains the token and reports the incomplete cleanup.
 These are client choices implemented entirely through the same generic
@@ -390,7 +388,7 @@ Stdout/stderr go to the runner's output streams, not the JSON protocol; status
 records bounded structured errors, not unredacted consumer output.
 If the runner's own output stream goes away (a supervisor closed the pipe), the
 runner keeps running without logging and records `runner.last_error` with code
-`output_lost` (additive; accepted by Bob on 2026-11-15). Supervisors should give
+`output_lost` (additive; accepted on 2026-11-15). Supervisors should give
 `run` output that outlives them, such as a regular file.
 
 Without configuration, cycles still fire deliveries into `out/`, mark them
@@ -529,9 +527,7 @@ terminal missing records. Sweep never turns an accepted item into pending.
 An old sweep or manual deletion can lose evidence; compatibility cannot prevent
 that. Keep unaccepted payloads until their disposition has been reconciled.
 
-`sweep --token-file PATH [days]` (capability `sweep-owner-v1`; proposed on 2026-11-18
-after Bob's decision of 2026-11-15 that the owner sweep finished records; text accepted
-by Bob on 2026-11-18) is that sweep for an owned instance. Every delivery a supervised
+`sweep --token-file PATH [days]` (capability `sweep-owner-v1`; accepted on 2026-11-18) is that sweep for an owned instance. Every delivery a supervised
 instance accepts leaves a record, so without it the records and their `out/` entries grow
 until the owner releases the instance. It follows the rules of `release`, `retry` and
 `recover`: the token holder only, with a stopped runner (exit 4 while one is alive) and the
@@ -572,7 +568,7 @@ it launched. `stop` closes admission and interrupts sleep too, but does not deta
 the runner keeps waiting for the call it already admitted, records `accepted` or
 `failed` from its result, and only then exits; while `stop` waits it says on
 stderr that it is waiting on a delivery and that SIGTERM on the runner detaches
-now. Amended on 2026-11-17, accepted by Bob; before that, `stop` detached like a
+now. Amended on 2026-11-17; before that, `stop` detached like a
 signal. A consumer call that outlasts a supervisor's wait for `stop` should be
 ended by the supervisor with SIGTERM to the runner; a long job should accept
 quickly and run on its own, or expect a recovery after such a stop timed out
@@ -642,7 +638,7 @@ instance's local scheduling time. IDs and ordering carry no time semantics.
 }
 ```
 
-`last_tick` (additive; accepted by Bob on 2026-11-17) says when the newest
+`last_tick` (additive; accepted on 2026-11-17) says when the newest
 completed `tick` ran, as a UTC RFC 3339 `at`, and whether an owned runner's
 cycle (`runner`) or a standalone `tick` call (`standalone`) ran it. A tick that
 fires nothing counts, and so does a tick that finds the instance paused. A
@@ -652,8 +648,7 @@ no caller, grants no control and changes no ownership rule. Status reads it
 without a lock and without writing. Only the newest tick is kept, so a runner
 tick and a standalone tick overwrite one another.
 
-`status --json --active` (capability `status-active-v1`; accepted by Bob on 2026-11-17,
-tour item 4: "let's go with your recommendation") reads for deliveries that can still
+`status --json --active` (capability `status-active-v1`; accepted on 2026-11-17) reads for deliveries that can still
 change. Every delivery leaves a record, so the full `deliveries` array grows without
 bound; about two weeks of one `every/1m` item pass an 8 MiB client limit. With the flag,
 `deliveries` lists in full only the deliveries whose state is `pending`, `in_flight`,
@@ -758,7 +753,7 @@ GH=/example/project/.groundhog/groundhog.sh
 | Authorized service explicitly enrolls an unowned instance and invokes run | Same authorization checks as any caller; no foreground human session required; run does not clear pause. |
 | Owner stops, reconciles unresolved attempts, explicitly releases | No owner, runner stopped, pause retained; old token invalidated. |
 | Owner stops, `sweep --token-file TOKEN 14` | Accepted and `missing` records older than 14 days leave with their `out/` entries; pending, failed, in-flight and uncertain ones, `pending/no_consumer` included, stay, listed as skipped; owner, pause and revision unchanged. |
-| Easyhog clean Quit completes stop/release, then reopen | No owner, runner stopped, pause retained; Quit deleted the token, so there is nothing to adopt, and this client's policy requires explicit Play. |
+| Example client: clean quit completes stop/release, then reopen | No owner, runner stopped, pause retained; quit deleted the token, so there is nothing to adopt, and this client's policy requires an explicit start. |
 
 Enrollment failure examples (no new command is needed):
 
@@ -787,15 +782,15 @@ a firing without overwrite, and one-shot cleanup still follows. Neither its
 fired marker nor a missing out entry demonstrates execution. Proposed status
 must not reuse those directory-creating code paths for inspection.
 
-Bob accepted these design choices on 2026-11-15: persistent ownership with manual
+These design choices were accepted on 2026-11-15: persistent ownership with manual
 lost-token repair; explicit configured argv rather than an automatic hook;
 exit-zero acceptance (synchronous completion or durable delegation) rather than
 stdout JSON; retained payloads and manual retries/recovery; cooperative local
 locking and no mixed-version pause guarantee; upgraded standalone tick refusal
 while owned; and explicit release only after safe stop and reconciliation of
-unresolved handoffs. Bob accepted on 2026-11-17 that `release --leave-unresolved` may
+unresolved handoffs. It was accepted on 2026-11-17 that `release --leave-unresolved` may
 release with an unresolved attempt, the handoff barrier staying until `recover`, and
-that an attempt records the admitting owner's label. Bob accepted on 2026-11-17 that
+that an attempt records the admitting owner's label. It was accepted on 2026-11-17 that
 `status --json --active` leaves settled deliveries out and counts them, and that a later
 sweep removes old settled records; that sweep is `sweep --token-file` (accepted on
 2026-11-18), which keeps pending deliveries, those without a consumer included. No dependent runtime
