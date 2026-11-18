@@ -981,7 +981,7 @@ GH_IMPLEMENTATION_VERSION="dev"
 # and durability tools, and consumer-v1, delivery-v1 and release-unresolved-v1
 # (release --leave-unresolved) where it also finds a way to start a consumer in
 # its own session.
-GH_CAPABILITIES=("status-json-v1" "status-active-v1")
+GH_CAPABILITIES=("status-json-v1" "status-active-v1" "next-due-v1")
 
 JSON_LOSSY=0        # set when json_str had to replace bytes that are not UTF-8
 JSTR=""
@@ -1719,6 +1719,7 @@ delivery_collision_diags() {
 LIVE_IDS=""      # US-delimited ids listed from deliveries/ (a record the runner files meanwhile is not listed twice)
 LIVE_FILES=""    # status --active: US-delimited file names listed from deliveries/
 STATUS_ACTIVE=0  # status --active: settled deliveries are counted, not listed
+STATUS_NEXT_DUE=0  # status --next-due: each schedule record gains next_due
 SETTLED_ACCEPTED=0; SETTLED_MISSING=0
 
 # status_list_or_count STATE — the record whose JSON is JR joins DELIVERIES, or
@@ -2140,7 +2141,7 @@ inspect_schedule() {
   local now_t due_text name src is_once slot k p rel marker marker_rel due_idx i
   local paused_list part paused_json bb fired eligible allowed marker_json
   local item_paths=() item_pauses=() due_src=() due_slot=() due_once=() found o
-  local parts=() item_cads=() cad_json nd_json nd_pending=()
+  local parts=() item_cads=() cad_json nd_json nd_part nd_pending=()
   ND_UTC=(); PR_ROWS=(); PC_KEY=(); PC_FROM=(); PC_TO=(); OC_KEY=(); OC_VAL=()
   now_t="$(now_today)"
 
@@ -2221,20 +2222,24 @@ inspect_schedule() {
     allowed=false
     [[ -z "$bb" ]] && allowed=true
 
-    # next_due: null for a paused item and for a once item that has fired;
-    # the observed time for an item that would fire on a tick now; the rest
-    # are asked of walk_due below.
-    nd_json=null
-    if [[ -n "${item_pauses[k]}" ]]; then :
-    elif [[ "$eligible" == true ]]; then json_str "$OBSERVED_AT"; nd_json="$JSTR"
-    elif [[ "$fired" == true && "${due_once[due_idx]}" == 1 ]]; then :
-    else nd_pending+=("$k"); nd_json="@$k@"
+    # next_due, only under status --next-due: null for a paused item and for
+    # a once item that has fired; the observed time for an item that would
+    # fire on a tick now; the rest are asked of walk_due below.
+    nd_part=""
+    if (( STATUS_NEXT_DUE )); then
+      nd_json=null
+      if [[ -n "${item_pauses[k]}" ]]; then :
+      elif [[ "$eligible" == true ]]; then json_str "$OBSERVED_AT"; nd_json="$JSTR"
+      elif [[ "$fired" == true && "${due_once[due_idx]}" == 1 ]]; then :
+      else nd_pending+=("$k"); nd_json="@$k@"
+      fi
+      nd_part=",\"next_due\":$nd_json"
     fi
 
     cadence_json "${item_cads[k]}"; cad_json="$JR"
     json_str "$rel"; local path_json="$JSTR"
     json_str "${p##*/}"; local id_json="$JSTR"
-    SCHEDULE+=("{\"path\":$path_json,\"item_id\":$id_json,\"cadence\":$cad_json,\"paused_by\":[$paused_json],\"eligible_now\":$eligible,\"fired_marker\":$marker_json,\"fired\":$fired,\"firing_allowed\":$allowed,\"blocked_by\":[$bb],\"next_due\":$nd_json}")
+    SCHEDULE+=("{\"path\":$path_json,\"item_id\":$id_json,\"cadence\":$cad_json,\"paused_by\":[$paused_json],\"eligible_now\":$eligible,\"fired_marker\":$marker_json,\"fired\":$fired,\"firing_allowed\":$allowed,\"blocked_by\":[$bb]$nd_part}")
   done
   if (( ${#nd_pending[@]} > 0 )); then
     nd_resolve "${nd_pending[@]}"
@@ -2324,12 +2329,16 @@ jgen_peek() {
 
 cmd_status() {
   # status takes --json, and --active (status-active-v1) beside it: settled
-  # deliveries are counted instead of listed.
-  local arg rest=() seen_active=0
+  # deliveries are counted instead of listed; and --next-due (next-due-v1):
+  # each schedule record gains next_due.
+  local arg rest=() seen_active=0 seen_nd=0
   for arg in "$@"; do
     if [[ "$arg" == --active ]]; then
       if (( seen_active )); then echo "error: status: --active given more than once" >&2; exit 2; fi
       seen_active=1; STATUS_ACTIVE=1
+    elif [[ "$arg" == --next-due ]]; then
+      if (( seen_nd )); then echo "error: status: --next-due given more than once" >&2; exit 2; fi
+      seen_nd=1; STATUS_NEXT_DUE=1
     else
       rest+=("$arg")
     fi

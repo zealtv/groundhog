@@ -366,7 +366,7 @@ between cycles, and every consumer) with `8>&- 9>&-`. Short-lived tools such as
 `ownership-v1`, `runner-v1` and `pause-v1` appear only when the host has: a lock
 helper (util-linux `flock` or perl with `Fcntl`); a SHA-256 tool (`sha256sum`,
 `shasum` or `openssl`); `perl` with `IO::Handle` or `sync(1)` for durable writes;
-`od` and `/dev/urandom`. Without them `capabilities` lists `status-json-v1` and `status-active-v1` only,
+`od` and `/dev/urandom`. Without them `capabilities` lists `status-json-v1`, `status-active-v1` and `next-due-v1` only,
 `enroll`, `run`, `pause`, `resume`, `stop`, `release`, `retry` and `recover` exit
 5 with a message, and every legacy command works as before without taking any
 lock. `consumer-v1`, `delivery-v1` and `release-unresolved-v1` additionally need a way to start a consumer
@@ -761,7 +761,7 @@ you.
 1. **Check the host.** `./groundhog.sh capabilities --json` should list all six
    capabilities (`status-json-v1`, `ownership-v1`, `runner-v1`, `pause-v1`,
    `consumer-v1`, `delivery-v1`), plus `release-unresolved-v1` (the flag for
-   `release`), `status-active-v1` (the flag for `status`) and `sweep-owner-v1`
+   `release`), `status-active-v1` and `next-due-v1` (flags for `status`) and `sweep-owner-v1`
    (the flag for `sweep`). Without `consumer-v1` and `delivery-v1` the instance can still be
    owned, paused and run delivery-only.
 2. **Stop whatever else writes to the instance.** Other `tick` loops, cron lines,
@@ -884,18 +884,19 @@ their behavior, including creating the trays.
 
 ```
 $ ./groundhog.sh capabilities --json
-{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","status-active-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","consumer-v1","delivery-v1","release-unresolved-v1"]}
+{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","status-active-v1","next-due-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","consumer-v1","delivery-v1","release-unresolved-v1"]}
 ```
 
-`capabilities` lists only what this script implements on this host: `status-json-v1`
-and `status-active-v1` always, `ownership-v1`, `runner-v1` and `pause-v1` where the locking tools
+`capabilities` lists only what this script implements on this host: `status-json-v1`,
+`status-active-v1` and `next-due-v1` always, `ownership-v1`, `runner-v1` and `pause-v1` where the locking tools
 exist (see [Runner, ownership and pause](#runner-ownership-and-pause)), and
 `sweep-owner-v1` with them, and
 `consumer-v1`, `delivery-v1` and `release-unresolved-v1` where a consumer can also be
 started in a session of its own. A client needs the six capabilities the contract
 names (`status-json-v1`, `ownership-v1` through `delivery-v1`) before it may offer
 supervised control, `release-unresolved-v1` before it passes `--leave-unresolved` to
-`release`, `status-active-v1` before it passes `--active` to `status`, and
+`release`, `status-active-v1` before it passes `--active` to `status`, `next-due-v1` before it
+passes `--next-due`, and
 `sweep-owner-v1` before it passes `--token-file` to `sweep`. An older
 script answers `capabilities` with its ordinary `unknown command` error (exit 1).
 
@@ -925,7 +926,10 @@ script answers `capabilities` with its ordinary `unknown command` error (exit 1)
   `"01-01"`, and once with `date: null` meaning the next tick. The whole object
   is `null` for an item that `tick` would fire but the grammar does not
   recognize. Paused items keep their cadence.
-* `next_due` is an additive field on each schedule record: the UTC time
+* `next_due` (capability `next-due-v1`, accepted on 2026-11-18) is an additive field
+  on each schedule record, present only under `status --json --next-due` (which
+  combines with `--active`); without the flag the key is absent and the output and
+  its cost are unchanged. It is the UTC time
   (`"2026-11-19T07:45:00Z"`) at which the item's next occurrence that has not
   fired begins, or `null`. It is computed by asking the same `walk_due` that
   `tick`, `due` and `eligible_now` use about later local moments, so it
@@ -943,8 +947,9 @@ script answers `capabilities` with its ordinary `unknown command` error (exit 1)
   next nine years (`yearly/02-30`). The item fires on the first tick at or
   after `next_due`, not at it: a tick that comes later fires it, and an
   occurrence that no tick reaches is missed, as under "Missed days", after
-  which `next_due` names the following one. Older scripts omit the field;
-  clients treat absent and `null` alike.
+  which `next_due` names the following one. A client passes the flag after finding
+  `next-due-v1` in `capabilities`; a script without it exits 2 on the flag, and
+  clients treat an absent field and `null` alike.
 * `deliveries` lists the records under `runtime/deliveries/` plus, read-only,
   every other directory in `out/` as `origin: "legacy_out"`, state `pending`,
   reason `unregistered`, `id: null`. Status registers nothing. Reasons the

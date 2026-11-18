@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# next_due: the additive schedule-record field naming when an item's next
-# unfired occurrence begins (UTC), or null. It must agree with `due`, which is
-# what a tick fires from: at next_due the item is due, a minute before it is not.
+# next_due: the additive, opt-in (status --json --next-due, capability next-due-v1)
+# schedule-record field naming when an item's next unfired occurrence begins (UTC),
+# or null. It must agree with `due`, which is what a tick fires from: at next_due
+# the item is due, a minute before it is not. Without the flag the key is absent.
 . "$(dirname "$0")/lib.sh"
 export TZ=UTC
 
@@ -24,7 +25,8 @@ for r in json.load(open(sys.argv[1]))["schedule"]:
         print(r["path"] + "\t" + r["next_due"])' "$T_TMP/nd.json"
 }
 mark() { mkdir -p "$(dirname "$GHD/$1")"; touch "$GHD/$1"; }
-snap_nd() { status_to "$T_TMP/nd.json"; assert_json_valid "$T_TMP/nd.json"; }
+nd_status() { gh status --json --next-due "$@" > "$T_TMP/nd.json" 2> "$T_TMP/nd.json.err"; }
+snap_nd() { nd_status; assert_json_valid "$T_TMP/nd.json"; }
 expect() { # PATH EXPECTED-UTC|null
   local want="$2"
   [ "$want" = null ] || want="\"$want\""
@@ -115,6 +117,37 @@ expect schedule/once/2026-12-01/o-future 2026-12-01T00:00:00Z
 expect schedule/daily/p-item.paused null
 expect schedule/weekly.paused/sun/p-axis null
 agrees_with_due "Sun 12:00"
+
+# --- opt-in: the flag, the capability, --active, and the plain output -----------------
+assert_contains "capabilities offers next-due-v1" "$(gh capabilities --json)" '"next-due-v1"'
+status_to "$T_TMP/plain.json"
+assert_json_valid "$T_TMP/plain.json"
+assert_eq "plain status has no next_due key" 0 "$(grep -c next_due "$T_TMP/plain.json")"
+# The flag adds the key and nothing else: stripped of it, the output is the plain output.
+nd_strip() { python3 -I -c '
+import json, sys
+d = json.load(open(sys.argv[1]))
+for r in d["schedule"]:
+    r.pop("next_due", None)
+print(json.dumps(d, sort_keys=True))' "$1"; }
+assert_eq "status --next-due equals plain status but for next_due" "$(nd_strip "$T_TMP/plain.json")" "$(nd_strip "$T_TMP/nd.json")"
+assert_eq "every record has the key under --next-due" "$(grep -o '"item_id"' "$T_TMP/nd.json" | wc -l | tr -d ' ')" "$(grep -o '"next_due"' "$T_TMP/nd.json" | wc -l | tr -d ' ')"
+# --active combines, in either order, and the settled count stays.
+gh status --json --active > "$T_TMP/act.json"
+nd_status --active; cp "$T_TMP/nd.json" "$T_TMP/ndact.json"
+gh status --active --next-due --json > "$T_TMP/ndact2.json"
+assert_json_valid "$T_TMP/ndact.json"
+assert_eq "--next-due --active equals --active but for next_due" "$(nd_strip "$T_TMP/act.json")" "$(nd_strip "$T_TMP/ndact.json")"
+assert_eq "flag order does not matter" "$(cat "$T_TMP/ndact.json")" "$(cat "$T_TMP/ndact2.json")"
+assert_eq "plain --active has no next_due key" 0 "$(grep -c next_due "$T_TMP/act.json")"
+assert_contains "--next-due --active keeps settled" "$(cat "$T_TMP/ndact.json")" '"settled"'
+# Misuse exits 2 and prints nothing on stdout.
+rc=0; gh status --json --next-due --next-due >"$T_TMP/o" 2>"$T_TMP/e" || rc=$?
+assert_eq "--next-due twice exits 2" 2 "$rc"
+assert_eq "--next-due twice prints no document" "" "$(cat "$T_TMP/o")"
+rc=0; gh status --next-due >"$T_TMP/o" 2>"$T_TMP/e" || rc=$?
+assert_eq "--next-due without --json exits 2" 2 "$rc"
+snap_nd
 
 # --- every/ near midnight: the last slot is short -----------------------------------
 new_instance
