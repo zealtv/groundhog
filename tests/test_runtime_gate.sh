@@ -23,7 +23,7 @@ bare_gh() { PATH="$bare" "$bash_bin" "$GHD/groundhog.sh" "$@"; }
 out="$T_TMP/g.json"
 
 bare_gh capabilities --json > "$out"
-assert_eq "no lock helper: only the two status capabilities are advertised" '["status-json-v1","status-active-v1"]' "$(jget "$out" capabilities)"
+assert_eq "no lock helper: only the capabilities that need nothing of the host are advertised" '["status-json-v1","status-active-v1","add-while-owned-v1"]' "$(jget "$out" capabilities)"
 
 new_token_path
 for c in "enroll --owner-label x --token-file $TOK" "run --token-file $TOK" "pause --token-file $TOK" \
@@ -49,6 +49,15 @@ rc=0; bare_gh sweep 0 >/dev/null 2>&1 || rc=$?
 assert_eq "sweep works" 0 "$rc"
 rc=0; bare_gh drop nudge >/dev/null 2>&1 || rc=$?
 assert_eq "drop works" 0 "$rc"
+# add and add --from need nothing of the host: no lock helper, no od, no staging beyond cp and mv.
+mkdir -p "$T_TMP/prep/sub"; echo go > "$T_TMP/prep/prompt.md"; echo x > "$T_TMP/prep/sub/n.txt"
+rc=0; bare_gh add once/2030-01-01 fromdir --from "$T_TMP/prep" >"$out.o" 2>"$out.e" || rc=$?
+assert_eq "add --from works without a lock helper" 0 "$rc"
+assert_true "...and lands the whole directory" diff -r "$T_TMP/prep" "$GHD/schedule/once/2030-01-01/fromdir"
+assert_eq "...leaving nothing staged" 0 "$(find "$GHD/runtime/staging" -mindepth 1 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "...and add --from of a missing directory still exits 2" 2 "$(rc=0; bare_gh add daily nope --from "$T_TMP/none" >/dev/null 2>&1 || rc=$?; echo $rc)"
+bare_gh drop fromdir >/dev/null 2>&1
+rmdir "$GHD/runtime/staging" "$GHD/runtime" 2>/dev/null
 assert_false "legacy use created no runtime directory" test -e "$GHD/runtime"
 bare_gh status --json > "$out"
 assert_eq "status works" true "$(jget "$out" consistent)"

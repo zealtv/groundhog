@@ -5,7 +5,7 @@ usage() {
   cat <<'USAGE'
 usage:
   groundhog.sh init
-  groundhog.sh add <when> <item-id>
+  groundhog.sh add <when> <item-id> [--from DIR]
   groundhog.sh tick
   groundhog.sh due
   groundhog.sh list
@@ -44,8 +44,11 @@ notes:
     see README.md and docs/runtime-contract.md
   - enroll, run, pause, resume, stop, release, retry and recover are the
     optional runner commands; they need the OS-released locking described in
-    README.md, and an owned instance refuses tick, init, add, drop and sweep
+    README.md, and an owned instance refuses tick, init, drop and sweep
     (sweep --token-file is the owner's own sweep: a stopped runner and a valid token)
+  - add works on an owned instance too, with no token (capability add-while-owned-v1);
+    add --from DIR copies a prepared directory in with one rename under the lock, so
+    no tick sees the item half-made, while plain add leaves an empty directory to fill
   - run hands pending deliveries to the consumer in runtime/config.json, if
     there is one; retry and recover are the operator's decisions about a
     failed or uncertain handoff (see README.md)
@@ -370,6 +373,18 @@ cmd_init() {
 
 cmd_add() {
   require_root
+  local from=""
+  if (( $# > 2 )); then
+    # More than <when> <item-id>: only the exact pair `--from DIR` is valid.
+    # An older script ignores the extras and would make an empty item.
+    if (( $# != 4 )) || [[ "$3" != --from ]]; then
+      rt_die 2 "add: expected <when> <item-id> [--from DIR]"
+    fi
+    from="$4"
+    rt_paths
+    add_from "$1" "$2" "$from"
+    return
+  fi
   passive_enter add
   ensure_dirs
   local when="${1:-}"
@@ -382,6 +397,50 @@ cmd_add() {
   local path="$SCHED/$when/$id"
   [[ ! -e "$path" ]] || die "item already exists: $path"
   mkdir -p "$path"
+  LINT_INCLUDE_PAUSED=0
+  lint_scan
+  note_shared_names "$id"
+  echo "$path"
+}
+
+ADD_STAGE=""
+add_cleanup() {
+  [[ -z "$ADD_STAGE" ]] || rm -rf -- "$ADD_STAGE"
+}
+
+# add_from WHEN ID DIR — `add <when> <item-id> --from DIR`: copy the prepared
+# directory DIR next to the schedule (runtime/staging/add-*), then rename it to
+# schedule/<when>/<id> under the mutation lock, so a tick sees the item whole or
+# not at all. The checks plain add makes run first, and DIR is copied, never moved.
+add_from() {
+  local when="$1" id="$2" dir="$3" real path n=0
+  [[ -n "$when" ]] || rt_die 1 "add requires <when> and <item-id>"
+  [[ -n "$id" ]]   || rt_die 1 "add requires <item-id>"
+  when="${when%/}"
+  validate_when "$when"
+  is_id "$id" || die "invalid item id '$id' (use letters, digits, ., _, -; cannot collide with axis tokens or date/hour shapes)"
+  path="$SCHED/$when/$id"
+  [[ ! -e "$path" ]] || die "item already exists: $path"
+  [[ -n "$dir" && -d "$dir" ]] || rt_die 2 "add: --from needs an existing directory"
+  real="$(cd -- "$dir" 2>/dev/null && pwd -P)" || rt_die 2 "add: cannot read the --from directory"
+
+  mkdir -p "$RT_DIR/staging" 2>/dev/null || rt_die 6 "add: cannot create $RT_DIR/staging"
+  trap add_cleanup EXIT
+  while :; do
+    ADD_STAGE="$RT_DIR/staging/add-$$-$RANDOM$RANDOM"
+    [[ -e "$ADD_STAGE" || -L "$ADD_STAGE" ]] || break
+    n=$((n + 1))
+    (( n < 20 )) || { ADD_STAGE=""; rt_die 6 "add: cannot name a staging directory"; }
+  done
+  cp -R -- "$real" "$ADD_STAGE" 2>/dev/null || rt_die 6 "add: cannot copy $dir"
+
+  passive_enter add
+  ensure_dirs
+  # Checked again under the lock: another add may have landed since.
+  [[ ! -e "$path" && ! -L "$path" ]] || die "item already exists: $path"
+  mkdir -p "$SCHED/$when" 2>/dev/null || rt_die 6 "add: cannot create $SCHED/$when"
+  mv -- "$ADD_STAGE" "$path" 2>/dev/null || rt_die 6 "add: cannot move the item into place"
+  ADD_STAGE=""
   LINT_INCLUDE_PAUSED=0
   lint_scan
   note_shared_names "$id"
@@ -921,13 +980,14 @@ GH_PROTOCOL="groundhog-runtime"
 GH_PROTOCOL_VERSION=1
 # Informational only; clients must not branch on it.
 GH_IMPLEMENTATION_VERSION="dev"
-# Advertise only what this script implements here. cmd_capabilities adds
+# Advertise only what this script implements here (add-while-owned-v1 needs
+# nothing from the host). cmd_capabilities adds
 # ownership-v1, runner-v1, pause-v1 and sweep-owner-v1 (sweep --token-file) on
 # hosts where rt_detect finds the locking
 # and durability tools, and consumer-v1, delivery-v1 and release-unresolved-v1
 # (release --leave-unresolved) where it also finds a way to start a consumer in
 # its own session.
-GH_CAPABILITIES=("status-json-v1" "status-active-v1")
+GH_CAPABILITIES=("status-json-v1" "status-active-v1" "add-while-owned-v1")
 
 JSON_LOSSY=0        # set when json_str had to replace bytes that are not UTF-8
 JSTR=""
@@ -2425,8 +2485,9 @@ parse_opts() {
 # --- passive callers ---------------------------------------------------------
 # passive_enter CMD — for tick, init, add, drop and sweep. Where locking exists:
 # take the mutation lock (held until this process exits), refuse while the
-# instance is owned (exit 3) or its state is unusable (exit 5), and note the
-# global pause for tick. Without locking the legacy behavior is unchanged.
+# instance is owned (exit 3, except for add, which works on an owned instance)
+# or its state is unusable (exit 5), and note the global pause for tick.
+# Without locking the legacy behavior is unchanged.
 passive_enter() {
   rt_paths
   rt_detect
@@ -2434,8 +2495,8 @@ passive_enter() {
   mkdir -p "$RT_LOCKS" 2>/dev/null || rt_die 6 "$1: cannot create $RT_LOCKS"
   lock_mutation_or_die "$1"
   rt_load || rt_die 5 "$1: $RT_ERR"
-  if (( S_OWNER_PRESENT )); then
-    rt_die 3 "$1: this instance is owned; its runner ticks under the owner's token, and v1 has no supervised schedule edit"
+  if (( S_OWNER_PRESENT )) && [[ "$1" != add ]]; then
+    rt_die 3 "$1: this instance is owned; its runner ticks under the owner's token, and v1 has no supervised schedule edit other than add"
   fi
   PASSIVE_PAUSED="$S_PAUSED"
 }

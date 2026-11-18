@@ -35,7 +35,7 @@ assert_eq "consistent" true "$(jget "$out" consistent)"
 assert_eq "no diagnostics for a valid state" "[]" "$(jget "$out" diagnostics)"
 
 # Pause and ownership feed firing_allowed / blocked_by; eligibility stays legacy.
-# (`add` refuses an owned instance, so the item is made directly.)
+# (The item is made directly here; `add` also works on an owned instance, see test_add.sh.)
 mkdir -p "$GHD/schedule/daily/nudge"
 status_to "$out"
 assert_eq "paused+owned: item still eligible_now" true "$(jq_py find "$out" schedule path schedule/daily/nudge | python3 -I -c 'import json,sys;print(json.dumps(json.load(sys.stdin)["eligible_now"]))')"

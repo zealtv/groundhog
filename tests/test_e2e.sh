@@ -132,7 +132,9 @@ for c in tick init drop sweep; do
   case "$c" in drop) a=nudge ;; *) a="" ;; esac
   assert_eq "$c while owned: 3" 3 "$(rc_of gh $c $a)"
 done
-assert_eq "add while owned: 3" 3 "$(rc_of gh add daily extra)"
+# add works while owned (test_add.sh); a far-future once item leaves the later parts' deliveries alone.
+assert_eq "add while owned: 0" 0 "$(rc_of gh add once/2099-01-01 extra)"
+rmdir "$GHD/schedule/once/2099-01-01/extra" "$GHD/schedule/once/2099-01-01"
 assert_eq "a second run, even with the same token: 4" 4 "$(rc_of gh run --token-file "$real_tok" --interval-seconds 1)"
 # a token from another instance does not control this one
 save_inst="$INST"; save_ghd="$GHD"
