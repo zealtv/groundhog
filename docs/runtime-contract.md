@@ -12,8 +12,9 @@ and `pause-v1` on hosts with the locking and durability tools described in
 `delivery-v1` and `release-unresolved-v1` where the host can also start a consumer
 in a session of its own ([README.md](../README.md#consumers-and-deliveries)); with
 the six required ones, this script satisfies "all six capabilities" for supervised control,
-`release-unresolved-v1` adds `release --leave-unresolved`, and `status-active-v1` adds
-`status --json --active`. The README records the
+`release-unresolved-v1` adds `release --leave-unresolved`, `status-active-v1` adds
+`status --json --active`, and `sweep-owner-v1` (offered with `ownership-v1`) adds
+`sweep --token-file`. The README records the
 points where the implementation chose a reading of this document (the extra
 `runtime/prepared/` journal, the exit-status record for signals, the legacy
 one-shot rule). Each schedule record of `status --json` also carries an
@@ -74,6 +75,7 @@ groundhog.sh pause --token-file PATH
 groundhog.sh resume --token-file PATH
 groundhog.sh stop --token-file PATH
 groundhog.sh release --token-file PATH [--leave-unresolved]
+groundhog.sh sweep --token-file PATH [days]
 groundhog.sh retry --token-file PATH --delivery ID
 groundhog.sh recover --token-file PATH --delivery ID --decision retry|accept
 ```
@@ -91,7 +93,7 @@ Synthetic capability response (not output from today's script):
   "protocol": "groundhog-runtime",
   "protocol_version": 1,
   "implementation_version": "example-build",
-  "capabilities": ["status-json-v1", "status-active-v1", "ownership-v1", "runner-v1", "pause-v1", "consumer-v1", "delivery-v1", "release-unresolved-v1"]
+  "capabilities": ["status-json-v1", "status-active-v1", "ownership-v1", "runner-v1", "pause-v1", "sweep-owner-v1", "consumer-v1", "delivery-v1", "release-unresolved-v1"]
 }
 ```
 
@@ -102,9 +104,11 @@ and decline unknown enum values for control. Six capabilities (`status-json-v1` 
 control under this contract. `release-unresolved-v1` is an optional one: a client
 negotiates it, by finding it in the `capabilities` list, before it passes
 `--leave-unresolved` to `release`, and otherwise uses plain `release` (a script without
-it exits 2 on the flag). `status-active-v1` is the other: a client finds it in the list
+it exits 2 on the flag). `status-active-v1` is another: a client finds it in the list
 before it passes `--active` to `status`, and otherwise reads the full `status --json` (a
-script without it exits 2 on the flag). An old script
+script without it exits 2 on the flag). `sweep-owner-v1` is a third: a client finds it in
+the list before it passes `--token-file` to `sweep`, and otherwise treats an owned instance
+as one it cannot sweep (a script without it refuses the option and sweeps nothing). An old script
 returns its existing unknown-command error: inspect its files as legacy, mark control unsupported,
 and do not probe by running `run`, `tick` or `init`. Capability discovery invokes
 only the deliberately selected instance's script; it is not a payload sandbox.
@@ -318,8 +322,9 @@ tick succeeds without firing and prints a human diagnostic to stderr. With an
 owner present it fails ownership conflict: the runner calls the tick operation
 internally under its token. If both paused and owned, ownership conflict takes
 precedence for standalone tick. Upgraded `init`, `add`, `drop` and `sweep` also
-serialize mutations and refuse while owned; v1 provides no supervised schedule-edit command. They do not clear
-pause or runtime state. No-owner, unpaused tick continues to materialize
+serialize mutations and refuse while owned; v1 provides no supervised schedule-edit command,
+and the owner's own `sweep --token-file` (see "Delivery journal, acknowledgement and retry") is
+the one exception. They do not clear pause or runtime state. No-owner, unpaused tick continues to materialize
 only, without enrollment or consumer invocation. No runtime directory is
 required for ordinary legacy-style use; lock coordination may create optional
 lock state, but never ownership or configuration. `due` continues to describe
@@ -523,6 +528,25 @@ externally missing paths remain visible in records until explicitly swept as
 terminal missing records. Sweep never turns an accepted item into pending.
 An old sweep or manual deletion can lose evidence; compatibility cannot prevent
 that. Keep unaccepted payloads until their disposition has been reconciled.
+
+`sweep --token-file PATH [days]` (capability `sweep-owner-v1`; proposed on 2026-11-18
+after Bob's decision of 2026-11-15 that the owner sweep finished records; text accepted
+by Bob on ACCEPTANCE-DATE) is that sweep for an owned instance. Every delivery a supervised
+instance accepts leaves a record, so without it the records and their `out/` entries grow
+until the owner releases the instance. It follows the rules of `release`, `retry` and
+`recover`: the token holder only, with a stopped runner (exit 4 while one is alive) and the
+token revalidated under the mutation lock (exit 3 for a stale or foreign one); exit 2 for a
+missing token file or wrong arguments, `days` being a non-negative integer, default 14, and
+5 for an unreadable or unsupported record, with nothing removed. It removes what the sweep
+above removes, accepted and `missing` records with their `out/` entries and unreferenced
+`fired/` dates, once older than `days`, and keeps what it keeps: every `pending`, `failed`,
+`in_flight` and `uncertain` delivery and the markers they reference, whatever their age,
+reported as skipped. A `pending` delivery with reason `no_consumer` is such a delivery: no
+consumer has seen it, so its payload is the only trace of the delivery and a sweep does not
+decide its disposition; it stays until a consumer is configured and takes it, or until the
+operator removes the entry and its record by hand. The sweep writes no state: ownership,
+pause, runner state and `revision` stay as they were, and it neither enrolls nor releases.
+Without `--token-file`, `sweep` keeps refusing an owned instance.
 
 ## Crash and shutdown observations
 
@@ -733,6 +757,7 @@ GH=/example/project/.groundhog/groundhog.sh
 | Authorized service stops without release, then restarts with its valid token and invokes run | Same owner/generation; pause retained; no re-enrollment required; unresolved handoff barrier still applies. |
 | Authorized service explicitly enrolls an unowned instance and invokes run | Same authorization checks as any caller; no foreground human session required; run does not clear pause. |
 | Owner stops, reconciles unresolved attempts, explicitly releases | No owner, runner stopped, pause retained; old token invalidated. |
+| Owner stops, `sweep --token-file TOKEN 14` | Accepted and `missing` records older than 14 days leave with their `out/` entries; pending, failed, in-flight and uncertain ones, `pending/no_consumer` included, stay, listed as skipped; owner, pause and revision unchanged. |
 | Easyhog clean Quit completes stop/release, then reopen | No owner, runner stopped, pause retained; Quit deleted the token, so there is nothing to adopt, and this client's policy requires explicit Play. |
 
 Enrollment failure examples (no new command is needed):
@@ -772,5 +797,6 @@ unresolved handoffs. Bob accepted on 2026-11-17 that `release --leave-unresolved
 release with an unresolved attempt, the handoff barrier staying until `recover`, and
 that an attempt records the admitting owner's label. Bob accepted on 2026-11-17 that
 `status --json --active` leaves settled deliveries out and counts them, and that a later
-sweep removes old settled records. No dependent runtime
+sweep removes old settled records; that sweep is `sweep --token-file` (accepted on
+ACCEPTANCE-DATE), which keeps pending deliveries, those without a consumer included. No dependent runtime
 implementation is authorized by this document.
