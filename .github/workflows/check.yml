@@ -29,6 +29,10 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v7
+        with:
+          # test_e2e.sh runs the pre-runtime script (252b705) from history; a
+          # shallow clone lacks it and the case skips.
+          fetch-depth: 0
       - name: Newer bash on macOS
         if: matrix.bash == 'brew'
         run: brew list bash >/dev/null 2>&1 || brew install bash
