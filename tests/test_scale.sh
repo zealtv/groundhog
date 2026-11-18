@@ -404,7 +404,7 @@ assert_eq "...counts the accepted ones" "$((150 - 15 + 1))" "$(jget "$act" settl
 assert_eq "...and the missing ones" 15 "$(jget "$act" settled.missing)"
 assert_eq "...consistent, no diagnostics" '[]' "$(jget "$act" diagnostics)"
 
-# --- names that are not valid UTF-8 are not fired or imported (finding 9) ----------------
+# --- names that are not valid UTF-8 are not fired or imported ----------------
 # The predicate itself, on every host: extract it from the script.
 sed -n '/^json_str() {/,/^}/p;/^utf8_valid() {/,/^}/p' "$GH_SCRIPT" > "$T_TMP/utf8fn.sh"
 utf8_probe() { # printf FORMAT of the name → valid|invalid

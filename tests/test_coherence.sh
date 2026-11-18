@@ -314,8 +314,8 @@ SHIM
   # After the record is replaced, before the generation is closed: the directory sync.
   held_writer "writer after the record is replaced" "@GHD@/runtime/deliveries"
   firing_done() { ! ls "$GHD"/runtime/prepared/*.json >/dev/null 2>&1; }
-  # A firing: the out/ entry exists before the delivery record does (the finding
-  # behind this file). Hold the runner at the sync of out/ itself.
+  # A firing: the out/ entry exists before the delivery record does.
+  # Hold the runner at the sync of out/ itself.
   fresh_consumer "$FAST"; rm -f "$GHD/runtime/config.json"
   rm -f "$REACHED"
   printf '%s\n' "$GHD/out" > "$HOLD"
