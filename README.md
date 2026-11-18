@@ -245,6 +245,7 @@ Neither starts a runner, enrolls an owner or writes a configuration: see
 ./groundhog.sh drop <item-id>           # remove from schedule/
 ./groundhog.sh out                      # ls out/
 ./groundhog.sh sweep [days]             # remove out/ entries older than N days (default 14)
+./groundhog.sh sweep --token-file PATH [days]  # the owner's sweep of an owned instance with a stopped runner
 ./groundhog.sh capabilities --json      # which runtime capabilities this script implements (read-only)
 ./groundhog.sh status --json [--active] # one JSON snapshot of schedule, state and deliveries (read-only); --active counts settled deliveries instead of listing them
 ./groundhog.sh enroll --owner-label LABEL --token-file ABSENT_ABSOLUTE_PATH
@@ -309,8 +310,9 @@ $ ./groundhog.sh release --token-file /private/dir/token    # then delete the to
   consumer admission under any later owner until `recover`.
 * **Standalone `tick`** fails 3 while the instance is owned (ownership wins over
   pause), succeeds without firing while paused, and otherwise ticks as always.
-  `init`, `add`, `drop` and `sweep` also fail 3 while owned. All of them take the
-  mutation lock and fail 4 if it stays busy for about three seconds.
+  `init`, `add`, `drop` and `sweep` also fail 3 while owned (`sweep --token-file`, below,
+  is the owner's own way in). All of them take the mutation lock and fail 4 if it stays
+  busy for about three seconds.
 * Exit codes of the new commands: 0 success, 2 invalid arguments or
   configuration, 3 ownership conflict or stale token, 4 busy, 5 unsupported or
   unusable state, 6 I/O failure, 7 enrollment outcome uncertain.
@@ -605,7 +607,8 @@ cycle, of `release` and of `status` from growing with every settled delivery
   record is replaced; any atomic rewrite changes the inode.
 * The index is only a cache: delete it and the next `status` or `run` reads every
   record once and, for `run`, writes it again. Deleting records (retention) is
-  not part of this layout; `sweep` still refuses while an owner exists.
+  not part of this layout; `sweep` still refuses while an owner exists, unless the
+  owner passes its token (`sweep --token-file`, see below).
 * A runner is the only writer of delivery records while it lives, so it reads
   them without the mutation lock and takes the lock only to write: in slices of
   about a second, each followed by a short pause for `pause`, `stop`, `retry` or
@@ -712,6 +715,21 @@ old enough, as do terminal `missing` records. An unreadable record stops the
 sweep before it removes anything. An instance with no runtime state sweeps
 exactly as before.
 
+**`sweep --token-file PATH [days]`** (capability `sweep-owner-v1`) is that same
+sweep for an owned instance, run by the holder of its token, so that the records
+a supervised instance accumulates can be cleared without releasing it. The
+runner must be stopped (exit 4 while one is alive) and the token must match the
+current owner (exit 3 if it does not; exit 2 if the file is missing or the
+arguments are wrong, with `days` before or after the option; an unreadable record
+exits 5 and nothing is removed). It removes the same things and keeps the same
+things as the sweep above, so pending, failed, in-flight and uncertain deliveries
+stay, and are reported as `skipped`, whatever their age. That includes `pending`
+deliveries with reason `no_consumer`: no consumer has seen them, and removing
+one would erase the only trace of a delivery nobody took. They stay until a
+consumer is configured and takes them, or until the operator removes the entry
+and its record by hand. The sweep writes no state, so ownership, pause and the
+revision stay as they were.
+
 ## Deployment and migration
 
 Written for operators on 2026-11-15, from the behavior this repository's tests
@@ -750,7 +768,8 @@ you.
 1. **Check the host.** `./groundhog.sh capabilities --json` should list all six
    capabilities (`status-json-v1`, `ownership-v1`, `runner-v1`, `pause-v1`,
    `consumer-v1`, `delivery-v1`), plus `release-unresolved-v1` (the flag for
-   `release`) and `status-active-v1` (the flag for `status`). Without `consumer-v1` and `delivery-v1` the instance can still be
+   `release`), `status-active-v1` (the flag for `status`) and `sweep-owner-v1`
+   (the flag for `sweep`). Without `consumer-v1` and `delivery-v1` the instance can still be
    owned, paused and run delivery-only.
 2. **Stop whatever else writes to the instance.** Other `tick` loops, cron lines,
    and any process that moves entries out of `out/` (see the next section). An
@@ -872,17 +891,19 @@ their behavior, including creating the trays.
 
 ```
 $ ./groundhog.sh capabilities --json
-{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","status-active-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1","release-unresolved-v1"]}
+{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","status-active-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","consumer-v1","delivery-v1","release-unresolved-v1"]}
 ```
 
 `capabilities` lists only what this script implements on this host: `status-json-v1`
 and `status-active-v1` always, `ownership-v1`, `runner-v1` and `pause-v1` where the locking tools
 exist (see [Runner, ownership and pause](#runner-ownership-and-pause)), and
+`sweep-owner-v1` with them, and
 `consumer-v1`, `delivery-v1` and `release-unresolved-v1` where a consumer can also be
 started in a session of its own. A client needs the six capabilities the contract
 names (`status-json-v1`, `ownership-v1` through `delivery-v1`) before it may offer
 supervised control, `release-unresolved-v1` before it passes `--leave-unresolved` to
-`release`, and `status-active-v1` before it passes `--active` to `status`. An older
+`release`, `status-active-v1` before it passes `--active` to `status`, and
+`sweep-owner-v1` before it passes `--token-file` to `sweep`. An older
 script answers `capabilities` with its ordinary `unknown command` error (exit 1).
 
 `status --json` follows the projection in the

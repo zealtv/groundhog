@@ -13,6 +13,7 @@ usage:
   groundhog.sh drop <item-id>
   groundhog.sh out
   groundhog.sh sweep [days]
+  groundhog.sh sweep --token-file PATH [days]
   groundhog.sh capabilities --json
   groundhog.sh status --json
   groundhog.sh enroll --owner-label LABEL --token-file ABSENT_ABSOLUTE_PATH
@@ -44,6 +45,7 @@ notes:
   - enroll, run, pause, resume, stop, release, retry and recover are the
     optional runner commands; they need the OS-released locking described in
     README.md, and an owned instance refuses tick, init, add, drop and sweep
+    (sweep --token-file is the owner's own sweep: a stopped runner and a valid token)
   - run hands pending deliveries to the consumer in runtime/config.json, if
     there is one; retry and recover are the operator's decisions about a
     failed or uncertain handoff (see README.md)
@@ -736,6 +738,10 @@ sweep_dir() {
 }
 
 cmd_sweep() {
+  local a
+  for a in "$@"; do
+    if [[ "$a" == --token-file ]]; then sweep_owned "$@"; return; fi
+  done
   require_root
   passive_enter sweep
   ensure_dirs
@@ -747,6 +753,56 @@ cmd_sweep() {
     sweep_dir "$OUT" out "$days"
     sweep_dir "$FIRED" fired "$days"
   fi
+}
+
+# sweep_owned ARGS… — `sweep --token-file PATH [days]`, the owner's sweep: the
+# supervised sweep below, run on an owned instance by the holder of its token.
+# Like release, it needs a stopped runner (exit 4 with a live one) and takes the
+# mutation lock; it revalidates the token under that lock (exit 3 for a stale
+# one). What it removes and keeps is sweep_runtime's, unchanged.
+sweep_owned() {
+  parse_sweep_opts "$@"
+  rt_begin sweep
+  token_read "$OPT_TOKEN_FILE"
+  local rc=0
+  lock_runner_try || rc=$?
+  if (( rc == 1 )); then rt_die 4 "sweep: a runner is still alive; stop it first"; fi
+  (( rc == 0 )) || rt_die 6 "sweep: cannot test the runner lock"
+  lock_mutation_or_die sweep
+  control_check sweep
+  SWEEP_OWNED=1
+  sweep_runtime "${SWEEP_DAYS:-14}"
+  unlock_mutation
+  unlock_runner
+}
+
+SWEEP_OWNED=0
+SWEEP_DAYS=""
+# parse_sweep_opts ARGS… — the owner's sweep takes --token-file once and one
+# optional days; anything else exits 2.
+parse_sweep_opts() {
+  OPT_TOKEN_FILE=""; SWEEP_DAYS=""
+  while (( $# )); do
+    case "$1" in
+      --token-file)
+        [[ -z "$OPT_TOKEN_FILE" ]] || rt_die 2 "sweep: --token-file given more than once"
+        (( $# >= 2 )) && [[ -n "$2" ]] || rt_die 2 "sweep: --token-file needs a value"
+        OPT_TOKEN_FILE="$2"; shift 2
+        ;;
+      -*) rt_die 2 "sweep: unknown option '$1'" ;;
+      *)
+        [[ -z "$SWEEP_DAYS" ]] || rt_die 2 "sweep: more than one <days>"
+        [[ "$1" =~ ^[0-9]+$ ]] || rt_die 2 "sweep <days> must be a non-negative integer"
+        SWEEP_DAYS="$1"; shift
+        ;;
+    esac
+  done
+}
+
+# sweep_fail CODE MESSAGE — the supervised sweep's failures: exit 1 as before for
+# the passive sweep, the contract's code for the owner's.
+sweep_fail() {
+  if (( SWEEP_OWNED )); then rt_die "$1" "$2"; else die "$2"; fi
 }
 
 # An instance with delivery records or runtime state is supervised: its sweep
@@ -770,7 +826,7 @@ sweep_runtime() {
   for f in "$RT_DIR"/deliveries/*.json "$RT_DIR"/deliveries/done/*.json; do
     if ! drec_load "$f"; then
       shopt -u nullglob
-      die "sweep: ${f##*/} is unreadable or of an unsupported shape; nothing was swept"
+      sweep_fail 5 "sweep: ${f##*/} is unreadable or of an unsupported shape; nothing was swept"
     fi
     case "$D_STATE" in
       pending|in_flight|failed|uncertain)
@@ -816,12 +872,12 @@ sweep_runtime() {
     name="${f##*/}"; name="${name%.json}"
     if [[ "$gone_ids" == *"$US$name$US"* ]] \
        && [[ -n "$(find "$f" -maxdepth 0 -type f -mtime +"$days")" ]]; then
-      jgen_begin || die "sweep: cannot write runtime/journal.gen"
+      jgen_begin || sweep_fail 6 "sweep: cannot write runtime/journal.gen"
       rm -f "$f"; jgen_end || true; printf 'swept delivery %s\n' "$name"
     elif [[ "$acc_ids" == *"$US$name$US"* ]] \
        && drec_load "$f" && [[ ! -d "$GH_DIR/$D_PATH" ]] \
        && [[ -n "$(find "$f" -maxdepth 0 -type f -mtime +"$days")" ]]; then
-      jgen_begin || die "sweep: cannot write runtime/journal.gen"
+      jgen_begin || sweep_fail 6 "sweep: cannot write runtime/journal.gen"
       rm -f "$f"; jgen_end || true; printf 'swept delivery %s\n' "$name"
     fi
   done
@@ -844,7 +900,7 @@ sweep_remove_records_for() {
   local f
   for f in "$RT_DIR"/deliveries/*.json "$RT_DIR"/deliveries/done/*.json; do
     if drec_load "$f" && [[ "$D_PATH" == "$1" && "$D_STATE" == accepted ]]; then
-      jgen_begin || die "sweep: cannot write runtime/journal.gen"
+      jgen_begin || sweep_fail 6 "sweep: cannot write runtime/journal.gen"
       rm -f "$f"; jgen_end || true; printf 'swept delivery %s\n' "$D_ID"
     fi
   done
@@ -866,7 +922,8 @@ GH_PROTOCOL_VERSION=1
 # Informational only; clients must not branch on it.
 GH_IMPLEMENTATION_VERSION="dev"
 # Advertise only what this script implements here. cmd_capabilities adds
-# ownership-v1, runner-v1 and pause-v1 on hosts where rt_detect finds the locking
+# ownership-v1, runner-v1, pause-v1 and sweep-owner-v1 (sweep --token-file) on
+# hosts where rt_detect finds the locking
 # and durability tools, and consumer-v1, delivery-v1 and release-unresolved-v1
 # (release --leave-unresolved) where it also finds a way to start a consumer in
 # its own session.
@@ -1907,7 +1964,7 @@ cmd_capabilities() {
   local caps="" c
   rt_detect
   if [[ -z "$GH_RT_MISSING" ]]; then
-    GH_CAPABILITIES+=("ownership-v1" "runner-v1" "pause-v1")
+    GH_CAPABILITIES+=("ownership-v1" "runner-v1" "pause-v1" "sweep-owner-v1")
     if [[ -n "$GH_ISOLATE" ]]; then
       GH_CAPABILITIES+=("consumer-v1" "delivery-v1" "release-unresolved-v1")
     fi
