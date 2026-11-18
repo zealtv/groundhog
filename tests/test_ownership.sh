@@ -145,11 +145,15 @@ status_to "$out"
 assert_eq "a repeated resume changes nothing" "$rev2" "$(jget "$out" revision)"
 assert_eq "pause does not touch schedule .paused components" "" "$(find "$GHD/schedule" -name '*.paused')"
 
-# --- the passive callers refuse while owned ----------------------------------
-gh add daily other >/dev/null 2>&1 && t_fail "add should have refused" || true
+# --- the passive callers (add excepted) refuse while owned -------------------
+# add is the exception (add-while-owned-v1, accepted 2026-11-18; test_add.sh covers it): it works while
+# owned, so the loop below leaves it out, and the item it makes is removed by hand (drop still refuses).
+rc=0; gh add daily other >/dev/null 2>&1 || rc=$?
+assert_eq "add works on an owned instance (the exception)" 0 "$rc"
+rm -rf "${GHD:?}/schedule/daily/other"
 gh init >/dev/null 2>&1 || true
 before="$(tree_hash "$GHD/schedule")$(tree_hash "$GHD/out")$(tree_hash "$GHD/fired")"
-for c in "tick" "init" "add daily blocked" "drop nudge" "sweep 0"; do
+for c in "tick" "init" "drop nudge" "sweep 0"; do
   rc=0; gh $c >/dev/null 2>"$out.e" || rc=$?
   assert_eq "'$c' on an owned instance fails 3" 3 "$rc"
   assert_contains "'$c' says why" "$(cat "$out.e")" "owned"
