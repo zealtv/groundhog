@@ -531,7 +531,7 @@ that. Keep unaccepted payloads until their disposition has been reconciled.
 
 `sweep --token-file PATH [days]` (capability `sweep-owner-v1`; proposed on 2026-11-18
 after Bob's decision of 2026-11-15 that the owner sweep finished records; text accepted
-by Bob on ACCEPTANCE-DATE) is that sweep for an owned instance. Every delivery a supervised
+by Bob on 2026-11-18) is that sweep for an owned instance. Every delivery a supervised
 instance accepts leaves a record, so without it the records and their `out/` entries grow
 until the owner releases the instance. It follows the rules of `release`, `retry` and
 `recover`: the token holder only, with a stopped runner (exit 4 while one is alive) and the
@@ -798,5 +798,5 @@ release with an unresolved attempt, the handoff barrier staying until `recover`,
 that an attempt records the admitting owner's label. Bob accepted on 2026-11-17 that
 `status --json --active` leaves settled deliveries out and counts them, and that a later
 sweep removes old settled records; that sweep is `sweep --token-file` (accepted on
-ACCEPTANCE-DATE), which keeps pending deliveries, those without a consumer included. No dependent runtime
+2026-11-18), which keeps pending deliveries, those without a consumer included. No dependent runtime
 implementation is authorized by this document.
