@@ -228,6 +228,18 @@ assert_eq "...and prints nothing on stderr" "" "$(cat "$out.err")"
 assert_eq "...including the unregistered entry" 1 "$(jq_py where "$out" deliveries reason '"unregistered"' path | wc -l | tr -d ' ')"
 rm -rf "$GHD/out/stray-one"
 
+# ...and with exactly one filed record: an empty join result must not read as
+# one line that matches the one listed file (it once did, and dropped the record).
+plain_consumer "$FAST"
+make_records runtime/deliveries 1 accepted
+run_once
+assert_true "one record is filed" done_is 1
+status_to "$out"
+with_tools="$(deliveries_sum "$out")"
+PATH="$nocomm" "$TEST_BASH" "$GHD/groundhog.sh" status --json > "$out" 2>"$out.err" || true
+assert_eq "status without join lists the one filed record all the same" "$with_tools" "$(deliveries_sum "$out")"
+assert_eq "...and prints nothing on stderr" "" "$(cat "$out.err")"
+
 # release refuses on an unreadable filed record (unreadable evidence is never "resolved")
 plain_consumer "$FAST"
 make_records runtime/deliveries 2 accepted

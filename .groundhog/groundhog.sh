@@ -3176,7 +3176,9 @@ done_classify() {
   idx="$DN_DIR/index"
   if [[ ! -f "$idx" || -L "$idx" ]]; then idx=/dev/null; fi
   joined="$( LC_ALL=C join -t "$US" -a 1 -e '' -o 1.1,1.2,1.3,1.4,1.5,2.2,2.3,2.4,2.5,2.6,2.7,2.8 <(printf '%s\n' "$scan") "$idx" 2>/dev/null )" || joined=""
-  n_join="$(printf '%s\n' "$joined" | wc -l)"
+  # An empty result is no lines (printf '%s\n' "" counts one), so a join that
+  # failed on a single listed file still reaches the fallback below.
+  if [[ -n "$joined" ]]; then n_join="$(printf '%s\n' "$joined" | wc -l)"; fi
   if (( n_scan != n_join )); then
     # join is missing, or lost a line (an index it could not merge): trust
     # nothing from the index and give every listed file an empty index half.
