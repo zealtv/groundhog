@@ -212,25 +212,18 @@ The next tick will refire it. Groundhog has no other override; the journal is th
 
 Old `fired/<date>/` directories are pruned by `sweep` on the same retention as `out/`.
 
-## Vendoring
+## Installing and upgrading
 
-To add groundhog to another project, copy `groundhog.sh` and `README.md`
-into the project's `.groundhog/` directory, then run
-`./.groundhog/groundhog.sh init` to seed the trays:
-
-```sh
-mkdir -p <project>/.groundhog
-cp .groundhog/groundhog.sh .groundhog/README.md <project>/.groundhog/
-<project>/.groundhog/groundhog.sh init
-```
+To install groundhog, copy the `.groundhog/` directory into the project. To
+upgrade, run `./install.sh <host-dir>` from a groundhog checkout: it refreshes
+`groundhog.sh`, `README.md` and `docs/`, runs `init` (which only creates
+missing trays), and leaves `schedule/`, `out/`, `fired/` and `runtime/` alone.
 
 `init` creates `schedule/`, `out/`, and `fired/` next to itself.
-`groundhog.sh` operates on the `.groundhog/` directory it lives in, so
-each vendored copy is self-contained. `groundhog.sh` is the only file the
-instance needs; `README.md` is documentation (its link to
-`docs/runtime-contract.md` points into this repository and dangles in a
-vendored copy). `./install.sh <host-dir>` does the same copy and runs `init`.
-Neither starts a runner, enrolls an owner or writes a configuration: see
+`groundhog.sh` operates on the `.groundhog/` directory it lives in, so each
+copy is self-contained, and `groundhog.sh` is the only file the instance
+needs; `README.md` and `docs/` are documentation. Neither a copy nor
+`install.sh` starts a runner, enrolls an owner or writes a configuration: see
 [Deployment and migration](#deployment-and-migration).
 
 ## Commands
@@ -834,7 +827,7 @@ records and the pause stay in `runtime/` and are ignored by an older script.
 Replacing `.groundhog/groundhog.sh` (and `README.md`), by hand or with
 `./install.sh <host-dir>`:
 
-* **Does:** swap the script and README; run `init`, which only creates missing
+* **Does:** swap the script, README and `docs/`; run `init`, which only creates missing
   trays.
 * **Does not:** touch `schedule/`, `out/`, `fired/` or anything in `runtime/`;
   enroll, configure, start or stop anything; change an existing owner, pause or

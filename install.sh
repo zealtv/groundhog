@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # usage: ./install.sh <host-dir>
-# Lays down a .groundhog/ at the host directory — a sanctioned standalone
-# install for scopes not delivered by any bundle. Idempotent: re-running
-# repairs groundhog.sh and README.md and re-seeds missing trays (via
-# groundhog.sh init); it never touches schedule/out/fired contents or
-# runtime/. The script is replaced by a temp file plus rename, so a process
-# already running keeps the old file (bash reads its script lazily); only a
-# runner started afterwards uses the new one. Stopping a runner first remains
-# the way to be sure which version runs.
+# Upgrades the .groundhog/ at the host directory (it also makes one if absent).
+# To install, copy the .groundhog/ directory; this script is the upgrade path.
+# It refreshes what groundhog ships (groundhog.sh, README.md,
+# docs/runtime-contract.md), seeds what is absent (the trays, via
+# groundhog.sh init), and never touches schedule/, out/ or fired/ contents or
+# runtime/. Re-running changes nothing. The script is replaced by a temp file
+# plus rename, so a process already running keeps the old file (bash reads its
+# script lazily); only a runner started afterwards uses the new one. Stopping
+# a runner first remains the way to be sure which version runs.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,11 +17,14 @@ target="${1:?usage: install.sh <host-dir>}"
 
 dest="$target/.groundhog"
 mkdir -p "$dest"
-tmp="$(mktemp "$dest/.groundhog.sh.XXXXXX")"
-trap 'rm -f "$tmp"' EXIT
-cp -f "$REPO_DIR/.groundhog/groundhog.sh" "$tmp"
-chmod 755 "$tmp"
-mv -f "$tmp" "$dest/groundhog.sh"
+# Source and destination can be the same file (./install.sh .): skip the copy.
+if [ ! "$REPO_DIR/.groundhog/groundhog.sh" -ef "$dest/groundhog.sh" ]; then
+  tmp="$(mktemp "$dest/.groundhog.sh.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+  cp -f "$REPO_DIR/.groundhog/groundhog.sh" "$tmp"
+  chmod 755 "$tmp"
+  mv -f "$tmp" "$dest/groundhog.sh"
+fi
 [ "$REPO_DIR/.groundhog/README.md" -ef "$dest/README.md" ] ||
   cp -f "$REPO_DIR/.groundhog/README.md" "$dest/README.md"
 mkdir -p "$dest/docs"

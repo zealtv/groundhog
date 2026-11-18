@@ -15,6 +15,7 @@
 #  10  authorized non-interactive token reuse
 #  11  stopped-but-owned, explicit release, re-enroll
 #  12  install.sh starts and enrolls nothing
+#  13  install.sh upgrades a copied, customised .groundhog/
 #
 # Every runner is stopped before its part ends; consumers are /bin/sh scripts.
 . "$(dirname "$0")/lib.sh"
@@ -287,5 +288,36 @@ assert_eq "...and no runtime state of any kind (only the lock files init takes)"
 assert_eq "...no process was left running" "" "$(pgrep -f "$host/.groundhog/groundhog.sh" || true)"
 GHD="$host/.groundhog"; status_to "$out"
 assert_eq "...status: unowned, unpaused, stopped" 'null false "stopped"' "$(jget "$out" owner) $(jget "$out" paused) $(jget "$out" runner.state)"
+
+# --- 13. install.sh upgrades a copied, customised .groundhog/ -----------------------------------
+host="$T_TMP/host13"; mkdir -p "$host"
+cp -R "$T_REPO_DIR/.groundhog" "$host/.groundhog"
+printf 'older script\n' > "$host/.groundhog/groundhog.sh"
+printf 'older readme\n' > "$host/.groundhog/README.md"
+printf 'older contract\n' > "$host/.groundhog/docs/runtime-contract.md"
+mkdir -p "$host/.groundhog/runtime"
+printf 'schedule item\n' > "$host/.groundhog/schedule/daily/job.md"
+printf 'output\n' > "$host/.groundhog/out/result-2026-01-01"
+mkdir -p "$host/.groundhog/fired/2026-01-01"
+printf 'fired\n' > "$host/.groundhog/fired/2026-01-01/job"
+printf 'runtime note\n' > "$host/.groundhog/runtime/custom.txt"
+host_files() { (cd "$host/.groundhog" && find . -type f ! -name "*.lock" ! -path ./groundhog.sh ! -path ./README.md ! -path ./docs/runtime-contract.md -exec cksum {} + | LC_ALL=C sort); }
+before13="$(host_files)"
+bash "$T_REPO_DIR/install.sh" "$host" >/dev/null 2>&1
+assert_eq "upgrade leaves schedule, out, fired and runtime contents byte for byte" "$before13" "$(host_files)"
+assert_eq "...refreshes the script" "" "$(cmp "$T_REPO_DIR/.groundhog/groundhog.sh" "$host/.groundhog/groundhog.sh" 2>&1)"
+assert_eq "...refreshes the README" "" "$(cmp "$T_REPO_DIR/.groundhog/README.md" "$host/.groundhog/README.md" 2>&1)"
+assert_eq "...refreshes the runtime contract" "" "$(cmp "$T_REPO_DIR/.groundhog/docs/runtime-contract.md" "$host/.groundhog/docs/runtime-contract.md" 2>&1)"
+assert_true "...and the script stays executable" test -x "$host/.groundhog/groundhog.sh"
+after13a="$(cd "$host/.groundhog" && find . -type f -exec cksum {} + | LC_ALL=C sort)"
+bash "$T_REPO_DIR/install.sh" "$host" >/dev/null 2>&1
+assert_eq "a second upgrade changes no file" "$after13a" "$(cd "$host/.groundhog" && find . -type f -exec cksum {} + | LC_ALL=C sort)"
+
+# The installer run inside its own checkout (source and destination the same file) works.
+self13="$T_TMP/self13"; mkdir -p "$self13"
+cp -R "$T_REPO_DIR/.groundhog" "$T_REPO_DIR/install.sh" "$self13/"
+(cd "$self13" && bash ./install.sh . >/dev/null 2>&1); rc=$?
+assert_eq "install.sh . inside a checkout exits 0" 0 "$rc"
+assert_eq "...and leaves the script as it was" "" "$(cmp "$T_REPO_DIR/.groundhog/groundhog.sh" "$self13/.groundhog/groundhog.sh" 2>&1)"
 
 t_finish
