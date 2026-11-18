@@ -287,6 +287,6 @@ assert_eq "...records intact" 4 "$(jget "$out" deliveries | python3 -I -c 'impor
 # --- capabilities: all seven where the host allows ---------------------------------
 new_instance
 gh capabilities --json > "$out"
-assert_eq "all eight capabilities are offered" '["status-json-v1","status-active-v1","ownership-v1","runner-v1","pause-v1","consumer-v1","delivery-v1","release-unresolved-v1"]' "$(jget "$out" capabilities)"
+assert_eq "all nine capabilities are offered" '["status-json-v1","status-active-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","consumer-v1","delivery-v1","release-unresolved-v1"]' "$(jget "$out" capabilities)"
 
 t_finish
