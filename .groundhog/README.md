@@ -318,7 +318,9 @@ $ ./groundhog.sh release --token-file /private/dir/token    # then delete the to
   a tick sees the item whole or not at all. Prepare the payload, `prompt.md` included, before the
   call. It runs the checks plain `add` runs (exit 1 for a bad `<when>` or `<item-id>` or an
   existing item, with nothing staged), prints the new path, and exits 2 for a malformed `--from`
-  (no such directory, given twice, no argument, or extra arguments). Contents are copied as
+  (no such directory, given twice, no argument, or extra arguments). Plain `add` rejects extra
+  arguments too: `add <when> <item-id> extra` exits 2 and creates nothing (Bob, 2026-11-18: "Okay,
+  let's reject them"; an older script ignores the extra and makes an empty item). Contents are copied as
   `cp -R` copies them. A staging directory left by a crash is inert; a later `add` picks a new
   name. `drop` still fails 3 while owned. An older script reads only the first two arguments of
   `add` and ignores `--from`, creating an **empty** item and printing its path, so a client finds

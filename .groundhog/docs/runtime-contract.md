@@ -341,7 +341,9 @@ mutation lock, so it waits for a tick in progress (exit 4 if the lock stays busy
 state. `add <when> <item-id> --from DIR` copies the prepared directory `DIR` into place with a single rename
 under that lock, so no tick sees the item incomplete; plain `add` makes an empty directory that the caller
 fills afterwards, which a tick can catch half-made. Exit codes: 1 for an invalid `<when>` or `<item-id>` or an
-existing item, 2 for a malformed `--from`, 4 busy, 5 unusable state, 6 I/O failure. A client finds
+existing item, 2 for a malformed `--from` or any argument beyond `<when> <item-id>` (so plain
+`add <when> <item-id> extra` exits 2 and creates nothing; Bob decided on 2026-11-18 to reject extras),
+4 busy, 5 unusable state, 6 I/O failure. A client finds
 `add-while-owned-v1` in `capabilities` before it passes `--from` or relies on `add` while owned; an older
 script ignores `--from` and creates an empty item. `drop` still refuses while owned.
 

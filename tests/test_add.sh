@@ -79,6 +79,9 @@ assert_eq "--from given twice exits 2" 2 "$(rc_of gh add daily n1 --from "$PAYLO
 assert_eq "--from with an argument trailing exits 2" 2 "$(rc_of gh add daily n1 --from "$PAYLOAD" extra)"
 assert_eq "--from= (not a form this script knows) exits 2" 2 "$(rc_of gh add daily n1 --from="$PAYLOAD")"
 assert_eq "a stray third argument exits 2 rather than making an empty item" 2 "$(rc_of gh add daily n1 surprise)"
+assert_eq "a stray third argument to plain add, with a trailing slash on <when>, exits 2" 2 "$(rc_of gh add daily/ n1 extra)"
+assert_eq "plain add with two stray arguments exits 2" 2 "$(rc_of gh add daily n1 extra more)"
+assert_eq "plain add with an empty third argument exits 2" 2 "$(rc_of gh add daily n1 "")"
 assert_contains "a malformed call explains itself" "$(cat "$T_TMP/rc.err")" "error:"
 assert_eq "none of those changed the schedule" "$before" "$(tree_hash "$GHD/schedule")"
 assert_eq "...or left anything in staging" 0 "$(staged)"
@@ -108,6 +111,7 @@ assert_eq "...and the instance is not paused" false "$(jget "$out" paused)"
 assert_eq "an existing item while owned exits 1" 1 "$(rc_of gh add daily/09 wake --from "$PAYLOAD")"
 assert_eq "a missing DIR while owned exits 2" 2 "$(rc_of gh add daily n1 --from "$T_TMP/nope")"
 assert_eq "a bad <when> while owned exits 1" 1 "$(rc_of gh add fortnightly x)"
+assert_eq "a stray third argument while owned exits 2" 2 "$(rc_of gh add daily n1 extra)"
 for c in tick init drop sweep; do
   case "$c" in drop) a=wake ;; *) a="" ;; esac
   assert_eq "$c while owned still exits 3" 3 "$(rc_of gh $c $a)"
