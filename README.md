@@ -10,6 +10,7 @@ Copy `.groundhog/` into your project:
 
 ```sh
 git clone https://github.com/zealtv/groundhog
+mkdir -p my-project
 cp -R groundhog/.groundhog my-project/
 ```
 
