@@ -3,8 +3,8 @@
 # ({at, source}, null when never recorded). Liveness only.
 . "$(dirname "$0")/lib.sh"
 
-if ! have_runtime_support; then
-  t_skip "this host has no lock helper, hash tool or durable-write tool; the runner is not offered"
+if ! have_lock_helper; then
+  t_skip "this host has no lock helper, so no tick is recorded"
   t_finish
   exit $?
 fi
@@ -45,7 +45,6 @@ for bad in "" "garbage" "2026-11-17T10:00:00Z" "2026-11-17T10:00:00Z somebody" "
   rc=0; status_to "$out" || rc=$?
   assert_eq "status exits 0 over a damaged record ($bad)" 0 "$rc"
   assert_eq "...and reports null ($bad)" null "$(jget "$out" last_tick)"
-  assert_eq "...and still consistent ($bad)" true "$(jget "$out" consistent)"
 done
 rm -f "$GHD/runtime/last_tick"; mkdir "$GHD/runtime/last_tick"
 rc=0; status_to "$out" || rc=$?
@@ -57,46 +56,45 @@ rmdir "$GHD/runtime/last_tick"
 new_instance
 gh init >/dev/null
 gh add daily nudge >/dev/null
-enroll_ok
-gh pause --token-file "$TOK" >/dev/null 2>&1
-gh release --token-file "$TOK" >/dev/null 2>&1
+gh pause >/dev/null
 status_to "$out"
-assert_eq "paused and unowned, no tick yet: null" null "$(jget "$out" last_tick)"
+assert_eq "paused, no tick yet: null" null "$(jget "$out" last_tick)"
 gh tick >/dev/null 2>&1
 assert_eq "the paused tick fired nothing" 0 "$(out_count)"
 status_to "$out"
 assert_eq "a paused standalone tick is recorded" '"standalone"' "$(jget "$out" last_tick.source)"
 
-# --- a refused standalone tick (owned) records nothing ------------------------------
+# --- a tick that fails records nothing --------------------------------------------------
 new_instance
 gh init >/dev/null
-enroll_ok
+mkdir -p "$GHD/runtime/locks"
+hold_lock "$GHD/runtime/locks/mutation.lock" 30
 rc=0; gh tick >/dev/null 2>&1 || rc=$?
-assert_eq "a standalone tick on an owned instance is refused" 3 "$rc"
+assert_eq "a tick that cannot take the mutation lock exits 4" 4 "$rc"
+kill "$HOLD_PID" 2>/dev/null; wait "$HOLD_PID" 2>/dev/null
 status_to "$out"
 assert_eq "...and leaves no record" null "$(jget "$out" last_tick)"
 
-# --- a runner's tick, paused or not --------------------------------------------------
+# --- the run loop's ticks, paused or not ---------------------------------------------
 new_instance
 gh init >/dev/null
 gh add daily nudge >/dev/null
-enroll_ok
-gh pause --token-file "$TOK" >/dev/null 2>&1
-start_runner --token-file "$TOK" --interval-seconds 1
-wait_for "the paused runner reports running" 80 runner_is running
+gh pause >/dev/null
+start_loop --interval-seconds 1
 lt_runner() { status_to "$out"; [ "$(jget "$out" last_tick.source)" = '"runner"' ]; }
-wait_for "a paused runner's cycle records a tick" 60 lt_runner
+wait_for "a paused loop's tick is recorded" 60 lt_runner
 assert_eq "...and fired nothing" 0 "$(out_count)"
 at1="$(jget "$out" last_tick.at)"
-is_utc "$at1" && t_ok || t_fail "runner last_tick.at is a UTC time" "$at1"
+is_utc "$at1" && t_ok || t_fail "loop last_tick.at is a UTC time" "$at1"
 moved() { status_to "$out"; [ "$(jget "$out" last_tick.at)" != "$at1" ]; }
-wait_for "later cycles move the time" 80 moved
-gh resume --token-file "$TOK" >/dev/null 2>&1
-wait_for "after resume the runner fires" 60 out_is 1
-assert_eq "an unpaused runner tick keeps source runner" '"runner"' "$(jget "$out" last_tick.source)"
-gh stop --token-file "$TOK" >/dev/null 2>&1
-wait_exit "the runner exited" 50 "$RUNNER_PID"
+wait_for "later ticks move the time" 80 moved
+gh resume >/dev/null 2>&1
+wait_for "after resume the loop fires" 60 out_is 1
+assert_eq "an unpaused loop tick keeps source runner" '"runner"' "$(jget "$out" last_tick.source)"
+kill -INT "$LOOP_PID" 2>/dev/null
+wait_exit "the loop exits on SIGINT" 50 "$LOOP_PID"
+assert_eq "...with status 0" 0 "$WAIT_RC"
 status_to "$out"
-assert_eq "the record outlives the runner" '"runner"' "$(jget "$out" last_tick.source)"
+assert_eq "the record outlives the loop" '"runner"' "$(jget "$out" last_tick.source)"
 
 t_finish

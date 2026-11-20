@@ -29,20 +29,16 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v7
-        with:
-          # test_e2e.sh runs the pre-runtime script (252b705) from history; a
-          # shallow clone lacks it and the case skips.
-          fetch-depth: 0
       - name: Newer bash on macOS
         if: matrix.bash == 'brew'
         run: brew list bash >/dev/null 2>&1 || brew install bash
       - name: Tools the harness uses
         run: |
-          # The harness needs python3 and, for the runner, a lock helper (util-linux
+          # The harness needs python3 and, for an item's run, a lock helper (util-linux
           # flock or perl) and a session helper (perl or setsid); jq is optional.
           # All of these come with the runner images. Print what is there, and
           # fail early on python3 and perl, the two the harness cannot do without.
-          for t in python3 perl jq flock setsid sha256sum shasum od ps; do
+          for t in python3 perl jq flock setsid od ps pgrep; do
             if command -v "$t" >/dev/null 2>&1; then echo "$t: $(command -v "$t")"; else echo "$t: absent"; fi
           done
           command -v python3 >/dev/null && command -v perl >/dev/null

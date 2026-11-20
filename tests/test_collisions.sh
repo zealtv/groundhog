@@ -1,80 +1,41 @@
 #!/usr/bin/env bash
 # Output collisions: every way two firings can claim one out/ name, and what the
-# status and the lint/add notes say about each. The contract accepts the legacy
-# no-overwrite rule (the later firing is recorded but not delivered); these tests
-# pin that it is never silent.
+# record, status and the lint/add notes say about each. The legacy no-overwrite
+# rule stands (the later firing is marked fired but not delivered, so its run
+# never runs); these tests pin that it is never silent where a record exists.
 . "$(dirname "$0")/lib.sh"
 
-if ! have_runtime_support; then
-  t_skip "this host lacks the runner's tools"
-  t_finish
-  exit $?
-fi
-
 out="$T_TMP/c.json"
-run_once() { # run for a moment, then stop (the first cycle runs immediately)
-  start_runner --token-file "$TOK" --interval-seconds 1
-  wait_for "the runner is up" 80 runner_is running
-  sleep "${1:-1.5}"
-  gh stop --token-file "$TOK" >/dev/null 2>&1
-  wait_exit "the runner exited" 50 "$RUNNER_PID"
-}
 dow="$(date +%a | tr '[:upper:]' '[:lower:]')"
 td="$(today)"
-diag_has() { jget "$out" diagnostics | grep -q "$1"; }
+ncoll() { jget "$out" diagnostics | grep -o '"code":"out_collision"' | wc -l | tr -d ' '; }
 
-# --- 1. a standalone tick on a previously supervised instance -------------------
-# (released, then ticked by hand: the collision used to reach stderr only)
+# --- 1. one name, three items (daily, weekly, one-shot), each with its own run ------
 new_instance; gh init >/dev/null
-gh add daily foo >/dev/null; echo d > "$GHD/schedule/daily/foo/n.txt"
-enroll_ok; gh resume --token-file "$TOK" >/dev/null
-run_once
-gh release --token-file "$TOK" >/dev/null 2>&1
-gh add "weekly/$dow" foo >/dev/null 2>&1; echo w > "$GHD/schedule/weekly/$dow/foo/n.txt"
+for w in daily "weekly/$dow" once; do
+  with_run "$w" foo "touch \"$T_TMP/ran-\$(cat \"\$1/which\")\""
+  echo "$w" | tr / - > "$GHD/schedule/$w/foo/which"
+done
 err="$(gh tick 2>&1 >/dev/null)"
-assert_contains "the standalone tick still warns on stderr" "$err" "already exists in out/"
-assert_eq "...and did not overwrite the delivery" d "$(cat "$GHD/out/foo-$td/n.txt")"
+assert_contains "the later firings warn on stderr" "$err" "already exists in out/"
 status_to "$out"
-assert_true "status now carries the out_collision for it" diag_has out_collision
-assert_contains "...naming the schedule item that lost" "$(jget "$out" diagnostics)" "schedule/weekly/$dow/foo"
-assert_eq "...against the one delivery that owns the name" 1 "$(jq_py where "$out" deliveries path "\"out/foo-$td\"" id | wc -l | tr -d ' ')"
+assert_eq "one delivery owns the name" 1 "$(jq_py where "$out" deliveries path "\"out/foo-$td\"" id | wc -l | tr -d ' ')"
+assert_eq "...the first walked item won (the others left it untouched)" daily "$(cat "$GHD/out/foo-$td/which")"
+assert_eq "...its record holds one collision line per later firing" 2 "$(rec_count "foo-$td" collision)"
+assert_eq "...and status shows each as an out_collision" 2 "$(ncoll)"
+assert_contains "...naming the weekly item" "$(jget "$out" diagnostics)" "schedule/weekly/$dow/foo"
+assert_contains "...and the one-shot" "$(jget "$out" diagnostics)" "schedule/once/foo"
+assert_contains "...saying its run never ran" "$(jget "$out" diagnostics)" "its run never ran"
+assert_true "every occurrence is marked fired" test -e "$GHD/fired/$td/weekly/$dow/foo" -a -e "$GHD/fired/$td/once/foo" -a -e "$GHD/fired/$td/daily/foo"
+assert_false "the one-shot's source is gone, only the diagnostic remains of it" test -e "$GHD/schedule/once/foo"
+if have_handlers; then
+  wait_for "the winner's run finished" 50 exited "foo-$td" 1
+  assert_true "...the winner's run ran" test -e "$T_TMP/ran-daily"
+  assert_false "...the losers' runs never did" test -e "$T_TMP/ran-weekly-$dow" -o -e "$T_TMP/ran-once"
+  assert_eq "...and it ran once" 1 "$(rec_count "foo-$td" start)"
+fi
 
-# --- 2. an out path reused after the first delivery vanished ----------------------
-# An old record for the path is missing; a collision on the reused name belongs to
-# the live delivery, not to that record (a sweep of the missing one would take the
-# evidence with it). The old record is hand-written with the smallest possible id,
-# so a lookup that takes the first match finds it first.
-new_instance; gh init >/dev/null
-gh add daily foo >/dev/null; echo d > "$GHD/schedule/daily/foo/n.txt"
-mkdir -p "$GHD/schedule/weekly/$dow/foo" "$GHD/runtime/deliveries"
-echo w > "$GHD/schedule/weekly/$dow/foo/n.txt"
-old=d-0000000000000000
-printf '{"schema_version":1,"id":"%s","path":"out/foo-%s","origin":"runtime","schedule_path":"schedule/daily/foo","occurrence":{"date":"%s","slot":null},"state":"missing","reason":"path_missing","registered_at":"2026-11-10T00:00:00Z","fired_marker":null,"attempts":[],"collisions":[]}\n' "$old" "$td" "$td" > "$GHD/runtime/deliveries/$old.json"
-enroll_ok; gh resume --token-file "$TOK" >/dev/null
-run_once 2
-status_to "$out"
-assert_eq "path reuse: the old generation stays missing" '"missing"' "$(jq_py dget "$out" id "$old" state)"
-oldrec="$GHD/runtime/deliveries/$old.json"; [ -f "$oldrec" ] || oldrec="$GHD/runtime/deliveries/done/$old.json"   # the runner files a missing record under done/
-assert_eq "...and keeps no collision" '[]' "$(grep -o '"collisions":\[[^]]*\]' "$oldrec" | sed 's/"collisions"://')"
-assert_true "...the live delivery's record holds the weekly item's collision" \
-  sh -c "grep -l 'weekly/$dow/foo' '$GHD'/runtime/deliveries/*.json | grep -v $old >/dev/null"
-assert_contains "...and status reports it" "$(jget "$out" diagnostics)" out_collision
-
-# --- 3. a reused path whose older record is accepted: one handoff, not two --------
-# (the consumer took the first delivery away; the name fires again later)
-new_instance; gh init >/dev/null
-gh add daily foo >/dev/null; echo d > "$GHD/schedule/daily/foo/n.txt"
-mkdir -p "$GHD/runtime/deliveries"
-old=d-0000000000000000
-printf '{"schema_version":1,"id":"%s","path":"out/foo-%s","origin":"runtime","schedule_path":"schedule/daily/foo","occurrence":{"date":"%s","slot":null},"state":"accepted","reason":null,"registered_at":"2026-11-10T00:00:00Z","fired_marker":null,"attempts":[],"collisions":[]}\n' "$old" "$td" "$td" > "$GHD/runtime/deliveries/$old.json"
-enroll_ok; gh resume --token-file "$TOK" >/dev/null
-consumer_script consumer.sh 'echo "$GROUNDHOG_DELIVERY_ID" >> "$PWD/calls.txt"'
-write_config /bin/sh "$CONS"
-run_once 3
-assert_eq "reused path: the new delivery is handed off exactly once" 1 "$(lines "$INST/calls.txt")"
-assert_eq "...the old accepted record is untouched" '"accepted"' "$(jq_py dget "$(status_to "$out"; echo "$out")" id "$old" state)"
-
-# --- 4. lint and add say when two items would share an out name --------------------
+# --- 2. lint and add say when two items would share an out name --------------------
 new_instance; gh init >/dev/null
 gh add daily/09 foo >/dev/null 2>&1
 err="$(gh add daily/17 foo 2>&1 >/dev/null)"; rc=$?
@@ -90,31 +51,18 @@ assert_contains "lint notes the shared id on stderr" "$lerr" "item id 'foo' exis
 assert_not_contains "...once, for foo only" "$lerr" "'bar'"
 assert_eq "...and its stdout and exit status are unchanged" "schedule is clean 0" "$lout $lrc"
 
-# --- 5. the runner: one name, three items (daily, weekly, one-shot) ---------------
-new_instance; gh init >/dev/null
-for w in daily "weekly/$dow" once; do gh add "$w" foo >/dev/null 2>&1; echo "$w" > "$GHD/schedule/$w/foo/n.txt"; done
-enroll_ok; gh resume --token-file "$TOK" >/dev/null
-run_once 2
-status_to "$out"
-assert_eq "one delivery owns the name" 1 "$(jq_py where "$out" deliveries path "\"out/foo-$td\"" id | wc -l | tr -d ' ')"
-assert_eq "...the first walked item won (the others left it untouched)" daily "$(cat "$GHD/out/foo-$td/n.txt")"
-assert_eq "...one out_collision per later firing" 2 "$(jget "$out" diagnostics | grep -o '"code":"out_collision"' | wc -l | tr -d ' ')"
-assert_true "...every occurrence is marked fired" test -e "$GHD/fired/$td/weekly/$dow/foo" -a -e "$GHD/fired/$td/once/foo" -a -e "$GHD/fired/$td/daily/foo"
-assert_false "...and the one-shot's source is gone, only the diagnostic remains of it" test -e "$GHD/schedule/once/foo"
-assert_contains "...which names it" "$(jget "$out" diagnostics)" "schedule/once/foo"
-
-# --- 6. the same id in two every/ buckets --------------------------------------------
+# --- 3. the same id in two every/ buckets ----------------------------------------------
 new_instance; gh init >/dev/null
 gh add every/1h foo >/dev/null 2>&1; gh add every/30m foo >/dev/null 2>&1
-enroll_ok; gh resume --token-file "$TOK" >/dev/null
 set_clock "2026-11-15 14:05:00"      # both buckets have a slot at 14:00
-run_once 2
+gh tick >/dev/null 2>&1
 clear_clock
 status_to "$out"
 assert_eq "every/1h and every/30m share the slot name: one delivery" 1 "$(jq_py col "$out" deliveries path | wc -l | tr -d ' ')"
-assert_contains "...and the later bucket's firing is reported" "$(jget "$out" diagnostics)" out_collision
+assert_eq "...and the later bucket's firing is reported" 1 "$(ncoll)"
+assert_contains "...with its slot" "$(jget "$out" diagnostics)" "slot 14-00"
 
-# --- 7. the same name on different dates never collides -------------------------------
+# --- 4. the same name on different dates never collides ---------------------------------
 new_instance; gh init >/dev/null
 gh add daily foo >/dev/null
 set_clock "2026-11-14 10:00:00"; gh tick >/dev/null
@@ -122,31 +70,44 @@ set_clock "2026-11-15 10:00:00"; gh tick >/dev/null
 assert_eq "two days, two out names" "foo-2026-11-14 foo-2026-11-15" "$(ls "$GHD/out" | tr '\n' ' ' | sed 's/ $//')"
 clear_clock
 
-# --- 8. a non-directory squatting on the name -----------------------------------------
-# The firing is recorded and not delivered (legacy no-overwrite). No delivery can
-# stand for a file, so the status shows the entry as a diagnostic, and the runner
-# logs the collision.
+# --- 5. a non-directory squatting on the name -------------------------------------------
+# No delivery can stand for a file, so status shows the entry as a diagnostic.
 new_instance; gh init >/dev/null
 gh add daily foo >/dev/null
 ln -s /nonexistent/target "$GHD/out/foo-$td"
-enroll_ok; gh resume --token-file "$TOK" >/dev/null
-run_once 2
+err="$(gh tick 2>&1 >/dev/null)"
 status_to "$out"
 assert_true "the occurrence is marked fired" test -e "$GHD/fired/$td/daily/foo"
 assert_true "...the squatter is untouched" test -L "$GHD/out/foo-$td"
-assert_contains "...status names the entry" "$(jget "$out" diagnostics)" out_entry_not_directory
-assert_contains "...and the runner logged the collision" "$(cat "$RUN_ERR")" "out_collision"
+assert_contains "...tick warned" "$err" "already exists in out/"
+assert_contains "...and status names the entry" "$(jget "$out" diagnostics)" out_entry_not_directory
 
-# --- 9. re-arming an occurrence whose entry is still in out/ ---------------------------
+# --- 6. a directory made by hand (no record) squatting on the name -----------------------
+# There is no record to carry the collision: the stderr warning is all (the known gap).
 new_instance; gh init >/dev/null
-gh add daily foo >/dev/null; echo d > "$GHD/schedule/daily/foo/n.txt"
-enroll_ok; gh resume --token-file "$TOK" >/dev/null
-run_once
+with_run daily foo 'touch "$1/ran"'
+mkdir -p "$GHD/out/foo-$td"
+err="$(gh tick 2>&1 >/dev/null)"
+assert_contains "a hand-made squatter: tick warns" "$err" "already exists in out/"
+assert_false "...writes no record into it" test -e "$(rec "foo-$td")"
+sleep 0.5
+assert_false "...and runs nothing" test -e "$GHD/out/foo-$td/ran"
+assert_eq "...status lists the entry as unrecorded" '"unrecorded"' "$(dstate "foo-$td")"
+assert_true "...and the occurrence is marked fired" test -e "$GHD/fired/$td/daily/foo"
+
+# --- 7. re-arming an occurrence whose entry is still in out/ -----------------------------
+new_instance; gh init >/dev/null
+with_run daily foo 'echo once'
+gh tick >/dev/null 2>&1
+have_handlers && wait_for "the first run finished" 50 exited "foo-$td" 1
 rm "$GHD/fired/$td/daily/foo"
-run_once
+gh tick >/dev/null 2>&1
 status_to "$out"
 assert_eq "re-arm: still one delivery for the name" 1 "$(jq_py where "$out" deliveries path "\"out/foo-$td\"" id | wc -l | tr -d ' ')"
-assert_contains "...and the refire is reported as a collision" "$(jget "$out" diagnostics)" out_collision
+assert_eq "...the refire is reported as a collision" 1 "$(ncoll)"
 assert_true "...with the marker back" test -e "$GHD/fired/$td/daily/foo"
+if have_handlers; then
+  assert_eq "...and the delivery's run was not started again" 1 "$(rec_count "foo-$td" start)"
+fi
 
 t_finish

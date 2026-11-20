@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# `add` while an instance is owned, and the atomic `add <when> <item-id> --from DIR`
-# (capability add-while-owned-v1, accepted 2026-11-18): who may add, what it
+# The atomic `add <when> <item-id> --from DIR` (capability add-from-v1): what it
 # writes, every malformed call, a held lock, and a tick racing a stream of
-# `--from` adds, standalone and under a runner, which must never fire a partial item.
+# `--from` adds, standalone and from the `run` loop, which must never fire a
+# partial item.
 # test_runtime_gate.sh covers `add` on a host with no lock helper.
 . "$(dirname "$0")/lib.sh"
 
-if ! have_runtime_support; then
-  t_skip "this host has no lock helper, hash tool or durable-write tool; see the no-helper case in test_runtime_gate.sh"
+if ! have_lock_helper; then
+  t_skip "this host has no lock helper; see the no-helper case in test_runtime_gate.sh"
   t_finish
   exit $?
 fi
@@ -17,7 +17,7 @@ rc_of() { local rc=0; "$@" >"$T_TMP/rc.out" 2>"$T_TMP/rc.err" || rc=$?; echo "$r
 staged() { # how many entries sit under runtime/staging (0 when the directory is absent)
   find "$GHD/runtime/staging" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '
 }
-same_tree() { diff -r "$1" "$2" >/dev/null 2>&1; }
+same_tree() { diff -r -x .groundhog-record "$1" "$2" >/dev/null 2>&1; }   # a delivery also holds its record
 
 # A prepared payload: a nested directory, a dotfile, a few files and prompt.md.
 PAYLOAD="$T_TMP/payload"
@@ -31,9 +31,9 @@ PAYLOAD_SUM="$(tree_hash "$PAYLOAD")"
 # --- the capability ---------------------------------------------------------------------
 new_instance
 gh capabilities --json > "$out"
-assert_contains "capabilities lists add-while-owned-v1" "$(jget "$out" capabilities)" '"add-while-owned-v1"'
+assert_contains "capabilities lists add-from-v1" "$(jget "$out" capabilities)" '"add-from-v1"'
 
-# --- unowned: plain add is as it was ------------------------------------------------------
+# --- plain add is as it was ------------------------------------------------------
 gh init >/dev/null
 p="$(gh add daily plain 2>"$T_TMP/e")"; rc=$?
 assert_eq "plain add exits 0" 0 "$rc"
@@ -44,7 +44,7 @@ assert_eq "plain add of an existing item exits 1" 1 "$(rc_of gh add daily plain)
 assert_eq "plain add with a bad <when> exits 1" 1 "$(rc_of gh add fortnightly x)"
 assert_eq "plain add with a bad id exits 1" 1 "$(rc_of gh add daily 'bad id')"
 
-# --- unowned: --from ---------------------------------------------------------------------
+# --- --from ---------------------------------------------------------------------
 p="$(gh add daily/09 wake --from "$PAYLOAD" 2>"$T_TMP/e")"; rc=$?
 assert_eq "add --from exits 0" 0 "$rc"
 assert_eq "...prints the new path alone" "$GHD/schedule/daily/09/wake" "$p"
@@ -65,7 +65,7 @@ gh add daily viasym --from "$T_TMP/payload-link" >/dev/null
 assert_true "a symlink to a directory works as DIR, and the item is a real copy" test ! -L "$GHD/schedule/daily/viasym" -a -f "$GHD/schedule/daily/viasym/prompt.md"
 assert_true "...with the symlink's contents" same_tree "$PAYLOAD" "$GHD/schedule/daily/viasym"
 
-# --- unowned: refusals change nothing ------------------------------------------------------
+# --- refusals change nothing ------------------------------------------------------
 before="$(tree_hash "$GHD/schedule")"
 assert_eq "--from an existing item exits 1" 1 "$(rc_of gh add daily/09 wake --from "$PAYLOAD")"
 assert_eq "--from with a bad <when> exits 1" 1 "$(rc_of gh add fortnightly x --from "$PAYLOAD")"
@@ -87,60 +87,10 @@ assert_eq "none of those changed the schedule" "$before" "$(tree_hash "$GHD/sche
 assert_eq "...or left anything in staging" 0 "$(staged)"
 assert_eq "...and DIR is intact" "$PAYLOAD_SUM" "$(tree_hash "$PAYLOAD")"
 
-# --- owned: add works, writes no state, and the rest still refuses ----------------------------
-new_instance
-gh init >/dev/null
-enroll_ok owner-session
-state_before="$(cat "$GHD/runtime/state.json")"
-p="$(gh add daily plain 2>"$T_TMP/e")"; rc=$?
-assert_eq "plain add while owned exits 0, with no token" 0 "$rc"
-assert_eq "...and prints the path" "$GHD/schedule/daily/plain" "$p"
-assert_true "...making an empty directory" test -d "$GHD/schedule/daily/plain" -a -z "$(ls -A "$GHD/schedule/daily/plain")"
-p="$(gh add daily/09 wake --from "$PAYLOAD" 2>"$T_TMP/e")"; rc=$?
-assert_eq "add --from while owned exits 0, with no token" 0 "$rc"
-assert_eq "...and prints the path" "$GHD/schedule/daily/09/wake" "$p"
-assert_true "...the item is the whole payload" same_tree "$PAYLOAD" "$GHD/schedule/daily/09/wake"
-assert_eq "...DIR is intact" "$PAYLOAD_SUM" "$(tree_hash "$PAYLOAD")"
-assert_eq "...nothing is left in staging" 0 "$(staged)"
-assert_eq "add while owned wrote no state: state.json is byte for byte as it was" "$state_before" "$(cat "$GHD/runtime/state.json")"
-status_to "$out"
-assert_eq "...the owner stays" '"owner-session"' "$(jget "$out" owner.label)"
-assert_eq "...the revision stays" 1 "$(jget "$out" revision)"
-assert_eq "...the runner stays stopped" '"stopped"' "$(jget "$out" runner.state)"
-assert_eq "...and the instance is not paused" false "$(jget "$out" paused)"
-assert_eq "an existing item while owned exits 1" 1 "$(rc_of gh add daily/09 wake --from "$PAYLOAD")"
-assert_eq "a missing DIR while owned exits 2" 2 "$(rc_of gh add daily n1 --from "$T_TMP/nope")"
-assert_eq "a bad <when> while owned exits 1" 1 "$(rc_of gh add fortnightly x)"
-assert_eq "a stray third argument while owned exits 2" 2 "$(rc_of gh add daily n1 extra)"
-for c in tick init drop sweep; do
-  case "$c" in drop) a=wake ;; *) a="" ;; esac
-  assert_eq "$c while owned still exits 3" 3 "$(rc_of gh $c $a)"
-done
-assert_contains "...and the refusal names add as the exception" "$(cat "$T_TMP/rc.err")" "other than add"
-assert_true "drop while owned left the item" test -d "$GHD/schedule/daily/09/wake"
-assert_eq "a malformed call while owned changed nothing: state" "$state_before" "$(cat "$GHD/runtime/state.json")"
-
-# owned and paused
-gh pause --token-file "$TOK" >/dev/null 2>&1
-state_paused="$(cat "$GHD/runtime/state.json")"
-assert_eq "add --from while owned and paused exits 0" 0 "$(rc_of gh add daily/11 pausedwake --from "$PAYLOAD")"
-assert_true "...and lands whole" same_tree "$PAYLOAD" "$GHD/schedule/daily/11/pausedwake"
-assert_eq "...without touching the state" "$state_paused" "$(cat "$GHD/runtime/state.json")"
-gh resume --token-file "$TOK" >/dev/null 2>&1
-
-# a runtime state that cannot be read still refuses: exit 5, nothing added or staged
-printf 'not json' > "$GHD/runtime/state.json"
-sched_before="$(tree_hash "$GHD/schedule")"
-assert_eq "add with unusable state exits 5" 5 "$(rc_of gh add daily n5)"
-assert_eq "add --from with unusable state exits 5" 5 "$(rc_of gh add daily n5 --from "$PAYLOAD")"
-assert_eq "...and added nothing" "$sched_before" "$(tree_hash "$GHD/schedule")"
-assert_eq "...leaving nothing in staging" 0 "$(staged)"
-printf '%s' "$state_paused" > "$GHD/runtime/state.json"
-
 # --- a held mutation lock: exit 4, nothing lands, nothing stays staged ---------------------------
 new_instance
 gh init >/dev/null
-enroll_ok
+mkdir -p "$GHD/runtime/locks"
 hold_lock "$GHD/runtime/locks/mutation.lock" 120
 ( rc=0; gh add daily/09 busy --from "$PAYLOAD" >/dev/null 2>"$out.e1" || rc=$?; echo "$rc" > "$out.r1" ) &
 ( rc=0; gh add daily busyplain >/dev/null 2>"$out.e2" || rc=$?; echo "$rc" > "$out.r2" ) &
@@ -201,7 +151,7 @@ adder() { # N — add N items from BIG; writes the number of failed adds to $T_T
   echo "$fails" > "$T_TMP/adder.fail"
 }
 
-# standalone ticks, unowned
+# standalone ticks
 new_instance
 gh init >/dev/null
 N=20
@@ -221,21 +171,20 @@ check_out_whole "$N"
 assert_eq "...and nothing is left in the schedule" 0 "$(find "$GHD/schedule/once" -mindepth 1 | wc -l | tr -d ' ')"
 assert_eq "...or in staging" 0 "$(staged)"
 
-# a runner's ticks, owned
+# the run loop's ticks
 new_instance
 gh init >/dev/null
-enroll_ok
-# The runner ticks once a second at best, so the copy must take a good part of a second to be caught.
+# The loop ticks once a second at best, so the copy must take a good part of a second to be caught.
 mkbig 5000
 N=12
 rm -f "$T_TMP/adder.fail"
-start_runner --token-file "$TOK" --interval-seconds 1
-wait_for "the runner is up" 80 runner_is running
+start_loop --interval-seconds 1
+wait_for "the loop has ticked" 80 test -s "$GHD/runtime/last_tick"
 adder "$N"
-assert_eq "no add of the stream failed while owned and ticking" 0 "$(cat "$T_TMP/adder.fail")"
+assert_eq "no add of the stream failed while the loop ticked" 0 "$(cat "$T_TMP/adder.fail")"
 wait_for "all $N items fired" 400 out_is "$N"
-gh stop --token-file "$TOK" >/dev/null 2>&1
-wait_exit "the runner exits after stop" 80 "$RUNNER_PID"
+kill -TERM "$LOOP_PID" 2>/dev/null
+wait_exit "the loop exits on SIGTERM" 80 "$LOOP_PID"
 check_out_whole "$N"
 assert_eq "...and nothing is left in the schedule" 0 "$(find "$GHD/schedule/once" -mindepth 1 | wc -l | tr -d ' ')"
 assert_eq "...or in staging" 0 "$(staged)"

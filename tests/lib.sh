@@ -23,15 +23,17 @@ T_REAL_DATE="$(command -v date)"
 T_HAVE_JQ=0
 command -v jq >/dev/null 2>&1 && T_HAVE_JQ=1
 
-# Runner processes the test started; t_finish and t_cleanup make sure none outlives it.
+# Loops and lock holders the test started; t_finish and t_cleanup make sure none outlives it.
 T_PIDS=""
-# Process groups (consumers run in sessions of their own) that t_cleanup kills.
-T_GROUPS=""
+
+# wrappers_left — pids of handler wrappers still running for this test's
+# instances (each is its own session and process-group leader).
+wrappers_left() { pgrep -f "_handle $T_TMP/" 2>/dev/null || true; }
 
 t_cleanup() {
   local p
   for p in $T_PIDS; do kill -9 "$p" 2>/dev/null || true; done
-  for p in $T_GROUPS; do kill -9 -- "-$p" 2>/dev/null || true; done
+  for p in $(wrappers_left); do kill -9 -- "-$p" 2>/dev/null || true; done
   chmod -R u+rwx "$T_TMP" 2>/dev/null || true
   rm -rf "$T_TMP"
 }
@@ -67,7 +69,10 @@ assert_not_contains() { # DESC HAYSTACK NEEDLE
 t_finish() {
   local p
   for p in $T_PIDS; do
-    if kill -0 "$p" 2>/dev/null; then t_fail "the test left a runner process behind (pid $p)"; kill -9 "$p" 2>/dev/null || true; fi
+    if kill -0 "$p" 2>/dev/null; then t_fail "the test left a process behind (pid $p)"; kill -9 "$p" 2>/dev/null || true; fi
+  done
+  for p in $(wrappers_left); do
+    t_fail "the test left a run behind (wrapper pid $p)"; kill -9 -- "-$p" 2>/dev/null || true
   done
   printf '%s: %d passed, %d failed, %d skipped\n' "$(basename "$0")" "$T_PASS" "$T_FAIL" "$T_SKIP"
   [ "$T_FAIL" -eq 0 ]
@@ -186,59 +191,24 @@ age_tree() {
   find "$1" -exec touch -h -t 202001010000 {} + 2>/dev/null || find "$1" -exec touch -t 202001010000 {} + 2>/dev/null
 }
 
-# --- runtime support ---------------------------------------------------------
-# have_runtime_support — does this host have what the script needs for the
-# runner (a lock helper, a hash tool, durable writes)? Mirrors rt_detect.
-have_runtime_support() {
-  local lock=0 hash=0 sync=0 v
+# --- host support ------------------------------------------------------------
+# have_lock_helper — util-linux flock(1), or perl with Fcntl (mirrors rt_detect).
+have_lock_helper() {
+  local v
   if command -v flock >/dev/null 2>&1; then
-    v="$(flock --version 2>&1 || true)"; case "$v" in *util-linux*) lock=1 ;; esac
+    v="$(flock --version 2>&1 || true)"; case "$v" in *util-linux*) return 0 ;; esac
   fi
-  if [ "$lock" -eq 0 ] && command -v perl >/dev/null 2>&1 && perl -MFcntl=:flock -e 'exit 0' >/dev/null 2>&1; then lock=1; fi
-  for v in sha256sum shasum openssl; do command -v "$v" >/dev/null 2>&1 && hash=1; done
-  if command -v perl >/dev/null 2>&1 && perl -MIO::Handle -e 'exit 0' >/dev/null 2>&1; then sync=1
-  elif command -v sync >/dev/null 2>&1; then sync=1; fi
-  [ "$lock" -eq 1 ] && [ "$hash" -eq 1 ] && [ "$sync" -eq 1 ] && [ -r /dev/urandom ]
+  command -v perl >/dev/null 2>&1 && perl -MFcntl=:flock -e 'exit 0' >/dev/null 2>&1
 }
-
-# --- runners, tokens and locks -----------------------------------------------
-T_RUNS=0
-RUNNER_PID=""
-RUN_OUT=""
-RUN_ERR=""
-T_TOKDIR="$T_TMP/tokens"
-mkdir -p "$T_TOKDIR"
-chmod 700 "$T_TOKDIR"
-T_TOKENS=0
-
-# new_token_path — sets TOK to a fresh absent path in the private token directory.
-new_token_path() {
-  T_TOKENS=$((T_TOKENS + 1))
-  TOK="$T_TOKDIR/token$T_TOKENS"
+# have_isolation — can this host start a run in a session of its own?
+have_isolation() {
+  if command -v perl >/dev/null 2>&1 && perl -MPOSIX -e 'exit 0' >/dev/null 2>&1; then return 0; fi
+  command -v setsid >/dev/null 2>&1
 }
+# have_handlers — capability handlers-v1 on this host.
+have_handlers() { have_lock_helper && have_isolation; }
 
-# enroll_ok [LABEL] — enroll the current instance; sets TOK.
-enroll_ok() {
-  new_token_path
-  gh enroll --owner-label "${1:-test-session}" --token-file "$TOK" >/dev/null 2>"$T_TMP/enroll.err" \
-    || { t_fail "enroll_ok failed" "$(cat "$T_TMP/enroll.err")"; return 1; }
-}
-
-# start_runner ARGS… — `run` in the background of the current instance. Sets
-# RUNNER_PID, RUN_OUT, RUN_ERR. Job control gives it its own process group and
-# default signal handling, so INT reaches it as it would from a terminal (a
-# plain background job of a non-interactive shell ignores SIGINT).
-start_runner() {
-  T_RUNS=$((T_RUNS + 1))
-  RUN_OUT="$T_TMP/runner$T_RUNS.out"
-  RUN_ERR="$T_TMP/runner$T_RUNS.err"
-  set -m
-  "$TEST_BASH" "$GHD/groundhog.sh" run "$@" > "$RUN_OUT" 2> "$RUN_ERR" &
-  RUNNER_PID=$!
-  set +m
-  T_PIDS="$T_PIDS $RUNNER_PID"
-}
-
+# --- waiting -------------------------------------------------------------------
 # wait_for DESC TRIES COMMAND… — poll every 0.1s, up to TRIES times.
 wait_for() {
   local desc="$1" tries="$2" i=0
@@ -270,10 +240,7 @@ wait_exit() {
   return 1
 }
 
-# runner_state — the runner state `status` reports right now.
-runner_state() { status_to "$T_TMP/rs.json" && jget "$T_TMP/rs.json" runner.state; }
-runner_is() { [ "$(runner_state)" = "\"$1\"" ]; }
-
+# --- locks -----------------------------------------------------------------------
 # lock_is_free FILE — can another process take the lock right now? (flock(2),
 # the same family the script uses.)
 lock_is_free() {
@@ -284,6 +251,7 @@ try:
 except OSError:
     sys.exit(1)' "$1"
 }
+lock_is_held() { ! lock_is_free "$1"; }
 
 # hold_lock FILE SECONDS — hold the lock from a background process. Sets
 # HOLD_PID after the lock is taken.
@@ -301,75 +269,66 @@ time.sleep(float(sys.argv[2]))' "$1" "$2" "$ready" &
   wait_for "lock holder ready" 50 test -e "$ready"
 }
 
+# --- out/, records and runs ---------------------------------------------------------
 # out_count — number of entries in the instance's out/.
 out_count() { find "$GHD/out" -mindepth 1 -maxdepth 1 2>/dev/null | wc -l | tr -d ' '; }
 out_is() { [ "$(out_count)" = "$1" ]; }
+today() { date +%Y-%m-%d; }
 
-# --- consumers and deliveries --------------------------------------------------
-# have_isolation — can this host start a consumer in a session of its own?
-have_isolation() {
-  if command -v perl >/dev/null 2>&1 && perl -MPOSIX -e 'exit 0' >/dev/null 2>&1; then return 0; fi
-  command -v setsid >/dev/null 2>&1
+# with_run WHEN ID BODY — add an item whose executable `run` is a /bin/sh
+# script with BODY. Every test run writes its pid to $1/pid first, so a test
+# can find it (its process group is the wrapper's).
+with_run() {
+  gh add "$1" "$2" >/dev/null 2>&1 || { t_fail "add $1 $2"; return 1; }
+  printf '#!/bin/sh\necho $$ > "$1/pid"\n%s\n' "$3" > "$GHD/schedule/$1/$2/run"
+  chmod +x "$GHD/schedule/$1/$2/run"
 }
 
-CONS=""
-# consumer_script NAME BODY — an executable /bin/sh script in the project
-# directory (the parent of .groundhog). Sets CONS.
-consumer_script() {
-  CONS="$INST/$1"
-  printf '#!/bin/sh\n%s\n' "$2" > "$CONS"
-  chmod +x "$CONS"
-}
+# rec NAME — path of out/NAME's record; log NAME — its run's log.
+rec() { printf '%s' "$GHD/out/$1/.groundhog-record"; }
+log() { printf '%s' "$GHD/out/$1/.groundhog-log"; }
+# rec_has NAME REGEX — does a line of out/NAME's record match?
+rec_has() { grep -Eq "$2" "$(rec "$1")" 2>/dev/null; }
+# rec_count NAME KIND — lines of KIND (fired, start, exit, collision).
+rec_count() { grep -c "^$2 " "$(rec "$1")" 2>/dev/null || true; }
+# exited NAME N — the record holds N exit lines (for wait_for).
+exited() { [ "$(rec_count "$1" exit)" -ge "$2" ]; }
+# wrapper_of NAME — pid of the wrapper running out/NAME's run, if any.
+wrapper_of() { pgrep -f "_handle $GHD/out/$1 " 2>/dev/null | head -1; }
+running() { [ -n "$(wrapper_of "$1")" ]; }
+# kill_run NAME [SIGNAL] — signal the run's whole session (wrapper and run).
+kill_run() { local w; w="$(wrapper_of "$1")"; [ -n "$w" ] && kill "-${2:-TERM}" -- "-$w" 2>/dev/null; return 0; }
 
-CFG_ENV_JSON='{}'
-CFG_CWD=".."
-# write_config ARGV… — runtime/config.json with literal argv (no quotes inside
-# the words), cwd $CFG_CWD and env $CFG_ENV_JSON.
-write_config() {
-  local argv="" a
-  for a in "$@"; do argv="$argv${argv:+,}\"$a\""; done
-  mkdir -p "$GHD/runtime"
-  printf '{"schema_version":1,"consumer":{"argv":[%s],"cwd":"%s","env":%s}}\n' "$argv" "$CFG_CWD" "$CFG_ENV_JSON" > "$GHD/runtime/config.json"
-}
-
-# dget BY VALUE PATH — a field of the delivery whose BY (id or path) equals
-# VALUE, from a fresh status.
-# While DG_CACHED is 1, dget reads the last snapshot instead of running status
-# again (assertion-heavy blocks take one with snap).
+# dget BY VALUE PATH — a field of the delivery whose BY (path or id) equals
+# VALUE, from a fresh status. While DG_CACHED is 1, dget reads the last
+# snapshot instead (assertion-heavy blocks take one with snap).
 DG_CACHED=0
 snap() { status_to "$T_TMP/dg.json" || true; DG_CACHED=1; }
 dget() {
   if [ "$DG_CACHED" != 1 ]; then status_to "$T_TMP/dg.json" || true; fi
   jq_py dget "$T_TMP/dg.json" "$1" "$2" "$3"
 }
-today() { date +%Y-%m-%d; }
-# dstate NAME — state of the delivery at out/NAME.
+# dstate NAME — state of the delivery at out/NAME; state_is NAME STATE.
 dstate() { dget path "out/$1" state; }
 state_is() { [ "$(dstate "$1")" = "\"$2\"" ]; }
-# registered NAME — has a runner imported or fired out/NAME as a delivery with an
-# id? (status alone shows an unrecorded entry as pending/unregistered, id null.)
-registered() { local v; v="$(dget path "out/$1" id)"; [ "$v" != null ] && [ "$v" != "<missing>" ]; }
-# did NAME — the delivery ID at out/NAME, unquoted.
-did() { local v; v="$(dget path "out/$1" id)"; v="${v#\"}"; v="${v%\"}"; printf '%s' "$v"; }
 
-# fresh_consumer BODY — an enrolled instance with one due item (nudge, holding
-# note.txt) and a plain /bin/sh consumer. Sets TOK, CONS and NAME (the
-# delivery's out name).
-fresh_consumer() {
-  new_instance
-  gh init >/dev/null
-  gh add daily nudge >/dev/null
-  echo "hello" > "$GHD/schedule/daily/nudge/note.txt"
-  enroll_ok || return 1
-  consumer_script consumer.sh "$1"
-  write_config /bin/sh "$CONS"
-  NAME="nudge-$(today)"
+# start_loop ARGS… — `run` (the plain loop) in the background. Job control
+# gives it its own process group and default signal handling, so INT reaches
+# it as it would from a terminal. Sets LOOP_PID, LOOP_OUT, LOOP_ERR.
+T_LOOPS=0
+LOOP_PID=""; LOOP_OUT=""; LOOP_ERR=""
+start_loop() {
+  T_LOOPS=$((T_LOOPS + 1))
+  LOOP_OUT="$T_TMP/loop$T_LOOPS.out"
+  LOOP_ERR="$T_TMP/loop$T_LOOPS.err"
+  set -m
+  "$TEST_BASH" "$GHD/groundhog.sh" run "$@" > "$LOOP_OUT" 2> "$LOOP_ERR" &
+  LOOP_PID=$!
+  set +m
+  T_PIDS="$T_PIDS $LOOP_PID"
 }
 
-# pid_alive FILE — does the pid written in FILE name a live process?
-pid_alive() { [ -s "$1" ] && kill -0 "$(cat "$1")" 2>/dev/null; }
+# rc_of COMMAND… — the exit status, output discarded.
+rc_of() { local rc=0; "$@" >/dev/null 2>&1 || rc=$?; echo "$rc"; }
 # lines FILE — number of lines (0 if absent).
 lines() { if [ -f "$1" ]; then wc -l < "$1" | tr -d ' '; else echo 0; fi; }
-file_has() { [ -s "$1" ]; }
-# lines_eq FILE N — for wait_for (a command substitution in its arguments would be evaluated only once).
-lines_eq() { [ "$(lines "$1")" -eq "$2" ]; }

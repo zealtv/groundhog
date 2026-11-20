@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `capabilities --json` and the argument rules the two new commands share.
+# `capabilities --json` and the argument rules it shares with `status --json`.
 . "$(dirname "$0")/lib.sh"
 
 new_instance
@@ -10,29 +10,21 @@ assert_eq "capabilities exits 0" 0 "$rc"
 assert_eq "capabilities writes nothing to stderr" "" "$(cat "$out.err")"
 assert_json_valid "$out"
 assert_eq "protocol" '"groundhog-runtime"' "$(jget "$out" protocol)"
-assert_eq "protocol_version is the integer 1" '1' "$(jget "$out" protocol_version)"
+assert_eq "protocol_version is the integer 2 (protocol 1 had owners and a consumer)" '2' "$(jget "$out" protocol_version)"
 assert_eq "implementation_version is a string" 'str' \
   "$(jq_py get "$out" implementation_version | cut -c1 | sed 's/"/str/')"
-# Advertise only what exists. The three runtime capabilities appear exactly on
-# hosts that have the locking, hashing and durability tools the runner needs;
-# consumer-v1 and delivery-v1 also need a way to start a consumer in a session
-# of its own (perl's POSIX::setsid or setsid(1)); they bring release-unresolved-v1
-# (release --leave-unresolved) with them. status-active-v1 (status --active) and
-# next-due-v1 (status --next-due) need nothing of the host, so they are offered everywhere, as is
-# add-while-owned-v1 (add on an owned instance, and add --from). sweep-owner-v1 (sweep --token-file)
-# needs the same tools as the owner commands and comes with them. With ownership-v1
-# through delivery-v1 present a client may supervise the instance; release-unresolved-v1
-# and sweep-owner-v1 are for their flags alone; discard-v1 (discard --token-file) comes
-# with sweep-owner-v1 and needs neither consumer-v1 nor delivery-v1.
-if have_runtime_support && have_isolation; then
-  assert_eq "capabilities on a host with locking and process isolation" \
-    '["status-json-v1","status-active-v1","next-due-v1","add-while-owned-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","discard-v1","consumer-v1","delivery-v1","release-unresolved-v1"]' "$(jget "$out" capabilities)"
-elif have_runtime_support; then
-  assert_eq "capabilities on a host with locking but no process isolation" \
-    '["status-json-v1","status-active-v1","next-due-v1","add-while-owned-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","discard-v1"]' "$(jget "$out" capabilities)"
+# Advertise only what exists. status-json-v2, next-due-v1 (status --next-due),
+# add-from-v1 (add --from) and pause-v2 (tokenless pause and resume) need
+# nothing of the host. handlers-v1 (an item's run, the record, retry) needs a
+# lock helper and a way to start a run in a session of its own.
+if have_handlers; then
+  assert_eq "capabilities on a host that can start runs" \
+    '["status-json-v2","next-due-v1","add-from-v1","pause-v2","handlers-v1"]' "$(jget "$out" capabilities)"
 else
-  assert_eq "capabilities on a host without locking" '["status-json-v1","status-active-v1","next-due-v1","add-while-owned-v1"]' "$(jget "$out" capabilities)"
+  assert_eq "capabilities on a host that cannot start runs" \
+    '["status-json-v2","next-due-v1","add-from-v1","pause-v2"]' "$(jget "$out" capabilities)"
 fi
+assert_not_contains "no protocol 1 capability is left" "$(jget "$out" capabilities)" '-v1","ownership'
 
 # It needs no initialized instance and creates nothing.
 assert_eq "an uninitialized instance stays untouched" "groundhog.sh" "$(ls -A "$GHD")"
@@ -56,8 +48,8 @@ for args in "" "--json --json" "--human" "--json extra" "extra --json" "-j"; do
   assert_eq "status $args exits 2" 2 "$rc"
   assert_eq "status $args prints no stdout" "" "$(cat "$out.o")"
 done
-# --active belongs to status alone, once, and still needs --json.
-for args in "--json --active" "--active --json"; do
+# --next-due belongs to status alone; --active (protocol 1) to nobody.
+for args in "--json --next-due" "--next-due --json" "--json --active"; do
   rc=0
   # shellcheck disable=SC2086
   gh capabilities $args > "$out.o" 2> "$out.e" || rc=$?

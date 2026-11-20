@@ -7,8 +7,8 @@
 # groundhog.sh init), and never touches schedule/, out/ or fired/ contents or
 # runtime/. Re-running changes nothing. The script is replaced by a temp file
 # plus rename, so a process already running keeps the old file (bash reads its
-# script lazily); only a runner started afterwards uses the new one. Stopping
-# a runner first remains the way to be sure which version runs.
+# script lazily): a `run` loop started before the upgrade goes on with the old
+# script until it is restarted. Its ticks run in subshells of that old script.
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,14 +30,6 @@ fi
 mkdir -p "$dest/docs"
 [ "$REPO_DIR/.groundhog/docs/runtime-contract.md" -ef "$dest/docs/runtime-contract.md" ] ||
   cp -f "$REPO_DIR/.groundhog/docs/runtime-contract.md" "$dest/docs/runtime-contract.md"
-# An owned instance refuses `init` (exit 3): its trays already exist and its
-# owner's runner is the only writer. Leave them alone; any other failure stops us.
-rc=0
-"$dest/groundhog.sh" init || rc=$?
-if [ "$rc" -eq 3 ]; then
-  echo "note: $dest is owned by a runtime owner; trays and runtime state left untouched" >&2
-elif [ "$rc" -ne 0 ]; then
-  exit "$rc"
-fi
+"$dest/groundhog.sh" init
 
 echo "installed $dest"

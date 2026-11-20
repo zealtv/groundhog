@@ -132,15 +132,11 @@ for r in d["schedule"]:
 print(json.dumps(d, sort_keys=True))' "$1"; }
 assert_eq "status --next-due equals plain status but for next_due" "$(nd_strip "$T_TMP/plain.json")" "$(nd_strip "$T_TMP/nd.json")"
 assert_eq "every record has the key under --next-due" "$(grep -o '"item_id"' "$T_TMP/nd.json" | wc -l | tr -d ' ')" "$(grep -o '"next_due"' "$T_TMP/nd.json" | wc -l | tr -d ' ')"
-# --active combines, in either order, and the settled count stays.
-gh status --json --active > "$T_TMP/act.json"
-nd_status --active; cp "$T_TMP/nd.json" "$T_TMP/ndact.json"
-gh status --active --next-due --json > "$T_TMP/ndact2.json"
-assert_json_valid "$T_TMP/ndact.json"
-assert_eq "--next-due --active equals --active but for next_due" "$(nd_strip "$T_TMP/act.json")" "$(nd_strip "$T_TMP/ndact.json")"
-assert_eq "flag order does not matter" "$(cat "$T_TMP/ndact.json")" "$(cat "$T_TMP/ndact2.json")"
-assert_eq "plain --active has no next_due key" 0 "$(grep -c next_due "$T_TMP/act.json")"
-assert_contains "--next-due --active keeps settled" "$(cat "$T_TMP/ndact.json")" '"settled"'
+# Flag order does not matter; protocol 1's --active is gone (exit 2).
+gh status --next-due --json > "$T_TMP/nd2.json"
+assert_eq "flag order does not matter" "$(nd_strip "$T_TMP/nd.json")" "$(nd_strip "$T_TMP/nd2.json")"
+rc=0; gh status --json --active >"$T_TMP/o" 2>"$T_TMP/e" || rc=$?
+assert_eq "--active (protocol 1) exits 2" 2 "$rc"
 # Misuse exits 2 and prints nothing on stdout.
 rc=0; gh status --json --next-due --next-due >"$T_TMP/o" 2>"$T_TMP/e" || rc=$?
 assert_eq "--next-due twice exits 2" 2 "$rc"
@@ -247,22 +243,19 @@ else
 fi
 export TZ=UTC
 
-# --- held: an owned instance still reads observed_at -----------------------------------
-if have_runtime_support; then
-  new_instance
-  gh init >/dev/null
-  gh add daily nudge >/dev/null
-  gh add daily/23 late >/dev/null
-  age_tree "$INST"
-  set_clock "2026-11-15 12:00:00"
-  enroll_ok
-  snap_nd
-  assert_eq "an owned instance does not allow firing" false "$(python3 -I -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["schedule"][0]["firing_allowed"]).lower())' "$T_TMP/nd.json")"
-  expect schedule/daily/nudge 2026-11-15T12:00:00Z
-  expect schedule/daily/23/late 2026-11-15T23:00:00Z
-else
-  t_skip "no runner support on this host (the held case needs an owner)"
-fi
+# --- held: a paused instance still reads observed_at -----------------------------------
+new_instance
+gh init >/dev/null
+gh add daily nudge >/dev/null
+gh add daily/23 late >/dev/null
+age_tree "$INST"
+set_clock "2026-11-15 12:00:00"
+gh pause >/dev/null
+snap_nd
+assert_eq "a paused instance does not allow firing" false "$(python3 -I -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["schedule"][0]["firing_allowed"]).lower())' "$T_TMP/nd.json")"
+assert_eq "...and says why" '["instance_paused"]' "$(jq_py find "$T_TMP/nd.json" schedule path schedule/daily/nudge | python3 -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["blocked_by"],separators=(",",":")))')"
+expect schedule/daily/nudge 2026-11-15T12:00:00Z
+expect schedule/daily/23/late 2026-11-15T23:00:00Z
 
 clear_clock
 t_finish

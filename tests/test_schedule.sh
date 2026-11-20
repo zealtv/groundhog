@@ -140,7 +140,6 @@ for p in "schedule/bogus|" "schedule/every/loose-item|" "schedule/monthly/99|" "
   assert_contains "diagnosed: $p" "$unrec" "$p"
 done
 assert_false "bogus is not an item" has_item schedule/bogus/x
-assert_eq "grammar problems do not make the snapshot inconsistent" true "$(jget "$T_TMP/sched.json" consistent)"
 
 # --- the same moment after tick: fired items, one-shots gone ------------------
 before_markers="$(jq_py where "$T_TMP/sched.json" schedule eligible_now true fired_marker | LC_ALL=C sort)"

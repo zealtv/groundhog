@@ -33,7 +33,6 @@ status_to "$out"
 assert_eq "awkward names: tree unchanged" "$before" "$(tree_hash "$INST")"
 assert_json_valid "$out"
 assert_eq "awkward names: stderr quiet" "" "$(cat "$out.err")"
-assert_eq "awkward names: still consistent" true "$(jget "$out" consistent)"
 if jq_py out-names "$out" "$GHD/out"; then t_ok; else t_fail "decoded delivery paths equal the directory entries on disk"; fi
 assert_eq "one document, one line" 1 "$(wc -l < "$out" | tr -d ' ')"
 assert_eq "no raw control characters in the document" 0 "$(LC_ALL=C tr -d '\n' < "$out" | LC_ALL=C grep -c '[[:cntrl:]]' || true)"
