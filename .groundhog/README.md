@@ -2,22 +2,7 @@
 
 A tiny, file-based protocol for recurring items.
 
-The script remains passive: it materializes deliveries when explicitly ticked.
-The [optional runtime contract](docs/runtime-contract.md) specifies supervision,
-ownership, pause and consumer handoff. The design was accepted on 2026-11-15.
-This version implements all of it on hosts with the lock and process tools it
-needs: the read-only inspection commands (`capabilities --json` and
-`status --json`, see [Inspection](#inspection)); ownership, the runner and the
-persistent pause ([Runner, ownership and pause](#runner-ownership-and-pause));
-and the optional consumer, the delivery journal, `retry` and `recover`
-([Consumers and deliveries](#consumers-and-deliveries)).
-Groundhog works with or without AI. A consumer is a plain executable run with
-literal argv, a documented cwd, an absolute delivery path and ordinary exit
-status. A script can finish its work synchronously and exit 0; no SDK, queue,
-model or AI account is required. Without a configured consumer, it remains
-delivery-only.
-
-An *item* is a directory. Its position under `schedule/` is when it returns. Each time it's due, a fresh copy lands in `out/`.
+An *item* is a directory. Its position under `schedule/` is when it returns. Each time it's due, a fresh copy lands in `out/`. If the item holds an executable `run`, the copy's `run` is then started, once, in a session of its own.
 
 When you open `.groundhog/schedule/`, you are looking at the things that come around again.
 
@@ -29,15 +14,17 @@ When you open `.groundhog/schedule/`, you are looking at the things that come ar
   fired/
 ```
 
+Groundhog is passive: nothing happens until something calls `tick` (or `run`, a plain loop of ticks). It works with or without AI: a `run` is any executable, with an absolute delivery path in `$1`, a documented cwd and environment, and an ordinary exit status. The machine-readable interface, protocol 2, is in [docs/runtime-contract.md](docs/runtime-contract.md).
+
 ## What groundhog is for
 
 Some things should appear on a schedule. A weekly prompt. A monthly check. A daily nudge. The occasional one-shot reminder for a future date.
 
 Groundhog holds the pattern. Each tick, anything due is copied into `out/`, ready to be picked up — by a hand, by an agent, by a script. A small note is left in `fired/` so groundhog remembers what it has already done.
 
-What an item *is* is up to you. A directory of files. A single prompt. A payload to run. An empty directory whose mere appearance is the signal. Groundhog does not care what's inside.
+What an item *is* is up to you. A directory of files. A single prompt. An empty directory whose mere appearance is the signal. Or a payload that says what to do with itself: an executable `run`, which Groundhog starts when the item fires (see [Runs](#runs)). Apart from `run` and the two files Groundhog writes into each delivery, it does not care what's inside.
 
-Three folders, three roles: `schedule/` is what *should* happen, `fired/` is what *has* happened, `out/` is the tray for whatever picks the work up. There are no header fields, no metadata files, no state outside the file system.
+Three folders, three roles: `schedule/` is what *should* happen, `fired/` is what *has* happened, `out/` is the tray for whatever picks the work up. All the state is in the file system: the paths, the markers in `fired/`, and one small record Groundhog writes into each delivery.
 
 ## Structure
 
@@ -70,8 +57,13 @@ An item is a directory under a known schedule path.
   out/
     morning-nudge-2026-04-25/
       note.md
+      .groundhog-record
     follow-up-2026-04-25/
+      .groundhog-record
     heartbeat-2026-04-25-09-15/
+      run
+      .groundhog-record
+      .groundhog-log
   fired/
     2026-04-25/
       daily/morning-nudge
@@ -120,7 +112,7 @@ An item placed at the *root* of an axis fires on the first slot of the cycle: Mo
 2. Materialize by copy: a due item is `cp -r`'d to `out/<item-name>-<YYYY-MM-DD>/`. Sub-day items under `every/` extend the name with their slot: `out/<item-name>-<YYYY-MM-DD>-<HH-MM>/`, so multiple firings in a day don't collide.
 3. Each firing is recorded by `touch fired/<YYYY-MM-DD>/<schedule-relative-path>` (with a slot suffix for `every/`). An occurrence with a marker will not fire again for that date and slot.
 4. One-shots remove themselves from `schedule/once/<date>/` after firing.
-5. Item contents are opaque. Groundhog only reads paths.
+5. Item contents are the item's own, with three reserved names. An executable `run` is started for each delivery that holds one. `.groundhog-record` (the delivery's record) and `.groundhog-log` (its run's output) are Groundhog's: a firing replaces any copies the item brought. Nothing else inside an item is read.
 6. A `.paused` suffix on any path component excludes that subtree. `due` and `tick` skip it; `list` shows it tagged `[paused]`; `lint` accepts it. Pausing cascades — `weekly/mon.paused/` pauses every item beneath. A paused `once/<date>/` does not auto-fire and is not removed when its date passes; it fires on the next tick after unpause.
 
 The file system is the protocol.
@@ -129,10 +121,11 @@ The file system is the protocol.
 
 1. Read every item directory at the expected depth under each schedule axis.
 2. For each, decide whether today (and the current time, if `<HH>` or `<HH-MM>` is specified) matches its path.
-3. If due and its schedule-relative marker under `fired/<today>/` does not exist: copy to `out/<item-name>-<today>/`, then touch that marker.
+3. If due and its schedule-relative marker under `fired/<today>/` does not exist: copy to `out/<item-name>-<today>.landing/`, write the fresh record into the copy, rename it to `out/<item-name>-<today>/`, then touch that marker.
 4. For each one-shot under `once/<past-or-today-date>/`, remove the source after firing.
+5. Start every delivery in `out/` whose record says it has a `run` and never started (see [Runs](#runs)).
 
-`fired/` is groundhog's only memory. The path encodes the schedule; the journal encodes what's done. That's all the state groundhog needs.
+While the instance is paused, a tick does none of this. `fired/` is what has fired; each delivery's record is what became of it.
 
 ## Catch-up
 
@@ -162,17 +155,18 @@ For `every/`, spring-forward skips slots that no tick observes. During fall-back
 
 ## Out
 
-`out/` is a tray of fresh items. Groundhog does not know what consumes them. Pipe, move, watch, or ignore — the next reader is your concern.
+`out/` is a tray of fresh items. An item with a `run` says itself what happens next; for the rest, Groundhog does not know what consumes them. Pipe, move, watch, or ignore — the next reader is your concern.
 
+* the item: put an executable `run` in it
 * a hand: `mv .groundhog/out/* somewhere/`
 * an agent: point its inbox at `out/` and let it tend
 * a script: cron + tick + mv, in one line
 
-A consumer can yoink items from `out/` immediately and the next tick will not re-deposit them — `fired/` remembers, not `out/`. If `out/` accumulates, that is a visible signal: items are being deposited but no one is collecting.
+Anything can take items from `out/` immediately and the next tick will not re-deposit them — `fired/` remembers, not `out/`. If `out/` accumulates, that is a visible signal: items are being deposited but no one is collecting.
 
 ### Polling
 
-Groundhog is passive — `tick` only fires when invoked. To bring the schedule to life, run `tick` on an interval. The simplest possible loop:
+Groundhog is passive — `tick` only fires when invoked. To bring the schedule to life, run `tick` on an interval. `./groundhog.sh run` is that loop, built in: it ticks every 60 seconds (`--interval-seconds N` to change it) until Ctrl-C, SIGTERM or SIGHUP, and exits 0 after the tick in progress. The simplest possible hand-made loop does the same:
 
 ```
 while sleep 60; do ./groundhog.sh tick; done
@@ -189,16 +183,13 @@ done
 
 Run it in a tmux pane, background it, or wrap it in launchd / systemd / cron — groundhog itself doesn't care. `sleep` is interruptible by Ctrl-C. `tick` already prints a line per firing, so piping the loop to a log gives you a free audit trail.
 
-To replace a loop like this with the supervised `run`, see
-[Migrating from a tick loop](#migrating-from-a-tick-loop).
-
 This single loop is the heartbeat for any system built on these protocols. Anything else that wants to "come alive" — a tender, an agent, a watcher — can be triggered by a groundhog item firing into its inbox.
 
 ## Fired
 
-`fired/<YYYY-MM-DD>/<schedule-relative-path>` is a file recording that the item fired on that date. It is empty, except that when a supervised runner fires a one-shot it writes the one-shot's source generation (inode and mtime of the directory it copied) into the marker, so a later tick removes that source and never a replacement put there the same day (see *The journal* under [Consumers and deliveries](#consumers-and-deliveries)). Only the marker's existence means "fired". The marker mirrors the schedule subtree, so `weekly/sat/foo` and `monthly/25/foo` get distinct markers and neither is silently swallowed. Groundhog writes it; nothing else should. Three useful things fall out:
+`fired/<YYYY-MM-DD>/<schedule-relative-path>` is an empty file recording that the item fired on that date. Only the marker's existence means "fired". The marker mirrors the schedule subtree, so `weekly/sat/foo` and `monthly/25/foo` get distinct markers and neither is silently swallowed. Groundhog writes it; nothing else should. Three useful things fall out:
 
-* **Idempotency**, even if the consumer takes items immediately.
+* **Idempotency**, even if something takes items out of `out/` immediately.
 * **History**: `find fired/2026-04-25 -type f` answers "what fired that day?" forever, regardless of whether the items have been collected.
 * **One-shot trace**: when a `once/<date>/<item>/` self-deletes, its `fired/` marker is the only durable record that it ever existed.
 
@@ -208,9 +199,10 @@ To **rearm an item that already fired today** — say you accidentally tended it
 rm .groundhog/fired/$(date +%Y-%m-%d)/weekly/sat/foo
 ```
 
-The next tick will refire it. Groundhog has no other override; the journal is the truth.
+The next tick will refire it, provided `out/` no longer holds that day's copy (otherwise the refire is a [collision](#output-name-collisions)). Groundhog has no other override; `fired/` is the truth.
 
 Old `fired/<date>/` directories are pruned by `sweep` on the same retention as `out/`.
+
 
 ## Installing and upgrading
 
@@ -218,823 +210,293 @@ To install groundhog, copy the `.groundhog/` directory into the project. To
 upgrade, run `./install.sh <host-dir>` from a groundhog checkout: it refreshes
 `groundhog.sh`, `README.md` and `docs/`, runs `init` (which only creates
 missing trays), and leaves `schedule/`, `out/`, `fired/` and `runtime/` alone.
+The script is replaced by a rename, so a `run` loop or a run already going
+keeps the old script until it is restarted.
 
 `init` creates `schedule/`, `out/`, and `fired/` next to itself.
 `groundhog.sh` operates on the `.groundhog/` directory it lives in, so each
 copy is self-contained, and `groundhog.sh` is the only file the instance
-needs; `README.md` and `docs/` are documentation. Neither a copy nor
-`install.sh` starts a runner, enrolls an owner or writes a configuration: see
-[Deployment and migration](#deployment-and-migration).
+needs; `README.md` and `docs/` are documentation.
+
+`.groundhog/runtime/` holds machine-specific state: the lock files, the pause
+and the last tick. It belongs in the project's VCS ignore list (for git, a
+`.groundhog/runtime/` line in `.gitignore`); `install.sh` writes no ignore file.
+
+Coming from protocol 1 (the owner, runner and consumer)? See
+[Upgrading from protocol 1](#upgrading-from-protocol-1).
 
 ## Commands
 
 ```
 ./groundhog.sh init
 ./groundhog.sh add <when> <item-id> [--from DIR]  # mkdir under schedule/<when>/<item-id>/ (you fill it), or with --from copy a prepared DIR in with one rename
-./groundhog.sh tick                     # fire any due items into out/
+./groundhog.sh tick                     # fire any due items into out/, then start every run that is due to start
 ./groundhog.sh due                      # what would fire now (read-only)
 ./groundhog.sh list                     # tree-like view of schedule/
 ./groundhog.sh lint                     # report any orphaned paths walk_due will never see
 ./groundhog.sh drop <item-id>           # remove from schedule/
 ./groundhog.sh out                      # ls out/
-./groundhog.sh sweep [days]             # remove out/ entries older than N days (default 14)
-./groundhog.sh sweep --token-file PATH [days]  # the owner's sweep of an owned instance with a stopped runner
-./groundhog.sh discard --token-file PATH --delivery ID  # the owner discards a pending/no_consumer delivery (stopped runner)
-./groundhog.sh capabilities --json      # which runtime capabilities this script implements (read-only)
-./groundhog.sh status --json [--active] # one JSON snapshot of schedule, state and deliveries (read-only); --active counts settled deliveries instead of listing them
-./groundhog.sh enroll --owner-label LABEL --token-file ABSENT_ABSOLUTE_PATH
-./groundhog.sh run --token-file PATH [--interval-seconds N]   # foreground heartbeat (default 60)
-./groundhog.sh pause|resume|stop|release --token-file PATH
-./groundhog.sh release --token-file PATH --leave-unresolved   # also with an unresolved attempt; the barrier stays
-./groundhog.sh retry --token-file PATH --delivery ID                    # failed -> pending
-./groundhog.sh recover --token-file PATH --delivery ID --decision retry|accept
+./groundhog.sh sweep [days]             # remove out/ entries and fired/ dates older than N days (default 14), keeping runs that are pending or running
+./groundhog.sh pause                    # stop firings and run starts for the whole instance
+./groundhog.sh resume                   # undo pause
+./groundhog.sh retry <delivery>         # start a delivery's run again, now
+./groundhog.sh run [--interval-seconds N]  # tick every N seconds (default 60) until interrupted
+./groundhog.sh capabilities --json      # which capabilities this script implements here (read-only)
+./groundhog.sh status --json [--next-due]  # one JSON snapshot of schedule, pause and deliveries (read-only)
 ```
 
 `<when>` is the schedule path: `daily`, `daily/09`, `daily/09-30`, `weekly`, `weekly/mon`, `weekly/mon/09`, `weekly/mon/09-30`, `monthly`, `monthly/1`, `monthly/15/09`, `monthly/15/09-30`, `yearly`, `yearly/03-15`, `yearly/03-15/09-30`, `once`, `once/2026-05-01`, `once/2026-05-01/09-30`, `every/15m`, `every/3h`. A bare axis (`weekly`, `monthly`, `yearly`, `once`) takes the default slot. `every/` has no default — the bucket is required.
 
-## Runner, ownership and pause
+Plain `add` makes an empty item directory that you fill afterwards, and a tick
+between the two steps can fire the item half-made. **`add <when> <item-id>
+--from DIR`** closes that race: it copies the prepared directory `DIR` (copied,
+never moved) to `runtime/staging/` and renames it into the schedule under the
+mutation lock, so a tick sees the item whole or not at all. Prepare the
+payload, `run` included, before the call. It runs the checks plain `add` runs
+(exit 1 for a bad `<when>` or `<item-id>` or an existing item), prints the new
+path, and exits 2 for a malformed `--from` or extra arguments, 4 if the lock
+stays busy.
 
-An instance can opt in to a supervised, foreground heartbeat. This is optional:
-an instance that never runs `enroll` ticks exactly as before. The design is in
-[docs/runtime-contract.md](docs/runtime-contract.md); this section records what
-the script does and what it needs.
+`retry`, `pause`, `resume` and `run` exit 0 on success, 2 for invalid
+arguments, 3 when refused by the pause (`retry` only), 4 when busy, 5 when
+there is nothing to do or the host cannot do it, 6 on an I/O failure. The
+schedule commands keep their old exit codes (1 for an error). Every writer
+(`init`, `add`, `drop`, `sweep`, `tick`, `pause`, `resume`, `retry`) takes the
+mutation lock and exits 4 if it stays busy for about three seconds.
+
+## Runs
+
+**An item that holds an executable `run` says what happens when it fires.**
+Write the script, make it executable, and schedule the item:
+
+```sh
+./.groundhog/groundhog.sh add daily/09 report
+cat > .groundhog/schedule/daily/09/report/run <<'SH'
+#!/bin/sh
+# $1 is this delivery, e.g. .../.groundhog/out/report-2026-05-01
+./scripts/make-report.sh "$1" && mv "$1" archive/
+SH
+chmod +x .groundhog/schedule/daily/09/report/run
+```
+
+From 09:00, the first tick copies the item to `out/report-<date>/` and starts
+that copy's `run`. Without an executable `run`, an item is only delivered, as
+always.
+
+**The record.** Every firing writes `.groundhog-record` into the `.landing`
+copy before the rename into `out/`, so a delivery is never visible without it.
+It is append-only, one line per event:
 
 ```
-$ ./groundhog.sh enroll --owner-label my-session --token-file /private/dir/token
-$ ./groundhog.sh resume --token-file /private/dir/token     # only if paused
-$ ./groundhog.sh run --token-file /private/dir/token --interval-seconds 60
-# from another terminal:
-$ ./groundhog.sh pause --token-file /private/dir/token
-$ ./groundhog.sh stop --token-file /private/dir/token
-$ ./groundhog.sh release --token-file /private/dir/token    # then delete the token file
+fired d-3f9c0a1b2c3d4e5f 2026-05-01T09:00:04Z run 2026-05-01 - schedule/daily/09/report
+start a-77aa01b2c3d4e5f6 2026-05-01T09:00:04Z tick
+exit a-77aa01b2c3d4e5f6 2026-05-01T09:00:31Z 0
 ```
 
-* **`enroll`** needs an unowned instance and an absent absolute `--token-file`
-  outside the instance, in an existing private directory. It writes a fresh
-  random token there (mode 0600, flushed to disk), then atomically replaces the
-  owner record with the token's verifier. Exit 6 means failure before any owner
-  was committed; exit 7 means the owner record may have been written, so keep the
-  token and reconcile with `status --json`. The secret never goes into argv,
-  `status` or any child's environment.
-* **`run`** takes the runner lock for its lifetime, then repeats a cycle every
-  interval: reconcile the delivery journal, tick once (unless paused), then hand
-  off pending deliveries to the consumer, if one is configured (see
-  [Consumers and deliveries](#consumers-and-deliveries)). It never enrolls and
-  never clears the pause. A second `run`,
-  even with the same token, exits 4. SIGINT, SIGTERM, SIGHUP and `stop` close
-  admission, interrupt the sleep and exit 0, keeping ownership and pause. A
-  signal detaches from a consumer call in progress (it is not killed); `stop`
-  waits for that call to finish and records its result first. A failing tick ends the
-  runner with exit 6 and a `runner.last_error`.
-* **`pause`/`resume`** set the instance-wide pause (idempotently) under the
-  mutation lock. Pause survives stop, restart, release and re-enrollment, and is
-  independent of the `.paused` suffix on schedule components.
-* **`stop`** records a request under the mutation lock, then waits, holding
-  nothing, until the runner has released its lock. The runner admits nothing more
-  but finishes the consumer call it already admitted and records `accepted` or
-  `failed` before it exits, so `stop` can take as long as that call. While it
-  waits, `stop` says on stderr that it is waiting on a delivery and that SIGTERM
-  to the runner detaches now (the delivery then becomes `uncertain`). With no live
-  runner, or no call in flight, it returns at once. **`release`** needs a stopped runner and no unresolved delivery
-  attempt; it removes the owner and leaves the pause. The generation counter
-  persists, so the next `enroll` issues generation + 1. **`release --leave-unresolved`**
-  does the same while a delivery attempt is unresolved (a runner must still have ended
-  first: exit 4); plain `release` keeps refusing, exit 5. The delivery records stay as
-  they are, and the barrier, which keys on them and not on ownership, keeps blocking every
-  consumer admission under any later owner until `recover`.
-* **Standalone `tick`** fails 3 while the instance is owned (ownership wins over
-  pause), succeeds without firing while paused, and otherwise ticks as always.
-  `init`, `drop` and `sweep` also fail 3 while owned (`add` does not, below; `sweep --token-file`,
-  below, is the owner's own way in). All of them take the mutation lock and fail 4 if it stays
-  busy for about three seconds.
-* **`add` works while owned** (capability `add-while-owned-v1`, accepted on 2026-11-18),
-  for anyone and with no token: adding a schedule item is authoring, not runtime control, and
-  ownership keeps what it guards (the runner, the pause, the deliveries). It takes the mutation
-  lock, so it waits behind a tick in progress (exit 4 if the lock stays busy), and it writes no
-  runtime state: owner, pause and `revision` stay as they were. Plain `add` still makes an empty
-  item directory that you fill afterwards, and a tick between the two steps can fire the item
-  half-made, owned or not. **`add <when> <item-id> --from DIR`** closes that race: it copies the
-  prepared directory `DIR` (which must exist; it is copied, never moved, so it stays) into
-  `runtime/staging/add-<random>` and renames it to `schedule/<when>/<item-id>` under the lock, so
-  a tick sees the item whole or not at all. Prepare the payload, `prompt.md` included, before the
-  call. It runs the checks plain `add` runs (exit 1 for a bad `<when>` or `<item-id>` or an
-  existing item, with nothing staged), prints the new path, and exits 2 for a malformed `--from`
-  (no such directory, given twice, no argument, or extra arguments). Plain `add` rejects extra
-  arguments too: `add <when> <item-id> extra` exits 2 and creates nothing (Bob, 2026-11-18: "Okay,
-  let's reject them"; an older script ignores the extra and makes an empty item). Contents are copied as
-  `cp -R` copies them. A staging directory left by a crash is inert; a later `add` picks a new
-  name. `drop` still fails 3 while owned. An older script reads only the first two arguments of
-  `add` and ignores `--from`, creating an **empty** item and printing its path, so a client finds
-  `add-while-owned-v1` in `capabilities` before it passes `--from` or relies on `add` while owned.
-* Exit codes of the new commands: 0 success, 2 invalid arguments or
-  configuration, 3 ownership conflict or stale token, 4 busy, 5 unsupported or
-  unusable state, 6 I/O failure, 7 enrollment outcome uncertain.
+The fired line comes first: a random delivery id, when, `run` or `none` (did
+the item hold an executable `run`), the occurrence's date and slot (`-` outside
+`every/`) and the schedule path. Each start has a fresh attempt id and says
+who started it (`tick` or `retry`); each exit gives the status. A collision
+adds a `collision` line (see [Output name collisions](#output-name-collisions)).
+The exact format is in the [runtime contract](docs/runtime-contract.md#the-record).
 
-`status --json` reports the real `paused`, `owner` (id, generation, label; never
-the verifier) and `runner` state, and `revision` rises with every write to
-`state.json` (see [Change tokens](#change-tokens-revision-and-journal_generation)
-for what it does and does not cover).
-A state file that still says `running` but whose recorded process is gone (a
-crash) shows the runner as `unknown` with a `runner_not_observed` diagnostic;
-status takes no locks and repairs nothing. The owner stays.
+**Any tick starts the runs that are due.** After its firings, every tick
+looks at each delivery in `out/` and starts every one whose record says `run`
+and has no start line. A tick that crashed after the rename, a Ctrl-C, a
+laptop asleep at 09:00: the next tick, from any caller, starts it. A payload
+put in `out/` by hand, or imported from elsewhere, has no record Groundhog
+made, so it never runs.
 
-### The runner's output streams
+**What `run` gets.** `$1` is the absolute path of its delivery; its cwd is the
+project (the directory that holds `.groundhog/`); stdin is `/dev/null`;
+stdout and stderr are appended to `.groundhog-log` in the delivery; and the
+environment is the ticker's plus:
 
-`run` writes its log lines (`groundhog: …`) to stderr and a `fired …` line to
-stdout, and a consumer inherits both streams. **A supervisor should give `run`
-stdout and stderr that outlive it, such as a regular file, not a pipe it may
-close.** A supervisor that reads the runner's output through a pipe and then
-exits (quits, crashes or is killed) leaves the runner and its consumer writing
-into a pipe with no reader. The consumer, which runs with the default SIGPIPE
-disposition, is then killed by SIGPIPE at its next write to the closed stream
-and the delivery is recorded `failed`. With a regular file, a consumer
-survives its supervisor's exit and its output stays readable.
+| Variable | Value |
+|---|---|
+| `GROUNDHOG_INSTANCE` | the instance's `.groundhog/` directory, canonical and absolute |
+| `GROUNDHOG_DELIVERY_ID` | the delivery id from the fired line; the same for every attempt |
+| `GROUNDHOG_ATTEMPT_ID` | this attempt's id from its start line |
 
-The runner survives a closed pipe on its own side. It ignores SIGPIPE, treats
-every log line and `fired` line as best-effort, and on the first failed write
-points its own stdout and stderr at `/dev/null` (consumers it starts afterwards
-inherit that), keeps running, and records `runner.last_error` with code
-`output_lost` once. `runner.state` stays `running`; a later `stop` still exits
-0 with state `stopped`, and the `output_lost` error remains in the state file
-until the next `run` clears it. Nothing else changes: ticks, handoffs and the
-recording of each consumer's result go on, but the runner no longer logs
-anything. A consumer that was already writing to the closed pipe still dies of
-SIGPIPE; that is the reason to prefer a file.
+**Exit 0 means "accepted", not "done".** Groundhog records the status and
+nothing else. A `run` that hands its work to something else and exits 0 has
+done its part; whether that work finished is for that something to say.
 
-### Locks
+**The wrapper.** Each run starts through a small wrapper in a session of its
+own (perl's `POSIX::setsid`, or `setsid(1)`), so Ctrl-C on a tick loop or a
+closed terminal cannot reach it, and the tick moves on at once: a slow or hung
+`run` stalls nothing. The wrapper holds the record's lock (`flock(2)` on
+`.groundhog-record`) for as long as `run` lives, then appends the exit line.
+`run` itself gets neither that lock nor the mutation lock. A signal to the
+wrapper alone waits for `run`; to stop a run, signal its process group, which
+is the wrapper's pid (`kill -TERM -- -<pid>`): the exit line then records
+`143`. A `run` killed by a signal records 128 plus its number; a `run` that is
+gone records 127, one that is not executable 126.
+
+**States**, as `status --json` reports them from the record and its lock:
+
+| State | Meaning |
+|---|---|
+| `delivered` | no `run`: delivered only |
+| `pending` | a `run` that never started; the next unpaused tick starts it |
+| `running` | the record's lock is held |
+| `accepted` | the last attempt exited 0 |
+| `failed` | the last attempt exited nonzero (`exit_status` says how) |
+| `interrupted` | the last attempt has a start and no exit, and the lock is free |
+| `unrecorded` | no record Groundhog made: put there by hand, imported, or a collision squatter |
+
+**Interrupted is never re-run by itself.** A run whose wrapper died (a
+`kill -9` of its session, a reboot) leaves a start with no exit and a free
+lock. Groundhog cannot know how far it got, so it leaves it for you:
+`retry` it, or delete it.
+
+**`retry <delivery>`** starts the delivery's run again now, whatever its last
+run did, as a new attempt under the same lock. `<delivery>` is the name in
+`out/`, `out/<name>`, or the delivery's absolute path. It needs no token. It
+exits 4 while the delivery is running (or another writer holds the mutation
+lock), 3 while the instance is paused, 5 when there is nothing to run (no
+record Groundhog made, a `none` record, or the `run` is gone), 2 for anything
+that is not a delivery of this instance. It returns once the run has started;
+watch `status --json` for its end.
+
+**Executing tracked files.** `schedule/` is usually under version control, so
+a `git pull` or a clone can bring in a `run` that the next tick executes. Treat
+a `run` like any other script in the repository. If an instance should not
+execute anything new until someone has looked, `pause` it before pulling.
+
+## Pause
+
+`pause` stops the whole instance: while `runtime/paused` exists, a tick fires
+nothing and starts nothing, and `retry` exits 3. Runs already going are left
+alone and their exits are still recorded. `resume` removes the file. Both are
+idempotent, need no token (anyone who can write the instance can pause it),
+and take the mutation lock, so once `pause` returns no tick is half-way
+through. A paused tick still counts for `last_tick`. Pause is separate from
+the `.paused` suffix on schedule components, which takes a subtree off the
+schedule.
+
+## Sweep and dismissal
+
+`sweep [days]` removes `out/` entries and `fired/` date directories whose
+mtime is more than `days` (default 14) days old, and leftover `.landing`
+copies. A delivery whose run is `pending` or `running` stays, whatever its
+age, with a `skipped out <name> (<state>)` line. Failed and interrupted ones
+age out like the rest.
+
+To dismiss a delivery, delete it: `rm -rf .groundhog/out/<name>`. `fired/`
+still remembers the occurrence, so it does not fire again.
+
+## Locks and what the host needs
 
 Exclusion uses `flock(2)` advisory locks, so the operating system releases them
-when the holder dies and no PID is ever consulted. Two lock files live in
-`runtime/locks/` (created on first use, never deleted): `runner.lock`, held for a
-runner's lifetime, and `mutation.lock`, held briefly by every writer. Order is
-runner, then mutation.
+when the holder dies and no PID is ever consulted. bash cannot call `flock(2)`
+itself: the script opens the file on a numbered descriptor and a short-lived
+helper takes the lock on it, util-linux `flock -n FD` when `flock --version`
+says so, otherwise `perl -MFcntl=:flock` (perl ships with macOS). The lock
+belongs to the open file description, so it stays with the shell, and with any
+child that inherits the descriptor, until the last of them exits.
 
-bash cannot call `flock(2)` itself. The script opens the lock file on a numbered
-descriptor in the shell (`exec 8>>runner.lock`, `exec 9>>mutation.lock`) and a
-short-lived helper takes the lock on that inherited descriptor: `flock -n FD`
-from util-linux when `flock --version` says so, otherwise
-`perl -MFcntl=:flock` (perl ships with macOS). The lock belongs to the open file
-description, so it stays held by the shell after the helper exits and goes away
-when the shell exits, however it exits (checked with `kill -9`).
+There are two kinds. `runtime/locks/mutation.lock` is held by every writer for
+the length of its command, which serializes firings: on a host with a lock
+helper, two tickers (cron and a loop, say) fire each occurrence exactly once.
+Each delivery's `.groundhog-record` is the other: a tick or `retry` takes it to
+write a start line and hands it to the wrapper, which holds it for the life of
+`run`, so a delivery runs at most once at a time.
 
-The catch: a child that inherits the descriptor keeps the lock alive after its
-parent dies. The runner therefore starts its long-lived children (`sleep`
-between cycles, and every consumer) with `8>&- 9>&-`. Short-lived tools such as
-`cp` hold the descriptors for milliseconds.
+**Requirements.** Runs (capability `handlers-v1`) need a lock helper and a way
+to start a session: perl with `POSIX`, else `setsid(1)`. On a host without
+them, `capabilities` leaves out `handlers-v1`, a tick still fires and writes
+records but starts nothing (it says so on stderr, and `status` shows
+`handlers_unavailable`), and `retry` exits 5. Without a lock helper every
+other command runs unlocked, as Groundhog always has, and `last_tick` is not
+recorded. Support is single host, local filesystem; do not share an instance
+over a network filesystem. Nothing is fsynced: a crash of a process is safe
+at every step, but a power loss can lose a firing that had just happened.
 
-**Requirements.** The runner commands and the three capabilities
-`ownership-v1`, `runner-v1` and `pause-v1` appear only when the host has: a lock
-helper (util-linux `flock` or perl with `Fcntl`); a SHA-256 tool (`sha256sum`,
-`shasum` or `openssl`); `perl` with `IO::Handle` or `sync(1)` for durable writes;
-`od` and `/dev/urandom`. Without them `capabilities` lists `status-json-v1`, `status-active-v1`, `next-due-v1` and `add-while-owned-v1` only,
-`enroll`, `run`, `pause`, `resume`, `stop`, `release`, `retry` and `recover` exit
-5 with a message, and every legacy command works as before without taking any
-lock. `consumer-v1`, `delivery-v1` and `release-unresolved-v1` additionally need a way to start a consumer
-in a session of its own: perl with `POSIX` (it ships with macOS), else
-`setsid(1)`. Without that, the host lists the first four capabilities and `run`
-refuses a configured consumer with exit 5. Support is
-single host, local filesystem; do not share an instance over a network
-filesystem. On macOS `fsync` does not force the drive's write cache to the
-platter.
+## Upgrading from protocol 1
 
-Older copies of this script know nothing about the locks or the pause and can
-bypass both. Stop other tick loops before enrolling an instance.
+Protocol 1 ran deliveries through an owner, a runner and a consumer in
+`runtime/config.json`. **Protocol 2 drops all of that, and the contract broke
+on purpose.** A client tells them apart with `capabilities --json`:
+`protocol_version` is `2`, and `handlers-v1` is the capability for runs. A
+protocol 1 script answers `1` and lists `ownership-v1`; an older one still
+answers `capabilities` with `unknown command` (exit 1).
 
-### State written under `runtime/`
-
-`.groundhog/runtime/` holds machine-specific state (absolute paths, the owner
-label and the token verifier, delivery records, lock files). It belongs in the
-project's VCS ignore list (for git, a `.groundhog/runtime/` line in
-`.gitignore`); `install.sh` writes no ignore file.
-
-`state.json` is replaced atomically (temp file in the same directory, fsync,
-rename, fsync of the directory) with `revision` + 1. Besides the fields
-`status` reads (`schema_version`, `revision`, `paused`, `owner`, `runner`,
-`config_digest`) it records `instance` (the canonical directory as the file
-system spells it, found with the external `/bin/pwd -P`; see below),
-`last_generation`, the owner's
-`token_verifier` (SHA-256 of owner id and token), and runner diagnostics (`id`,
-`pid`, `start_id`, `stop_requested_for`). Diagnostics grant no authority. Unusable
-state makes every control command exit 5 and is never overwritten; `status`
-shows it with `consistent: false`.
-
-The `instance` binding exists to protect tokens, so it matters only while the
-instance is owned. A released instance that has moved (or was reached by another
-spelling of its path) simply ignores the stale binding, and the next state write
-records the current directory. An owned instance whose state names another
-directory fails closed: `tick`, `add`, `drop`, `sweep` and `enroll` exit 5, and `status --json` reports `consistent: false` with the
-diagnostic `state_bound_elsewhere`. (A token file names the directory too, so a
-command that reads the old token file stops at the foreign-token check, exit 3,
-before it reads the state.) Offline repair, with no runner running: edit
-`instance` in `runtime/state.json` and in the token file to the directory
-`status` now reports. Moving the project back also works.
-
-The runner's recorded `start_id` is a process start time in UTC with the C locale,
-so `status` reads the same value from any `TZ`; a runner started by a copy of
-this script from before that change shows `runner_not_observed` until it is
-restarted.
-
-### Change tokens: `revision` and `journal_generation`
-
-`status --json` carries two numbers a client can compare between reads to learn
-whether anything changed. They cover different files, and neither covers
-everything. These readings describe this implementation, as of the change that
-added `journal_generation`:
-
-* **`revision`** is the `revision` in `runtime/state.json`. It rises by one with
-  every write of that file: `enroll`, `run` (start and stop), `pause`, `resume`,
-  `stop`, `release`, and the runner recording `last_error`. It covers ownership,
-  pause, the runner's state and error, and the configuration digest. It does
-  **not** move when a delivery record changes (admit, record, `retry`,
-  `recover`, a firing, reconciliation, filing under `done/`, `sweep`), when
-  `config.json` is edited, or when the schedule, `fired/` or `out/` change by
-  hand or by a plain `tick`.
-* **`journal_generation`** is the number in `runtime/journal.gen` (0 when the
-  file is absent), an additive field on the status object. Every write to the
-  delivery journal moves it, each write in two steps: odd while the write is in
-  progress, even again once it is done. The writes it covers: delivery records
-  (admission of an attempt, recording its result, marking a path missing,
-  reconciliation fixes, imports of legacy `out/` entries, `retry`, `recover`, the
-  runner's finalization of an in-flight attempt, and the `out_collision` the
-  standalone tick attaches to a record); a firing (prepared record, `out/` entry,
-  marker, delivery record, prepared record removed, as one bracket);
-  completing, discarding or setting aside a prepared firing in reconciliation;
-  the move of a settled record under `done/`; and the removal of records by
-  `sweep`. It does **not** cover `done/index` (a cache of what the records say;
-  rewriting it changes nothing `status` prints), `config.json`, `state.json`,
-  the schedule, `fired/` or `out/` outside a firing, or the contents of any
-  payload.
-* A client that wants "anything protocol-visible changed" compares both numbers
-  and the `consistent` flag; a number alone says nothing about the other file.
-  Both are observations: equal numbers across two reads say no write went by
-  between them (as far as these files go), not that a later write will not.
-  `journal.gen` is written without fsync (the records it brackets are made
-  durable by their own writes; the number only has to serve readers on the same
-  machine, and fsyncing it would double the cost of every journal write). After a
-  power loss it can read as an older value, so compare it for equality with what
-  you last saw, never for order across a restart of the machine, and treat a
-  snapshot taken before the restart as stale.
-
-`status` takes no lock. It reads `journal.gen` before and after its pass and
-reports `consistent: false` when:
-
-* the number changed between the two reads (`journal_changed_during_read`);
-* the number is odd, so a journal write is in progress or an earlier one did not
-  finish (`journal_write_in_progress`). A crash can leave it odd; the next
-  command that takes the mutation lock (any control command, `tick`, `sweep`, a
-  runner start) settles it, because holding the lock means no writer is alive;
-* the file is not a readable number (`journal_generation_unreadable`); the next
-  journal write replaces it.
-
-Each diagnostic names `runtime/journal.gen`, and a client refreshes before acting,
-as for any `consistent: false`. The existing check on `state.json` stays.
-
-A firing creates its `out/` entry before its delivery record. While it runs the
-prepared record names that path, so `status` does not list the entry as an
-unregistered `legacy_out` delivery (it lists no delivery for it yet, and the
-generation is odd, so the read is `consistent: false` anyway). A prepared record
-left by a crash keeps its entry out of the unregistered list until the next `run`
-completes or discards it.
-
-## Consumers and deliveries
-
-A *delivery* is one directory in `out/`. A *consumer* is whatever you configure
-to receive deliveries: any executable or script, with or without AI. Nothing is
-discovered: a `consume.sh` lying around, in an instance or inside a payload,
-enables nothing. Only an explicit `runtime/config.json` does.
-
-```json
-{
-  "schema_version": 1,
-  "consumer": {
-    "argv": ["/bin/sh", "/example/project/copy-note.sh"],
-    "cwd": "..",
-    "env": {"EXAMPLE_QUEUE": "demo"}
-  }
-}
-```
-
-* `argv` is a nonempty array of literal strings. Element zero must be an
-  absolute path to an existing executable file. A script that is not executable
-  works with an explicit interpreter as above. There is no shell expansion and
-  no PATH search.
-* `cwd` is required, resolved relative to the canonical instance directory
-  (`..` is the project containing `.groundhog/`), and must exist.
-* `env` (optional) is a map of strings. Names must be plain identifiers, and the
-  three reserved names below are refused.
-
-`run` reads and validates the file before it ticks anything, and freezes it for
-the runner's lifetime (a change needs `stop` and `run`). An invalid file,
-a missing executable or cwd, or a reserved name makes `run` exit 2 with the
-reason on stderr and ticks nothing; `status` shows `consumer.valid: false` and a
-`consumer_config_invalid` diagnostic. That differs on purpose from having no
-file: with no `config.json`, `run` still ticks and registers deliveries as
-`pending` with reason `no_consumer`, and invokes nothing. An unowned standalone
-`tick` never invokes a consumer even when a config exists.
-
-**Invocation.** The runner executes `argv` plus one extra argument: the
-canonical absolute delivery directory. The consumer starts in `cwd`, with stdin
-from `/dev/null`, with the runner's environment, then the `env` map, then:
-
-```
-GROUNDHOG_INSTANCE=/absolute/project/.groundhog
-GROUNDHOG_DELIVERY_ID=d-…
-GROUNDHOG_ATTEMPT_ID=a-…
-```
-
-The owner token and the token file's path never reach it. It inherits no lock
-descriptor, so a consumer that outlives a crashed runner cannot hold the runner's
-locks. `argv`, `env` and the consumer's output never appear in `status`;
-stdout and stderr go to the runner's own streams. The consumer runs with the
-default SIGPIPE disposition, although the runner itself ignores SIGPIPE (see
-[The runner's output streams](#the-runners-output-streams)).
-
-**Its own session.** A consumer must survive Ctrl-C on the runner's terminal.
-bash 3.2 on macOS has no `setsid(1)`, so the runner starts the consumer through
-`perl -MPOSIX -e 'POSIX::setsid(); exec …'` when perl has `POSIX`, which is the
-case wherever perl is already the lock helper. The consumer becomes leader of a
-new session and process group (its pgid equals its pid) and replaces perl by
-`exec`, so the pid the runner waits on is the consumer's. The same step restores
-SIGINT and SIGQUIT, which a background job of a non-interactive shell inherits
-as ignored. Where perl lacks `POSIX`, `setsid -w` is used if present (untested
-here, since this was built on macOS); with neither, the host does not offer
-`consumer-v1`. `tests/test_delivery.sh` checks the separate group and that a
-SIGINT to the runner's group leaves the consumer running.
-
-**Acknowledgement.** Exit status 0 is the whole acknowledgement. It means the
-consumer accepted responsibility before returning: either it finished
-synchronous work, or it durably accepted asynchronous work (starting a process is
-not durable acceptance). The delivery becomes `accepted` and stays in `out/`
-unchanged. Any other status, a signal or a failure to start becomes `failed` with
-the exit code and a structured error. bash reports a signal death as 128 plus the
-signal number, and a script can exit with such a number itself, so the record
-carries the status as `exit_code` and, for 129 to 159, also the `signal` name with
-a message that says both readings are possible. A consumer that cannot be started
-exits 126 or 127, with its reason on stderr, likewise ambiguous with a script that
-returns them. `execution` stays `unknown` in every case: Groundhog records the
-handoff, not whether the work succeeded. Groundhog never retries by itself and
-promises no exactly-once effects; consumers deduplicate on `GROUNDHOG_DELIVERY_ID`.
-
-**The journal.** Delivery records live in `runtime/deliveries/<id>.json`, one
-file per delivery, each replaced atomically. The runner's firings are journaled:
-a prepared record (`runtime/prepared/<id>.json`) naming the schedule path,
-fired marker, occurrence and the original source's identity (inode and mtime)
-is written first; the item is copied into `runtime/staging/<id>/`, renamed
-into `out/`, marked in `fired/`, recorded as a pending delivery, and only then
-is the prepared record removed. Each step can be redone or finished by the next
-`run`. The `.landing` names of the passive tick never appear for these.
-Standalone `tick` keeps its legacy behavior.
-
-A fired one-shot's marker records the source generation, and the journaled tick
-removes a one-shot whose marker exists only if its directory still has that
-generation. Say a crash left the marker without the removal and the operator then
-put a new `schedule/once/<item>/` in place the same day: the recovery step and
-every later tick leave the replacement alone (the runner logs it once). A marker
-without a recorded generation (the standalone tick's, or one written before this
-was recorded) keeps the legacy rule, so its one-shot is removed. The standalone
-tick itself is unchanged.
-
-**Terminal records and the lock (implementation reading).** Not part of the
-accepted contract's interface; `status --json` shows the same deliveries as
-before. A delivery that is `accepted` or `missing` never changes again, so the
-runner files its record under `runtime/deliveries/done/<id>.json` on a later
-cycle (a rename; `retry`, `recover`, `sweep` and `release` look in both
-directories). Next to those files sits `done/index`, a cache the runner
-writes: per filed record, the inode, size, mtime and mode the file had when the
-runner last read it, and the JSON `status` prints for it. This keeps the cost of a
-cycle, of `release` and of `status` from growing with every settled delivery
-(`status --json --active` also leaves them out of its output, see [Inspection](#inspection)):
-
-* A cycle lists `done/` with one `find` and one `stat`. A record whose signature
-  matches the index is trusted without being parsed; any other (new, edited,
-  replaced, or with a changed mode) is parsed. An unchanged listing costs
-  nothing more. Records that carry `out_collision` entries are never cached, so
-  status always re-reads them.
-* The barrier still fails closed. A file in `done/` that cannot be read, is not
-  a terminal record (for example an `in_flight` one filed there by hand), or also
-  exists in `deliveries/` blocks every consumer admission and shows in `status`
-  as `delivery_record_unreadable` or `delivery_record_malformed`, like an
-  unreadable record in `deliveries/`. The runner does not re-parse a filed record
-  on every cycle, so an in-place edit that leaves the inode, size, mtime (to the
-  second) and mode as they were goes unseen until `done/index` is removed or the
-  record is replaced; any atomic rewrite changes the inode.
-* The index is only a cache: delete it and the next `status` or `run` reads every
-  record once and, for `run`, writes it again. Deleting records (retention) is
-  not part of this layout; `sweep` still refuses while an owner exists, unless the
-  owner passes its token (`sweep --token-file`, see below).
-* A runner is the only writer of delivery records while it lives, so it reads
-  them without the mutation lock and takes the lock only to write: in slices of
-  about a second, each followed by a short pause for `pause`, `stop`, `retry` or
-  `recover` to take it, each record re-read before it is changed. The first
-  cycle after an upgrade files the existing accepted and missing records the same
-  way; a runner stopped during it finishes the job on the next run. Pending,
-  failed, in-flight and uncertain records stay in `deliveries/` and are read every
-  cycle, so a journal that accumulates those (for example `pending` with reason
-  `no_consumer`) still costs time per cycle, though no longer lock time.
-* The order of `deliveries` in `status --json` follows the files (live records,
-  then filed ones); delivery ids are random, so the order carried no meaning
-  before either.
-
-A name in `out/` or `schedule/` that is not valid UTF-8 (possible on Linux; APFS
-refuses it) cannot round-trip through a record, so it would have been imported
-again every cycle. The runner now leaves such a schedule item unfired
-and such an `out/` entry unimported (the standalone `tick` is unchanged); `status` does not list the entry as a
-delivery and reports `out_entry_name_not_utf8` or `schedule_name_not_utf8` instead.
-
-**Serial handoff.** One consumer call at a time per instance, across stop,
-crash and restart:
-
-1. under the mutation lock the runner checks the token, a stop request, the
-   pause, and the barrier below, picks the oldest pending delivery, and writes an
-   attempt as `in_flight` durably;
-2. it releases the lock and starts the consumer (so `pause`, `stop` and the
-   status commands never wait for a running consumer; `status` takes no locks);
-3. it takes the lock again and records `accepted` or `failed`.
-
-A slow consumer delays only its own instance's later cycles; cycles never
-overlap, and missed slots are skipped, not queued. A paused instance admits no
-new handoff (pending stays pending); a call admitted before the pause finishes
-and records.
-
-**The barrier.** While any attempt is `in_flight`, or any delivery is
-`uncertain`, or any delivery record cannot be read, the runner admits no
-consumer call at all: not for other deliveries, not under a new configuration.
-Ticks still register new deliveries meanwhile (they wait as pending).
-
-**Crash and shutdown.** If the runner dies between step 1 and step 3 (`kill -9`,
-power loss), the record stays `in_flight` with an unknown outcome; `status` shows
-it as such and repairs nothing. The next `run` reconciles it to `uncertain`
-without replaying it. SIGINT, SIGTERM and SIGHUP do not kill the consumer: they
-close admission, detach and leave the delivery `uncertain` with the error code
-`consumer_detached`. `stop` closes admission but does not detach: the runner waits
-for the admitted call, records its result, then exits. Nothing reports `accepted`
-merely because a shutdown succeeded. A consumer never gets killed by Groundhog.
-
-A consumer that takes long should therefore accept quickly (hand the job to
-something that runs on its own, then exit 0) or expect a recovery: a supervisor
-whose wait for `stop` runs out and that sends the runner SIGTERM leaves the
-delivery `uncertain`.
-
-**`retry` and `recover`** both need the token and a stopped runner (a live one
-makes them exit 4), and both write the record durably before they return.
-
-* `retry --delivery ID` turns a `failed` delivery `pending` (same delivery ID;
-  history kept; the next admission makes a new attempt). Retrying a `pending`
-  delivery changes nothing. Any other state exits 5. If the failed handoff might
-  have had side effects, reconcile them first.
-* `recover --delivery ID --decision accept|retry` settles an `uncertain` (or
-  abandoned `in_flight`) delivery. First establish by your own means that the
-  original consumer call has finished; a lock, a dead runner or a missing pid
-  proves nothing. `accept` records the delivery as `accepted` on your say-so,
-  `retry` makes it `pending`. The decision and its time go on the attempt, whose
-  outcome stays `unknown`. Recovery invokes nothing. Another unresolved attempt
-  keeps the barrier up.
-
-**`discard --delivery ID`** (capability `discard-v1`, accepted on 2026-11-18) lets the token holder dispose of a
-delivery no consumer took: the runner must be stopped (exit 4 while one is alive) and the
-token must match (exit 3; exit 2 for a missing token file or a missing or malformed id; 5 for
-a missing or unreadable record or any state but `pending` with reason `no_consumer`; 6 for an
-I/O failure). It removes the delivery's `out/` entry and records it as `missing` with reason
-`discarded`; nothing is invoked, the fired marker stays (the occurrence does not fire again),
-and the barrier is as it was. Run it again after an interruption and it finishes; on a delivery
-already discarded it changes nothing. Such a record is terminal: `status --json --active`
-counts it in `settled.missing` and `sweep` removes it once old enough. `failed` and
-`uncertain` deliveries are not discarded: retry them, or `recover --decision accept`.
-
-`release` exits 5 while any attempt is unresolved or any record unreadable, unless it
-is given `--leave-unresolved`; that releases and leaves the records and the barrier
-as they are. Each attempt records `owner_label`, the label of the owner that admitted
-the call, next to `started_at`, so after a release `status` still shows whose call an
-unresolved attempt was before the next owner chooses `recover`. (Attempts admitted
-before this field existed lack it; clients that do not know it ignore it.)
-
-**Reconciliation on `run`**, under the mutation lock, at the start of each cycle
-and whatever the pause says:
-
-* an interrupted firing is completed, or discarded when nothing was exposed
-  (and refired if still due); evidence that conflicts (a fired marker but no
-  `out/` entry, or an unreadable prepared record) is set aside as
-  `runtime/prepared/<id>.blocked`, reported by `status` as
-  `firing_reconciliation_error`, and its occurrence is not fired again;
-* abandoned `in_flight` attempts become `uncertain`;
-* complete `out/` directories without a record become `pending` deliveries with
-  `origin: legacy_out` and an unknown occurrence, ignoring `*.landing`; this
-  imports metadata only and never implies a handoff;
-* pending deliveries whose path vanished become `missing`, never recreated;
-* an `out/` name that already exists when an occurrence fires follows the legacy
-  no-overwrite rule (the firing is recorded, one-shots are still removed), no
-  second delivery is invented, and the existing delivery's record carries an
-  `out_collision` that `status` reports.
-
-One compatibility note: a one-shot whose fired marker already exists is still
-removed by the next tick, as in the legacy script; the source-identity check
-only protects the runner's own recovery from deleting a replacement.
-
-**`sweep` on a supervised instance** (one with delivery records or `state.json`)
-keeps every out entry whose delivery is pending, failed, in flight or
-uncertain, and every unregistered entry, plus the `fired/<date>/` directories
-their markers live in, and reports each as `skipped`. Accepted entries leave
-together with their record; a record whose path is already gone leaves once it is
-old enough, as do terminal `missing` records. An unreadable record stops the
-sweep before it removes anything. An instance with no runtime state sweeps
-exactly as before.
-
-**`sweep --token-file PATH [days]`** (capability `sweep-owner-v1`) is that same
-sweep for an owned instance, run by the holder of its token, so that the records
-a supervised instance accumulates can be cleared without releasing it. The
-runner must be stopped (exit 4 while one is alive) and the token must match the
-current owner (exit 3 if it does not; exit 2 if the file is missing or the
-arguments are wrong, with `days` before or after the option; an unreadable record
-exits 5 and nothing is removed). It removes the same things and keeps the same
-things as the sweep above, so pending, failed, in-flight and uncertain deliveries
-stay, and are reported as `skipped`, whatever their age. That includes `pending`
-deliveries with reason `no_consumer`: no consumer has seen them, and removing
-one would erase the only trace of a delivery nobody took. They stay until a
-consumer is configured and takes them, or until the owner discards them with `discard`. The sweep writes no state, so ownership, pause and the
-revision stay as they were.
-
-## Deployment and migration
-
-Written for operators on 2026-11-15, from the behavior this repository's tests
-exercise (`tests/test_e2e.sh` walks the paths below on scratch instances). The
-runtime is optional and opt-in per instance. Nothing in this script, in
-`install.sh` or in an upgrade enables it for an instance that did not ask.
-
-### Tick-only installations keep working
-
-An instance that never runs `enroll` has no owner, no pause and no runner, and
-behaves as before: `tick` copies what is due into `out/` and records it in
-`fired/`, with the same names, markers and one-shot removal. The new script
-differs for such an instance in a few small, visible ways:
-
-* `tick`, `init`, `add`, `drop` and `sweep` take a short mutation lock, which
-  creates `.groundhog/runtime/locks/` (two empty lock files) on first use. They
-  create no other runtime file: no `state.json`, no `config.json`, no delivery
+* **Gone:** `enroll`, token files, generations, `release`, `stop`,
+  `sweep --token-file`, the consumer config, the delivery journal under
+  `runtime/deliveries/` (and its `prepared/`, `done/` and `journal.gen`), the
+  handoff barrier, `recover`, `discard` and `status --active`. Each of them now
+  exits 1 (`unknown command`) or 2 (an unknown option).
+* **Changed:** `pause` and `resume` take no token; `retry` takes a delivery,
+  not `--token-file` and `--delivery`; `run` is a plain tick loop with no
+  token; plain `tick`, `init`, `drop` and `sweep` work on every instance;
+  `status --json` has no `owner`, `runner`, `consumer`, `revision`,
+  `journal_generation` or `consistent`, and reports deliveries from their
   records.
-* `help` lists the new commands. `lint` and `add` print a `note:` on stderr when
-  an item id exists at more than one schedule path (see
-  [Output name collisions](#output-name-collisions)); their stdout and exit codes
-  stay the same. `list` no longer fails under bash 3.2 when an item directory has
-  no subdirectories.
-* `capabilities --json` and `status --json` read the instance without writing
-  anything and work before `init`.
-
-No old consumer, tick loop or cron line needs a change. Nothing is discovered:
-a `consume.sh` in an instance or a payload enables nothing, and `run` refuses
-to start without a token from an explicit `enroll`.
-
-### Opting one instance in
-
-Do this per instance, deliberately; discovery or an upgrade never does it for
-you.
-
-1. **Check the host.** `./groundhog.sh capabilities --json` should list all six
-   capabilities (`status-json-v1`, `ownership-v1`, `runner-v1`, `pause-v1`,
-   `consumer-v1`, `delivery-v1`), plus `release-unresolved-v1` (the flag for
-   `release`), `status-active-v1` and `next-due-v1` (flags for `status`), `add-while-owned-v1` (`add` on an
-   owned instance, and its `--from` flag), `sweep-owner-v1` (the flag for `sweep`) and `discard-v1`
-   (the `discard` command). Without `consumer-v1` and `delivery-v1` the instance can still be
-   owned, paused and run delivery-only.
-2. **Stop whatever else writes to the instance.** Other `tick` loops, cron lines,
-   and any process that moves entries out of `out/` (see the next section). An
-   older copy of the script, or a loop calling it, knows nothing about the lock,
-   the owner or the pause and can bypass all three.
-3. **Choose where the token lives.** A private directory outside the instance,
-   for example `~/.config/<your-supervisor>/session/`. The token file is the
-   whole credential: whoever can read it controls the instance.
-4. **Enroll.** `./groundhog.sh enroll --owner-label my-service --token-file
-   /private/dir/token`. This writes the token and the owner record and starts
-   nothing. The pause stays off unless you set it.
-5. **Optionally write `runtime/config.json`** (a consumer; see
-   [Consumers and deliveries](#consumers-and-deliveries)). Without one the runner
-   fires deliveries into `out/` and marks them `pending` with reason
-   `no_consumer`. Any entries already in `out/` become pending deliveries on the
-   first `run` and go to the consumer if one is configured, so move aside anything
-   you do not want handed off.
-6. **Run it under a supervisor of your choice.** `run` is a foreground process:
-   a terminal multiplexer pane, a launchd or systemd unit, a `nohup` line, a
-   process manager. Groundhog does not install or start one. Give the service the
-   token file path (and nothing else secret): `./groundhog.sh run --token-file
-   /private/dir/token --interval-seconds 60`.
-7. **Operate it with the same token file**, from any process: `status --json`
-   (no token needed), `pause`, `resume`, `stop`, `retry`, `recover`, `release`.
-
-A service may keep the token across its own restarts and run again without
-re-enrolling: `stop` ends the runner and keeps the owner. `release`, after a
-safe stop and with no unresolved handoff (or with `--leave-unresolved`, which leaves the
-unresolved attempts and their barrier for the next owner), ends ownership; then delete the token
-file. The runtime has one rule for every supervisor, human or service. A client
-may choose a stricter policy for itself (for example never reusing a stored
-token after a restart); that is its own choice and not a limit of this script.
-
-### Migrating from a tick loop
-
-A hand-rolled loop (`while sleep 60; do ./groundhog.sh tick; done`, a cron line,
-a launchd job) and `run` must not tick at once. The script cannot see the
-loop, so the order matters:
-
-1. **Stop the loop** and confirm nothing else calls it
-   (`pgrep -fl 'groundhog.sh'`; check cron and launchd). If the loop stays
-   alive, a standalone `tick` meets the owner and fails with exit 3, but an older
-   copy of the script will not notice and will fire alongside the runner.
-2. **Decide who consumes `out/`.** If a script moves entries out of `out/`
-   today, either keep the instance unenrolled (nothing changes), or turn that
-   script's per-entry work into a configured consumer (it receives one absolute
-   delivery path and exits 0 to accept) and stop its directory watcher. Do not
-   run a watcher and a configured consumer together: both would take the same
-   entry, and a pending delivery whose directory has been moved away is recorded
-   `missing` and never handed off.
-3. **Leave `fired/` and `schedule/` alone.** Markers carry over, so nothing fires
-   twice. Entries still in `out/` are imported as `legacy_out` pending
-   deliveries and go to the consumer one at a time; drain or move aside what
-   should not.
-4. **Enroll, configure, run** as above.
-
-To go back: `stop`, `release`, delete the token, restart the old loop. Delivery
-records and the pause stay in `runtime/` and are ignored by an older script.
-
-### Upgrading the vendored script
-
-Replacing `.groundhog/groundhog.sh` (and `README.md`), by hand or with
-`./install.sh <host-dir>`:
-
-* **Does:** swap the script, README and `docs/`; run `init`, which only creates missing
-  trays.
-* **Does not:** touch `schedule/`, `out/`, `fired/` or anything in `runtime/`;
-  enroll, configure, start or stop anything; change an existing owner, pause or
-  delivery record. An instance that was enrolled stays enrolled, and the
-  installer leaves it alone (`init` on an owned instance exits 3, which
-  `install.sh` reports as a note).
-* **Replaces the script by rename.** `install.sh` copies the new script to a
-  temporary file in `.groundhog/` and renames it over the old one, so a runner
-  or consumer that is already running keeps reading the old file (bash reads a
-  script lazily, which makes an in-place overwrite unsafe). Only a runner
-  started afterwards runs the new version, so to be sure which version runs,
-  `stop` the runner and start it again with the same token. A by-hand `cp` over
-  the script does not have this property: stop the runner first.
-* **Old copies elsewhere** (other projects, other worktrees) stay old: they ignore
-  the lock, owner and pause.
+* **Reversed:** "item contents are opaque" and "metadata beside, never
+  inside". `run`, `.groundhog-record` and `.groundhog-log` are reserved names
+  inside an item and a delivery. Check before upgrading that no item already
+  holds an executable `run` that was not meant to be started.
+* **Left alone:** `runtime/config.json`, `runtime/state.json` and
+  `runtime/deliveries/` stay on disk, ignored. `status` flags the first two
+  (`config_ignored`, `state_ignored`). A pause recorded in `state.json` no
+  longer applies: run `pause` again after upgrading if the instance should stay
+  paused. Deliveries already in `out/` have no record and never run.
+* **To move a consumer over:** put its per-delivery work in the item as `run`
+  (it gets the same `$1` and the same three `GROUNDHOG_*` variables), delete
+  `runtime/config.json`, and tick plainly from cron, a loop or `run`.
 
 ## Output name collisions
 
-A firing lands in `out/<item-id>-<date>` (`-<HH-MM>` for `every/`). The legacy
-rule, kept by the runtime, never overwrites an existing entry: the occurrence is
-marked fired and, for a one-shot, the source is still removed, but no second
-delivery exists. Two firings can claim one name in these ways. What each leaves
-behind, as of this version:
+A firing lands in `out/<item-id>-<date>` (`-<HH-MM>` for `every/`). Groundhog
+never overwrites an existing entry: the occurrence is marked fired and, for a
+one-shot, the source is still removed, but no second delivery exists, so **the
+later occurrence's `run` never runs**. Two firings can claim one name in these
+ways:
 
 | Case | Result |
 |---|---|
-| The same item id at two schedule paths, due the same day (`daily/09/foo` and `daily/17/foo`; `daily/foo` and `weekly/sun/foo`) | The first firing (in `due` order) is the delivery. The later one is marked in `fired/` and gets an `out_collision` diagnostic on that delivery in `status`. `lint` and `add` print a `note:` when an id exists at more than one path. |
+| The same item id at two schedule paths, due the same day (`daily/09/foo` and `daily/17/foo`; `daily/foo` and `weekly/sun/foo`) | The first firing (in `due` order) is the delivery. The later one is marked in `fired/`, warned about on stderr, and appended as a `collision` line to the delivery's record, which `status` shows as an `out_collision` diagnostic. `lint` and `add` print a `note:` when an id exists at more than one path. |
 | A one-shot and a recurring item with one id | Same, and the one-shot's source is removed even though it was never delivered: only the diagnostic and its marker remain. Keep one-shot ids unique. |
 | The same id in two `every/` buckets (`every/1h/foo`, `every/30m/foo`) at a shared slot | Same as the first row. |
-| Standalone `tick` and `run` mixed on an instance once supervised (after `release`) | A hand-run `tick` that finds the name taken warns on stderr and also attaches the `out_collision` to the delivery's record. An instance that never had delivery records keeps the legacy stderr warning only. |
-| The name exists from another source (a legacy entry, a hand-made directory) | The existing directory becomes the delivery (`legacy_out`); the firing is recorded and not delivered; `out_collision` as above. |
-| A non-directory (file, dangling symlink) squats on the name | No delivery can stand for it. The firing is marked and not delivered; `status` lists the entry as `out_entry_not_directory` and the runner logs `out_collision`; there is no `out_collision` record for it. |
+| An occurrence re-armed by deleting its marker while its entry is still in `out/` | Same: recorded, not delivered, `out_collision`; the delivery's run is not started again. |
+| A tick that crashed between the rename and the marker | The next tick finds the occurrence's own delivery and records it as a collision with itself. Harmless: the delivery and its run are untouched. |
+| A directory made by hand (no record) holds the name | The firing is marked and not delivered, with the stderr warning only: there is no record to carry the collision, and `status` lists the entry as `unrecorded`. |
+| A non-directory (file, dangling symlink) holds the name | The same, and `status` lists the entry as `out_entry_not_directory`. |
 | The same name on different dates | No collision: the date is part of the name. |
-| A path reused after the first delivery vanished | The old record turns `missing`; the new firing is a new delivery with its own id; a later collision attaches to the live delivery. |
-| An occurrence re-armed by deleting its marker while the entry is still in `out/` | The refire finds the name taken: recorded, not delivered, `out_collision`. |
 
-A collision costs the later occurrence (it is not delivered and not retried);
-the earlier delivery is never overwritten. If two items must both deliver on one
-day, give them different ids.
+If two items must both deliver on one day, give them different ids.
 
 ## Inspection
 
 `capabilities --json` and `status --json` are the machine-readable view of an
 instance. Each prints one JSON object and a newline on stdout; diagnostics go to
-stderr. They take exactly `--json` (anything else exits 2; `status` also takes `--active`, below), and `status` needs the
-script to sit in a `.groundhog/` directory (otherwise exit 2). Output is UTF-8;
-human output from the other commands is not an API.
+stderr. They take exactly `--json` (`status` also takes `--next-due`); anything
+else exits 2, and `status` needs the script to sit in a `.groundhog/` directory
+(otherwise exit 2). Output is UTF-8; human output from the other commands is
+not an API. The full projection is in the
+[runtime contract](docs/runtime-contract.md#read-only-json-projection).
 
 They are **strictly read-only**, even on an uninitialized instance: no
-directories, lock files or markers are created, nothing is ticked, repaired or
-overwritten, and payload contents are never read or evaluated (only directory
-names are looked at). The `due`, `list`, `out` and other legacy commands keep
-their behavior, including creating the trays.
+directories, lock files or markers are created, nothing is ticked, started or
+repaired. Of a payload, only directory names and the delivery's own record are
+read. To tell `running` from `interrupted`, `status` tests the record's lock,
+taking it for an instant and letting it go; a `retry` or tick that tries to
+start that delivery in that instant finds it busy.
 
 ```
 $ ./groundhog.sh capabilities --json
-{"protocol":"groundhog-runtime","protocol_version":1,"implementation_version":"dev","capabilities":["status-json-v1","status-active-v1","next-due-v1","add-while-owned-v1","ownership-v1","runner-v1","pause-v1","sweep-owner-v1","discard-v1","consumer-v1","delivery-v1","release-unresolved-v1"]}
+{"protocol":"groundhog-runtime","protocol_version":2,"implementation_version":"dev","capabilities":["status-json-v2","next-due-v1","add-from-v1","pause-v2","handlers-v1"]}
 ```
 
-`capabilities` lists only what this script implements on this host: `status-json-v1`,
-`status-active-v1`, `next-due-v1` and `add-while-owned-v1` always, `ownership-v1`, `runner-v1` and `pause-v1` where the locking tools
-exist (see [Runner, ownership and pause](#runner-ownership-and-pause)), and
-`sweep-owner-v1` and `discard-v1` with them, and
-`consumer-v1`, `delivery-v1` and `release-unresolved-v1` where a consumer can also be
-started in a session of its own. A client needs the six capabilities the contract
-names (`status-json-v1`, `ownership-v1` through `delivery-v1`) before it may offer
-supervised control, `release-unresolved-v1` before it passes `--leave-unresolved` to
-`release`, `status-active-v1` before it passes `--active` to `status`, `next-due-v1` before it
-passes `--next-due`, `add-while-owned-v1` before it passes `--from` to `add` or relies on `add` while owned,
-`sweep-owner-v1` before it passes `--token-file` to `sweep`, and `discard-v1` before it runs `discard`. An older
-script answers `capabilities` with its ordinary `unknown command` error (exit 1).
-
-`status --json` follows the projection in the
-[runtime contract](docs/runtime-contract.md#read-only-json-projection):
-
-* `schedule` has one record per recognized item: its `path` (the identity,
-  relative to the instance, so same-named items at different paths stay
-  distinct), `item_id` (the last path component, verbatim), `paused_by` (the
-  `.paused` components above or at the item), `eligible_now`, `fired_marker`,
-  `fired`, `firing_allowed`, `blocked_by` and `cadence`. `eligible_now` and `fired_marker`
-  come from the same `walk_due` and `fired_marker_for` that `tick` and `due` use,
-  so they agree with `due` at any moment. `fired_marker` names the marker for
-  the occurrence due right now and is `null` when none is. Paths the schedule
-  grammar rejects are listed in `diagnostics` (the ones `lint` reports); an item
-  that `tick` would nonetheless fire is also listed, because status says what
-  `tick` would do.
-* `cadence` is an additive, structured description of when the item recurs,
-  taken from the components the schedule grammar matched (a client never parses
-  `path`): `{"axis","day","date","time","interval","defaulted"}`, every key
-  always present. `axis` is `daily`, `weekly`, `monthly`, `yearly`, `once` or
-  `every`. `day` is `mon`..`sun` (weekly) or the day of month as a string such as
-  `"15"` (monthly). `date` is `"MM-DD"` (yearly) or `"YYYY-MM-DD"` (once).
-  `time` is local `"HH:MM"` (`09` reads `"09:00"`) or `null`. `interval` is
-  `"15m"`/`"3h"` (every). Unused fields are `null`. `defaulted` is `true` when
-  the axis root supplied the default: weekly `mon`, monthly `"1"`, yearly
-  `"01-01"`, and once with `date: null` meaning the next tick. The whole object
-  is `null` for an item that `tick` would fire but the grammar does not
-  recognize. Paused items keep their cadence.
-* `next_due` (capability `next-due-v1`, accepted on 2026-11-18) is an additive field
-  on each schedule record, present only under `status --json --next-due` (which
-  combines with `--active`); without the flag the key is absent and the output and
-  its cost are unchanged. It is the UTC time
-  (`"2026-11-19T07:45:00Z"`) at which the item's next occurrence that has not
-  fired begins, or `null`. It is computed by asking the same `walk_due` that
-  `tick`, `due` and `eligible_now` use about later local moments, so it
-  cannot disagree with `tick`. An item that a tick now would fire reads
-  `observed_at`, whether or not pause or an owner holds it (`firing_allowed`
-  and `blocked_by` say whether it will fire); an unfired past `once` item is
-  such an item. Otherwise it reads when the item's next occurrence begins:
-  its explicit time in local time (a skipped wall-clock time on a
-  spring-forward day reads the moment the clock jumps, a repeated one its
-  first pass), local 00:00 for an item with no time, the start of the next
-  slot for `every/` (00:00 the next day after the last, shorter slot), always
-  with seconds `00`. It is `null` for an item paused by its own or an
-  ancestor's `.paused`, a `once` item that has fired, an item the grammar does
-  not recognize that is not due now, and an item with no occurrence in the
-  next nine years (`yearly/02-30`). The item fires on the first tick at or
-  after `next_due`, not at it: a tick that comes later fires it, and an
-  occurrence that no tick reaches is missed, as under "Missed days", after
-  which `next_due` names the following one. A client passes the flag after finding
-  `next-due-v1` in `capabilities`; a script without it exits 2 on the flag, and
-  clients treat an absent field and `null` alike.
-* `deliveries` lists the records under `runtime/deliveries/` plus, read-only,
-  every other directory in `out/` as `origin: "legacy_out"`, state `pending`,
-  reason `unregistered`, `id: null`. Status registers nothing. Reasons the
-  runtime writes: `no_consumer` (pending, no config), `path_missing` and `discarded` (missing: its entry vanished, or the owner
-  removed it with `discard`), `result_not_recorded` and `consumer_detached` (uncertain).
-* `status --json --active` (capability `status-active-v1`, accepted on
-  2026-11-17) is the same document with the settled deliveries left out of
-  `deliveries`: only `pending`, `in_flight`, `failed` and `uncertain` ones (and the
-  `legacy_out` entries) are listed, and a new top-level `"settled":
-  {"accepted": N, "missing": M}` counts the others. The default output has no
-  `settled` field and is unchanged. Every delivery leaves a record, so the full list
-  grows for as long as the instance runs (about 360 bytes per delivery: a year of one
-  `every/1m` item is roughly 190 MB); a client that needs the list to stay readable
-  passes the flag, after finding `status-active-v1` in `capabilities`. The flag also
-  keeps the work down: records the runner's `done/index` vouches for (see
-  [Terminal records and the lock](#runner-ownership-and-pause)) are counted in one
-  pass and neither parsed nor collected, so the cost is a listing of `done/` and
-  `out/`, not a read of every record. A filed record the index does not vouch for is
-  still parsed, so damage to it shows as the usual diagnostic and is not counted.
-  The newest settled delivery per item is not reported.
-* `owner`, `paused`, `revision`, `runner` and `consumer` come from
-  `runtime/state.json` and `runtime/config.json` when they exist, and default
-  (`owner: null`, `paused: false`, `revision: 0`, runner `stopped`, consumer not
-  configured) when they do not. `enroll`, `run`, `pause`, `resume`, `stop` and
-  `release` write `state.json`; `run`, `retry` and `recover` write delivery
-  records; nothing writes `config.json`. `consumer.valid` also reflects the
-  executable, cwd and environment names (status stats them and runs nothing), and
-  `consumer.config_digest` is the SHA-256 of the file the last `run` froze.
-  Secrets (the owner token verifier, consumer argv and environment) are never
-  printed.
-* `last_tick` is an additive field: `{"at": <UTC time>, "source": "runner" |
-  "standalone"}` for the newest tick that completed, or `null` when none was
-  recorded (or the record is missing or damaged). A tick that fires nothing
-  counts; **a paused tick counts too**, since the point is to show something is
-  calling `tick`, whether or not pause lets it fire. A tick refused because the
-  instance is owned, or one that fails, does not. `source` tells an owned
-  runner's cycle from a standalone `tick`; nothing names the caller, and the
-  field grants no control. It lives in `runtime/last_tick` (one line, replaced by
-  temp file and rename, taking no lock), and only the newest tick is kept.
-  Hosts without the lock helper record nothing.
-* `journal_generation` is an additive field: the change token for the delivery
-  journal (see [Change tokens](#change-tokens-revision-and-journal_generation)).
-* `consistent` is `false`, with `diagnostics`, when `state.json` or a delivery
-  record is unreadable, malformed or of an unsupported `schema_version`, when
-  `state.json` changes while status reads it, or when the delivery journal
-  changes, is mid-write or has an unreadable generation (`journal_changed_during_read`,
-  `journal_write_in_progress`, `journal_generation_unreadable`). An unusable `state.json` also
-  shows the runner as `unknown`, owner `null`, and adds `invalid_state` to every
-  item's `blocked_by`. A bad `config.json` only sets `consumer.valid: false`.
-  An `out_collision`, a `firing_reconciliation_error`, an
-  `out_entry_name_not_utf8` or a `schedule_name_not_utf8` is a diagnostic, not an
-  inconsistency.
-  Clients must refresh before acting. `observed_at` is UTC; schedule times use
-  the local clock, as `tick` does.
+`status --json` has `paused`, `last_tick` (`{"at", "source"}`, source
+`standalone` for `tick` and `runner` for the `run` loop, or `null`), `schedule`
+(one record per item, with `cadence`, `eligible_now`, `fired_marker`, `fired`,
+`firing_allowed` and `blocked_by`, and `next_due` under `--next-due`),
+`deliveries` (one per directory in `out/`, with its `state` and attempts) and
+`diagnostics`. `next_due` is the UTC time at which the item's next unfired
+occurrence begins, computed by asking the same `walk_due` that `tick` uses; the
+item fires on the first tick at or after it.
 
 Item names containing a tab or newline break `walk_due`'s own row format (as they
 do for `tick`); status skips the fragments rather than inventing items.
@@ -1042,34 +504,25 @@ do for `tick`); status skips the fragments rather than inventing items.
 ## Tests
 
 ```
-tests/run.sh                  # every test, under each bash found
-tests/run.sh test_state.sh    # one test file
+tests/run.sh                    # every test, under each bash found
+tests/run.sh test_handlers.sh   # one test file
 TEST_BASHES=/bin/bash tests/run.sh
 ```
 
 `tests/run.sh` runs each `tests/test_*.sh` under macOS's stock `/bin/bash` 3.2
 and under any newer bash installed (`/opt/homebrew/bin/bash`,
-`/usr/local/bin/bash`, or `bash` on `PATH`). It needs `python3` to parse the JSON
-output (the script itself uses no python) and optionally `jq`, which then parses
-every document as a second opinion. Tests copy the script into temporary
-directories under `$TMPDIR` and never touch a real schedule. To test a chosen
-moment they put a `date` shim first on `PATH`, so the script needs no test hook.
-The runner tests start real `run` processes in the background (own process group,
-short `--interval-seconds`, bounded waits), prove the lock with Python's
-`fcntl.flock`, and fail if a test leaves a runner behind. `test_runtime_gate.sh`
-simulates a host with no lock helper. Hosts that lack the runner's tools skip the
-runner tests. `test_e2e.sh` is one readable walk of the operator's path (tick-only use, the
-upgrade, recurring and overdue delivery, ownership, pause, synchronous and
-asynchronous consumers, shutdown, token reuse, release); `test_collisions.sh`
-covers [Output name collisions](#output-name-collisions); `test_scale.sh` writes thousands
-of settled records as fixtures, with no runner running for hours, and checks that
-`status --json --active` stays small and quick while the default output grows; `test_streams.sh` closes
-the runner's output pipes while a consumer runs. The consumer tests
-(`test_consumer.sh`, `test_delivery.sh`, `test_journal.sh`) use plain `/bin/sh` consumers that write marker files, kill
-the runner with `kill -9` or signal its process group while a consumer sleeps,
-hand-write delivery and prepared records for crashes that cannot be timed from
-outside, and skip on hosts without the lock and process-isolation tools. Run them
-from a foreground shell: a runner started from a background job of a
-non-interactive shell inherits an ignored SIGINT and cannot catch it.
+`/usr/local/bin/bash`, or `bash` on `PATH`). It needs `python3` to parse the
+JSON output (the script itself uses no python) and optionally `jq`, which then
+parses every document as a second opinion. Tests copy the script into
+temporary directories under `$TMPDIR` and never touch a real schedule. To test
+a chosen moment they put a `date` shim first on `PATH`, so the script needs no
+test hook. `test_handlers.sh` covers the record, the wrapper and what `run`
+gets, crashes and interrupts, and racing ticks; `test_retry.sh` covers
+`retry`; `test_pause_sweep.sh` the pause, `sweep` and the `run` loop;
+`test_runtime_gate.sh` a host with no lock helper and, on Linux, the
+`setsid(1)` path. Every run a test starts is a `/bin/sh` script that ends by
+itself or is killed by its process group, and a test fails if it leaves a run
+or a loop behind. Run them from a foreground shell: a loop started from a
+background job of a non-interactive shell inherits an ignored SIGINT.
 New tests: add `tests/test_<area>.sh`, source `tests/lib.sh`, and finish with
 `t_finish`.
