@@ -125,7 +125,7 @@ The file system is the protocol.
 4. For each one-shot under `once/<past-or-today-date>/`, remove the source after firing.
 5. Start every delivery in `out/` whose record says it has a `run` and never started (see [Runs](#runs)).
 
-While the instance is paused, a tick does none of this. `fired/` is what has fired; each delivery's record is what became of it.
+While the instance is paused, a tick does none of this. An item whose firing fails (a file the ticker cannot read, say) costs only itself: the tick warns on stderr, fires the rest, still starts the runs, and exits 1; `status` shows `firing_failed` for it until a tick fires it. A `run` that is present but not an executable file (no execute bit, a link that breaks once copied into `out/`) is warned about and the delivery is only delivered; `status` shows `run_not_executable`. `fired/` is what has fired; each delivery's record is what became of it.
 
 ## Catch-up
 
@@ -166,7 +166,7 @@ Anything can take items from `out/` immediately and the next tick will not re-de
 
 ### Polling
 
-Groundhog is passive — `tick` only fires when invoked. To bring the schedule to life, run `tick` on an interval. `./groundhog.sh run` is that loop, built in: it ticks every 60 seconds (`--interval-seconds N` to change it) until Ctrl-C, SIGTERM or SIGHUP, and exits 0 after the tick in progress. The simplest possible hand-made loop does the same:
+Groundhog is passive — `tick` only fires when invoked. To bring the schedule to life, run `tick` on an interval. `./groundhog.sh run` is that loop, built in: it ticks every 60 seconds (`--interval-seconds N` to change it) until Ctrl-C, SIGTERM or SIGHUP, and exits 0. Ctrl-C, or a signal sent to the loop's pid alone, lets the tick in progress finish; SIGHUP or SIGTERM sent to the loop's whole process group (a closed terminal pane, a service manager stopping the group) cuts that tick short, which is as safe as a crash (see the crash table in the [runtime contract](docs/runtime-contract.md#crash-windows)). The simplest possible hand-made loop does the same:
 
 ```
 while sleep 60; do ./groundhog.sh tick; done
@@ -218,9 +218,13 @@ keeps the old script until it is restarted.
 copy is self-contained, and `groundhog.sh` is the only file the instance
 needs; `README.md` and `docs/` are documentation.
 
-`.groundhog/runtime/` holds machine-specific state: the lock files, the pause
-and the last tick. It belongs in the project's VCS ignore list (for git, a
-`.groundhog/runtime/` line in `.gitignore`); `install.sh` writes no ignore file.
+`.groundhog/runtime/` holds machine-specific state: the lock files, the pause,
+the last tick and any firing that failed. It belongs in the project's VCS
+ignore list (for git, a `.groundhog/runtime/` line in `.gitignore`). So do the
+contents of `out/` and `fired/`: a tracked `out/` carries each delivery's
+record, and on another machine the next tick starts every pending `run` in it
+(for git: `.groundhog/out/*` and `.groundhog/fired/*`, with `!.gitkeep` lines
+to keep the trays). `install.sh` writes no ignore file.
 
 Coming from protocol 1 (the owner, runner and consumer)? See
 [Upgrading from protocol 1](#upgrading-from-protocol-1).
@@ -327,11 +331,15 @@ own (perl's `POSIX::setsid`, or `setsid(1)`), so Ctrl-C on a tick loop or a
 closed terminal cannot reach it, and the tick moves on at once: a slow or hung
 `run` stalls nothing. The wrapper holds the record's lock (`flock(2)` on
 `.groundhog-record`) for as long as `run` lives, then appends the exit line.
-`run` itself gets neither that lock nor the mutation lock. A signal to the
+`run` itself gets neither that lock nor the mutation lock. `$1` and the cwd
+are spelled canonically, whatever path the ticker used to reach the
+instance, so `$1` always lies under `$GROUNDHOG_INSTANCE`. A signal to the
 wrapper alone waits for `run`; to stop a run, signal its process group, which
 is the wrapper's pid (`kill -TERM -- -<pid>`): the exit line then records
 `143`. A `run` killed by a signal records 128 plus its number; a `run` that is
-gone records 127, one that is not executable 126.
+gone records 127, one that is not executable 126. On the `setsid(1)` path
+(a host without perl), a ticker that runs under bash 3.2, or was itself
+started with SIGINT ignored, passes that ignored SIGINT on to `run`.
 
 **States**, as `status --json` reports them from the record and its lock:
 
@@ -348,16 +356,28 @@ gone records 127, one that is not executable 126.
 **Interrupted is never re-run by itself.** A run whose wrapper died (a
 `kill -9` of its session, a reboot) leaves a start with no exit and a free
 lock. Groundhog cannot know how far it got, so it leaves it for you:
-`retry` it, or delete it.
+`retry` it, or delete it. `interrupted` means the wrapper is gone, not
+necessarily `run`: after a `kill -9` of the wrapper's pid alone, `run` goes on
+without the lock, and a `retry` would start a second copy beside it. Check
+(`ps`, or the run's own traces) before retrying.
 
 **`retry <delivery>`** starts the delivery's run again now, whatever its last
 run did, as a new attempt under the same lock. `<delivery>` is the name in
 `out/`, `out/<name>`, or the delivery's absolute path. It needs no token. It
 exits 4 while the delivery is running (or another writer holds the mutation
-lock), 3 while the instance is paused, 5 when there is nothing to run (no
+lock; it tries the record's lock three times, 0.1 s apart, first), 3 while
+the instance is paused, 5 when there is nothing to run (no
 record Groundhog made, a `none` record, or the `run` is gone), 2 for anything
 that is not a delivery of this instance. It returns once the run has started;
 watch `status --json` for its end.
+
+**For a `run`'s author.** A retry carries the same `GROUNDHOG_DELIVERY_ID` as
+the first attempt: a `run` that skips a delivery id it has seen before skips
+the retry too, and exits 0, which reads `accepted`. De-duplicate on the attempt
+id, or only on success. And a host that ticks and then moves `out/*` away (a
+hand-made loop feeding another tray) moves a delivery from under the run just
+started for it: leave deliveries whose record says `run`, or let `run` do the
+moving.
 
 **Executing tracked files.** `schedule/` is usually under version control, so
 a `git pull` or a clone can bring in a `run` that the next tick executes. Treat
@@ -422,6 +442,23 @@ on purpose.** A client tells them apart with `capabilities --json`:
 protocol 1 script answers `1` and lists `ownership-v1`; an older one still
 answers `capabilities` with `unknown command` (exit 1).
 
+Upgrade an instance in this order:
+
+1. **Stop and release any protocol 1 runner** with the old script, while its
+   commands still exist: `stop --token-file …`, then `release --token-file …`.
+   A runner left going keeps the old script in memory and goes on handing
+   `out/` to its consumer after the swap, while the new ticks start each item's
+   `run`: the work would happen twice. Stop other tick loops and cron lines
+   too.
+2. **Carry a pause over by hand.** If the instance is paused (its
+   `runtime/state.json` says `"paused":true`), create the file
+   `.groundhog/runtime/paused` before installing. Protocol 1 ignores it and
+   protocol 2 honours it from its first tick; otherwise the first tick from any
+   caller fires what is due.
+3. **Install with `install.sh`**, which replaces the script by a rename, not
+   with a `cp` over the old file.
+4. **Check `status --json`**, then resume ticking.
+
 * **Gone:** `enroll`, token files, generations, `release`, `stop`,
   `sweep --token-file`, the consumer config, the delivery journal under
   `runtime/deliveries/` (and its `prepared/`, `done/` and `journal.gen`), the
@@ -440,8 +477,8 @@ answers `capabilities` with `unknown command` (exit 1).
 * **Left alone:** `runtime/config.json`, `runtime/state.json` and
   `runtime/deliveries/` stay on disk, ignored. `status` flags the first two
   (`config_ignored`, `state_ignored`). A pause recorded in `state.json` no
-  longer applies: run `pause` again after upgrading if the instance should stay
-  paused. Deliveries already in `out/` have no record and never run.
+  longer applies (step 2 above carries it over). Deliveries already in `out/`
+  have no record and never run.
 * **To move a consumer over:** put its per-delivery work in the item as `run`
   (it gets the same `$1` and the same three `GROUNDHOG_*` variables), delete
   `runtime/config.json`, and tick plainly from cron, a loop or `run`.
@@ -481,8 +518,9 @@ They are **strictly read-only**, even on an uninitialized instance: no
 directories, lock files or markers are created, nothing is ticked, started or
 repaired. Of a payload, only directory names and the delivery's own record are
 read. To tell `running` from `interrupted`, `status` tests the record's lock,
-taking it for an instant and letting it go; a `retry` or tick that tries to
-start that delivery in that instant finds it busy.
+taking a shared lock for an instant and letting it go, so readers never get in
+each other's way; a tick that tries to start that delivery in that instant
+finds it busy and leaves it to the next tick, and `retry` tries again.
 
 ```
 $ ./groundhog.sh capabilities --json
@@ -519,6 +557,8 @@ a chosen moment they put a `date` shim first on `PATH`, so the script needs no
 test hook. `test_handlers.sh` covers the record, the wrapper and what `run`
 gets, crashes and interrupts, and racing ticks; `test_retry.sh` covers
 `retry`; `test_pause_sweep.sh` the pause, `sweep` and the `run` loop;
+`test_scale.sh` a tick over 3,000 finished deliveries, which must stay quick
+enough for other writers to get the lock;
 `test_runtime_gate.sh` a host with no lock helper and, on Linux, the
 `setsid(1)` path. Every run a test starts is a `/bin/sh` script that ends by
 itself or is killed by its process group, and a test fails if it leaves a run

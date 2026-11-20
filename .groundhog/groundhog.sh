@@ -522,9 +522,12 @@ cmd_due() {
 
 # tick: fire what is due, then start every delivery whose record says fired
 # and never started. Serialized with the other writers by the mutation lock,
-# and a no-op while the instance is paused (the pause gates both halves).
+# and a no-op while the instance is paused (the pause gates both halves). A
+# firing that fails costs only that item: the rest fire, the runs still
+# start, and the tick exits 1 (status shows firing_failed).
 TICK_SOURCE=standalone
 cmd_tick() {
+  local rc=0
   require_root
   passive_enter tick
   if [[ "$PASSIVE_PAUSED" == true ]]; then
@@ -532,66 +535,89 @@ cmd_tick() {
     last_tick_record "$TICK_SOURCE"
     return 0
   fi
-  tick_body
+  tick_body || rc=$?
   handlers_scan
   last_tick_record "$TICK_SOURCE"
+  return "$rc"
 }
 
-# tick_body — fire every due item. A firing copies the item to
-# out/<name>.landing, replaces any reserved files the copy brought with a fresh
-# record (the fired line), renames it into out/, then writes the fired marker.
-# The record is in place before the delivery is visible, so a crash at any
-# point leaves either nothing in out/ or a delivery that says "fired, never
+# tick_body — fire every due item (fire_one), note each that fails in
+# runtime/firing_failed (removed again by a tick in which none fails), and
+# return 1 if any did.
+tick_body() {
+  ensure_dirs
+  local now_t name src is_once slot failed=""
+  now_t="$(now_today)"
+  while IFS=$'\t' read -r name src is_once slot; do
+    [[ -n "$name" ]] || continue
+    if ! fire_one "$name" "$src" "$is_once" "$slot" "$now_t"; then
+      echo "error: tick: firing ${src#"$GH_DIR"/} failed; it is tried again on the next tick" >&2
+      failed+="$(now_utc) ${src#"$GH_DIR"/}"$'\n'
+    fi
+  done < <(walk_due)
+  if [[ -n "$failed" ]]; then
+    { mkdir -p "$GH_DIR/runtime" && printf '%s' "$failed" > "$GH_DIR/runtime/firing_failed"; } 2>/dev/null || true
+    return 1
+  fi
+  rm -f -- "$GH_DIR/runtime/firing_failed" 2>/dev/null || true
+}
+
+# fire_one NAME SRC IS_ONCE SLOT DATE — one due item. A firing copies the item
+# to out/<name>.landing, replaces any reserved files the copy brought with a
+# fresh record (the fired line), renames it into out/, then writes the fired
+# marker. The record is in place before the delivery is visible, so a crash at
+# any point leaves either nothing in out/ or a delivery that says "fired, never
 # started", which the next tick starts. The marker comes last: a crash just
 # before it leaves the delivery without a marker, and the next tick records
 # that occurrence as a collision with its own delivery (shown, harmless).
-tick_body() {
-  ensure_dirs
-  local now_t
-  now_t="$(now_today)"
-  local name src is_once slot dst tmp marker src_rel handler
-  while IFS=$'\t' read -r name src is_once slot; do
-    [[ -n "$name" ]] || continue
-    if [[ -n "$slot" ]]; then
-      dst="$OUT/${name}-${now_t}-${slot}"
-    else
-      dst="$OUT/${name}-${now_t}"
+# Called in a condition, so every step checks its own failure.
+fire_one() {
+  local name="$1" src="$2" is_once="$3" slot="$4" now_t="$5" dst tmp marker src_rel handler parent
+  if [[ -n "$slot" ]]; then dst="$OUT/${name}-${now_t}-${slot}"; else dst="$OUT/${name}-${now_t}"; fi
+  src_rel="${src#"$GH_DIR"/}"
+  marker="$(fired_marker_for "$src" "$now_t" "$slot")"
+  if [[ -e "$marker" ]]; then
+    :  # fired/ says this already fired today — leave it alone
+  elif [[ -e "$dst" || -L "$dst" ]]; then
+    printf 'warning: %s already exists in out/; recording firing without overwrite\n' "$(basename "$dst")" >&2
+    mkdir -p "$(dirname "$marker")" && touch "$marker" || return 1
+    note_collision "$dst" "$src_rel" "$now_t" "$slot"
+  else
+    tmp="${dst}.landing"
+    if [[ -e "$tmp" || -L "$tmp" ]]; then
+      [[ -L "$tmp" ]] || chmod -R u+w "$tmp" 2>/dev/null
+      rm -rf -- "$tmp" || return 1
     fi
-    src_rel="${src#"$GH_DIR"/}"
-    marker="$(fired_marker_for "$src" "$now_t" "$slot")"
-    if [[ -e "$marker" ]]; then
-      :  # fired/ says this already fired today — leave it alone
-    elif [[ -e "$dst" || -L "$dst" ]]; then
-      printf 'warning: %s already exists in out/; recording firing without overwrite\n' "$(basename "$dst")" >&2
-      mkdir -p "$(dirname "$marker")"
-      touch "$marker"
-      note_collision "$dst" "$src_rel" "$now_t" "$slot"
-    else
-      tmp="${dst}.landing"
-      [[ -e "$tmp" || -L "$tmp" ]] && rm -rf -- "$tmp"
-      cp -R -- "$src" "$tmp"
-      rm -rf -- "${tmp:?}/$REC_NAME" "${tmp:?}/$LOG_NAME"
+    cp -R -- "$src" "$tmp" || return 1
+    # A link to a directory is copied as the link: write nothing through it
+    # (it gets no record, so it never runs).
+    if [[ ! -L "$tmp" ]]; then
+      chmod -R u+w "$tmp" || return 1     # an item without owner write still takes its record
+      rm -rf -- "${tmp:?}/$REC_NAME" "${tmp:?}/$LOG_NAME" || return 1
       handler=none
-      [[ -f "$tmp/$RUN_NAME" && -x "$tmp/$RUN_NAME" ]] && handler=run
+      if [[ -f "$tmp/$RUN_NAME" && -x "$tmp/$RUN_NAME" ]]; then
+        handler=run
+      elif [[ -e "$tmp/$RUN_NAME" || -L "$tmp/$RUN_NAME" ]]; then
+        echo "warning: $src_rel/$RUN_NAME is not an executable file, so the delivery is not run" >&2
+      fi
       rand_hex 8
-      printf 'fired d-%s %s %s %s %s %s\n' "$RAND" "$(now_utc)" "$handler" "$now_t" "${slot:--}" "$src_rel" > "$tmp/$REC_NAME"
-      mv -- "$tmp" "$dst"
-      mkdir -p "$(dirname "$marker")"
-      touch "$marker"
-      printf 'fired %s -> %s\n' "$name" "$dst"
+      printf 'fired d-%s %s %s %s %s %s\n' "$RAND" "$(now_utc)" "$handler" "$now_t" "${slot:--}" "$src_rel" > "$tmp/$REC_NAME" || return 1
     fi
-    if [[ "$is_once" == "1" ]]; then
-      rm -rf -- "$src"
-      # Walk up removing now-empty schedule dirs (e.g. <date>/<HH-MM>/, then <date>/),
-      # but never the once axis root itself.
-      local parent
-      parent="$(dirname "$src")"
-      while [[ "$parent" != "$SCHED/once" && "$parent" == "$SCHED/once/"* ]]; do
-        rmdir "$parent" 2>/dev/null || break
-        parent="$(dirname "$parent")"
-      done
-    fi
-  done < <(walk_due)
+    mv -- "$tmp" "$dst" || return 1
+    mkdir -p "$(dirname "$marker")" && touch "$marker" || return 1
+    printf 'fired %s -> %s\n' "$name" "$dst"
+  fi
+  if [[ "$is_once" == "1" ]]; then
+    rm -rf -- "$src" || return 1
+    # Walk up removing now-empty schedule dirs (e.g. <date>/<HH-MM>/, then <date>/),
+    # but never the once axis root itself.
+    parent="$(dirname "$src")"
+    while [[ "$parent" != "$SCHED/once" && "$parent" == "$SCHED/once/"* ]]; do
+      rmdir "$parent" 2>/dev/null || break
+      parent="$(dirname "$parent")"
+    done
+  fi
+  return 0
 }
 
 # note_collision DST SRC_REL DATE SLOT — the later occurrence lost its out/
@@ -652,7 +678,7 @@ cmd_list() {
 # never reach — orphans from typos, manual mkdirs, or invalid paths.
 # The "state" arg is the small grammar machine: at each position we
 # know which dir-name shapes are valid; anything else is an orphan.
-# When we hit a valid item-id, we stop descending (item contents are opaque).
+# When we hit a valid item-id, we stop descending (lint never looks inside an item).
 #
 # The same grammar serves `status --json`. Two globals widen the walk:
 #   LINT_INCLUDE_PAUSED=1  descend into .paused components (matching their
@@ -740,7 +766,7 @@ lint_walk() {
   shopt -u nullglob
 }
 
-# A recognized item: remember it (and what pauses it); never look inside.
+# A recognized item: remember it (and what pauses it); lint never looks inside.
 lint_item() {
   LINT_ITEMS+=("$1")
   LINT_ITEM_PAUSED+=("$2")
@@ -865,6 +891,7 @@ cmd_sweep() {
   passive_enter sweep
   ensure_dirs
   local days="${1:-14}" entry name
+  (( $# <= 1 )) || rt_die 2 "sweep: expected at most one <days>"
   [[ "$days" =~ ^[0-9]+$ ]] || die "sweep <days> must be a non-negative integer"
   while IFS= read -r entry; do
     [[ -n "$entry" ]] || continue
@@ -1063,14 +1090,17 @@ rec_load() {
     fi
     case "$kw" in
       start)
+        # Every start line counts, so a torn one fails closed (running or
+        # interrupted, never pending); fields that do not parse are empty.
         rf_pop; id="$RF"; rf_pop; at="$RF"; rf_pop
-        [[ "$id" =~ ^a-[A-Za-z0-9]+$ && "$at" =~ $RE_UTC ]] || continue
+        [[ "$id" =~ ^a-[A-Za-z0-9]+$ ]] || id=""
+        [[ "$at" =~ $RE_UTC ]] || at=""
         A_ID+=("$id"); A_AT+=("$at"); A_BY+=("$RF"); A_END+=(""); A_EXIT+=("")
         R_NSTART=$((R_NSTART + 1))
         ;;
       exit)
         rf_pop; id="$RF"; rf_pop; at="$RF"; rf_pop
-        [[ "$at" =~ $RE_UTC && "$RF" =~ ^[0-9]{1,3}$ ]] || continue
+        [[ -n "$id" && "$at" =~ $RE_UTC && "$RF" =~ ^[0-9]{1,3}$ ]] || continue
         for (( i = R_NSTART - 1; i >= 0; i-- )); do
           if [[ "${A_ID[i]}" == "$id" ]]; then A_END[i]="$at"; A_EXIT[i]="$RF"; break; fi
         done
@@ -1085,12 +1115,13 @@ rec_load() {
 }
 
 # rec_probe FILE — is the record's lock free right now? 0 free, 1 held, 2 no
-# answer. It takes the lock for an instant and lets it go; it writes nothing.
+# answer. It takes a shared lock for an instant and lets it go, so readers never
+# collide with each other; it writes nothing.
 rec_probe() {
   local rc=0
   case "$GH_LOCK_HELPER" in
-    flock) flock -n "$1" true 2>/dev/null || rc=$? ;;
-    perl)  perl -MFcntl=:flock -e 'open(my $f, "<", $ARGV[0]) or exit 2; flock($f, LOCK_EX|LOCK_NB) or exit 1; exit 0' "$1" 2>/dev/null || rc=$? ;;
+    flock) flock -s -n "$1" true 2>/dev/null || rc=$? ;;
+    perl)  perl -MFcntl=:flock -e 'open(my $f, "<", $ARGV[0]) or exit 2; flock($f, LOCK_SH|LOCK_NB) or exit 1; exit 0' "$1" 2>/dev/null || rc=$? ;;
     *)     rc=2 ;;
   esac
   (( rc <= 1 )) || rc=2
@@ -1135,11 +1166,12 @@ delivery_json() {
   rec_state "$rec"
   [[ "$R_STATE" == pending ]] && PENDING_N=$((PENDING_N + 1))
   for (( i = 0; i < R_NSTART; i++ )); do
-    json_str "${A_ID[i]}"; id="$JSTR"
+    id=null; [[ -n "${A_ID[i]}" ]] && id="\"${A_ID[i]}\""
+    at=null; [[ -n "${A_AT[i]}" ]] && at="\"${A_AT[i]}\""
     by=null; [[ "${A_BY[i]}" == tick || "${A_BY[i]}" == retry ]] && by="\"${A_BY[i]}\""
     end=null; ex=null
     if [[ -n "${A_EXIT[i]}" ]]; then end="\"${A_END[i]}\""; ex=$((10#${A_EXIT[i]})); fi
-    att+="${att:+,}{\"id\":$id,\"started_at\":\"${A_AT[i]}\",\"by\":$by,\"finished_at\":$end,\"exit_status\":$ex}"
+    att+="${att:+,}{\"id\":$id,\"started_at\":$at,\"by\":$by,\"finished_at\":$end,\"exit_status\":$ex}"
   done
   ex=null; [[ -n "$R_EXIT" ]] && ex=$((10#$R_EXIT))
   if [[ -e "$d/$LOG_NAME" ]]; then json_str "$rel/$LOG_NAME"; log="$JSTR"; fi
@@ -1148,13 +1180,20 @@ delivery_json() {
   json_str "$R_SCHED"; sched_json="$JSTR"
   slot_json=null; [[ "$R_SLOT" != - ]] && slot_json="\"$R_SLOT\""
   [[ "$R_HANDLER" == run ]] && run=true
+  if [[ "$run" == false && ( -e "$d/$RUN_NAME" || -L "$d/$RUN_NAME" ) ]]; then
+    diag_add run_not_executable "$rel/$RUN_NAME was not an executable file when it fired (no execute bit, or a broken link), so the delivery was not run" "$rel/$RUN_NAME"
+  fi
   JR="{\"path\":$path_json,\"id\":$id_json,\"state\":\"$R_STATE\",\"fired_at\":\"$R_AT\",\"schedule_path\":$sched_json,\"occurrence\":{\"date\":\"$R_DATE\",\"slot\":$slot_json},\"run\":$run,\"exit_status\":$ex,\"attempts\":[$att],\"log\":$log}"
   local c parts=() what
   for c in ${R_COLL[@]+"${R_COLL[@]}"}; do
     IFS="$US" read -r -a parts <<< "$c"
     what="${parts[3]:-a schedule item}${parts[1]:+ on ${parts[1]}}"
     [[ "${parts[2]:-}" != - && -n "${parts[2]:-}" ]] && what+=" slot ${parts[2]}"
-    diag_add out_collision "$rel already existed when $what fired; that occurrence was marked fired and not delivered, so its run never ran" "$rel"
+    if [[ "${parts[1]:-}" == "$R_DATE" && "${parts[2]:-}" == "$R_SLOT" && "${parts[3]:-}" == "$R_SCHED" ]]; then
+      diag_add out_collision "$rel: the same occurrence fired again (re-armed, or a tick ended before its marker); this delivery stands" "$rel"
+    else
+      diag_add out_collision "$rel already existed when $what fired; that occurrence was marked fired and not delivered, so its run never ran" "$rel"
+    fi
   done
 }
 
@@ -1175,6 +1214,13 @@ inspect_deliveries() {
   shopt -u nullglob
   if (( PENDING_N > 0 )) && ! handlers_supported; then
     diag_add handlers_unavailable "$PENDING_N deliveries have a run that this host cannot start ($GH_HANDLERS_MISSING); see README.md" ""
+  fi
+  local line
+  if read_text "$GH_DIR/runtime/firing_failed"; then
+    while IFS= read -r line; do
+      [[ "$line" == *" "* ]] || continue
+      diag_add firing_failed "the tick at ${line%% *} could not fire ${line#* } (see that tick's stderr); every tick tries it again" "${line#* }"
+    done <<< "$TEXT"
   fi
   if [[ -e "$GH_DIR/runtime/config.json" || -L "$GH_DIR/runtime/config.json" ]]; then
     diag_add config_ignored "runtime/config.json is present but ignored: protocol 2 has no consumer configuration, and an item's own run replaces it" "runtime/config.json"
@@ -1859,20 +1905,31 @@ cmd_setpause() { # true|false ARGS…
 # delivery whose record says it has a run and never started. One that another
 # process is starting (its lock is held) is left to it.
 handlers_scan() {
-  local d n=0
-  shopt -s nullglob
-  for d in "$OUT"/*; do
-    [[ -d "$d" && ! -L "$d" && "$d" != *.landing ]] || continue
-    rec_load "$d/$REC_NAME" || continue
+  local f d n=0
+  while IFS= read -r f; do
+    d="${f%/*}"
+    [[ -n "$f" && -d "$d" && ! -L "$d" && "$d" != *.landing ]] || continue
+    rec_load "$f" || continue
     [[ "$R_HANDLER" == run ]] && (( R_NSTART == 0 )) || continue
     if ! handlers_supported; then n=$((n + 1)); continue; fi
     handler_start "$d" tick || true
-  done
-  shopt -u nullglob
+  done < <(run_pending_records)
   if (( n > 0 )); then
     echo "warning: $n deliveries have a run, but this host cannot start one ($GH_HANDLERS_MISSING)" >&2
   fi
   return 0
+}
+
+# run_pending_records — the records in out/ whose fired line says run and
+# that hold no start line, one per line. One find and one awk read them all,
+# so a tick does not parse every finished delivery in bash; rec_load checks
+# each hit again.
+run_pending_records() {
+  [[ -d "$OUT" ]] || return 0
+  find "$OUT" -mindepth 2 -maxdepth 2 -name "$REC_NAME" -type f -exec awk '
+    FNR == 1 { if (f != "" && ok && !st) print f; f = FILENAME; st = 0; ok = ($0 ~ /^fired [^ ]+ [^ ]+ run /); next }
+    /^start / { st = 1 }
+    END { if (f != "" && ok && !st) print f }' {} + 2>/dev/null || true
 }
 
 # handler_start DIR BY — start DIR's run once, BY tick or retry. Take the
@@ -1900,13 +1957,17 @@ handler_start() {
     case "$GH_ISOLATE" in
       perl)
         # setsid(2) makes the wrapper its own session and process group
-        # leader. A background job of a non-interactive shell starts with
-        # SIGINT and SIGQUIT ignored, and a bash started with a signal ignored
-        # cannot restore it, so perl restores them first.
-        exec "$GH_PERL_BIN" -MPOSIX -e '$SIG{INT} = "DEFAULT"; $SIG{QUIT} = "DEFAULT"; $SIG{PIPE} = "DEFAULT"; POSIX::setsid() or POSIX::_exit(126); exec { $ARGV[0] } @ARGV; POSIX::_exit(127)' \
+        # leader, before anything else, so a Ctrl-C meant for the ticker
+        # cannot reach it. A background job of a non-interactive shell starts
+        # with SIGINT and SIGQUIT ignored, and a bash started with a signal
+        # ignored cannot restore it, so perl restores them next.
+        exec "$GH_PERL_BIN" -MPOSIX -e 'POSIX::setsid() or do { print STDERR "groundhog: setsid failed: $!\n"; POSIX::_exit(126) }; $SIG{INT} = "DEFAULT"; $SIG{QUIT} = "DEFAULT"; $SIG{PIPE} = "DEFAULT"; exec { $ARGV[0] } @ARGV; print STDERR "groundhog: cannot start the wrapper: $!\n"; POSIX::_exit(127)' \
           -- "$BASH" "$GH_DIR/groundhog.sh" _handle "$d" "$R_ID" "$HS_AID"
         ;;
       setsid)
+        # Resets SIGINT under bash 5 when the ticker itself had it at its
+        # default; bash 3.2, or a ticker started with it ignored, passes the
+        # ignored SIGINT on to the run (perl, preferred above, always resets).
         trap - INT QUIT PIPE
         exec "$GH_SETSID_BIN" "$BASH" "$GH_DIR/groundhog.sh" _handle "$d" "$R_ID" "$HS_AID"
         ;;
@@ -1929,6 +1990,7 @@ cmd_handle() {
   { : >&7; } 2>/dev/null || die "_handle is started by tick and retry only"
   resolve_paths
   INSTANCE="$(canonical_dir "$GH_DIR")" || INSTANCE="$GH_DIR"
+  d="$INSTANCE/out/${d##*/}"    # $1 and cwd spelled canonically, whatever path the ticker used
   # A signal to the wrapper alone waits for `run`, so the lock and the exit
   # line still come out right; `run` itself keeps the default handling. To
   # stop a run, signal its process group (the wrapper's pid).
@@ -1937,7 +1999,7 @@ cmd_handle() {
     echo "groundhog: $d/$RUN_NAME is gone" >&2; rc=127     # bash 3.2 would say 1
   elif [[ ! -f "$d/$RUN_NAME" || ! -x "$d/$RUN_NAME" ]]; then
     echo "groundhog: $d/$RUN_NAME is not an executable file" >&2; rc=126
-  elif cd -- "$GH_DIR/.." 2>/dev/null; then
+  elif cd -- "$INSTANCE/.." 2>/dev/null; then
     GROUNDHOG_INSTANCE="$INSTANCE" GROUNDHOG_DELIVERY_ID="$did" GROUNDHOG_ATTEMPT_ID="$aid" \
       "$d/$RUN_NAME" "$d" 7>&- </dev/null || rc=$?
   else
@@ -1974,7 +2036,13 @@ cmd_retry() {
   rec_load "$d/$REC_NAME" || rt_die 5 "retry: out/$name has no record Groundhog made (placed by hand or imported), so it never runs"
   [[ "$R_HANDLER" == run ]] || rt_die 5 "retry: out/$name has no run"
   [[ -f "$d/$RUN_NAME" && -x "$d/$RUN_NAME" ]] || rt_die 5 "retry: out/$name/$RUN_NAME is missing or not executable"
-  handler_start "$d" retry || rc=$?
+  # A status or sweep testing the lock holds it for an instant: try thrice.
+  local tries=0
+  while :; do
+    rc=0; handler_start "$d" retry || rc=$?
+    (( rc == 4 && ++tries < 3 )) || break
+    sleep 0.1 9>&-
+  done
   case "$rc" in
     0) ;;
     4) rt_die 4 "retry: out/$name is running" ;;
@@ -2050,4 +2118,7 @@ main() {
   esac
 }
 
-main "$@"
+# exit on main's own line: bash reads a script as it runs it, so when main
+# returns it exits without reading on. A copy rewritten in place while a
+# wrapper or loop waits never has its new bytes run by the old process.
+main "$@"; exit $?

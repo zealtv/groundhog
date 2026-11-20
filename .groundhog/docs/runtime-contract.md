@@ -63,8 +63,10 @@ Exit codes of `retry`, `pause`, `resume` and `run`: 0 success, 2 invalid
 arguments (or, for `retry`, not a delivery of this instance), 3 refused by
 the instance pause, 4 busy, 5 nothing to do or not possible on this host,
 6 I/O failure. `tick`, `init`, `add`, `drop` and `sweep` keep exit 1 for
-errors and also exit 4 when the mutation lock stays busy (about three
-seconds) and 6 when it cannot be taken. `capabilities` and `status` exit 2 on
+errors (for `tick`: an item that could not be fired, after the rest of the
+tick has run; `sweep` exits 2 for more than one argument) and also exit 4
+when the mutation lock stays busy (about three seconds) and 6 when it cannot
+be taken. `capabilities` and `status` exit 2 on
 invalid arguments, and `status` also when the script is not inside a
 `.groundhog/` directory.
 
@@ -143,12 +145,17 @@ tick`), opens `.groundhog-log` for appending, and starts the wrapper with the
 locked descriptor. The tick does not wait for the run.
 
 **The wrapper** runs in a new session (perl's `POSIX::setsid`, else
-`setsid(1)`) with SIGINT, SIGQUIT and SIGPIPE at their defaults, stdout and
-stderr on `.groundhog-log`, stdin `/dev/null`, and without the mutation lock.
+`setsid(1)`), stdout and stderr on `.groundhog-log`, stdin `/dev/null`, and
+without the mutation lock. On the perl path, SIGINT, SIGQUIT and SIGPIPE are
+at their defaults. On the `setsid(1)` path they are reset by the shell, which
+works under bash 5 when the ticker had them at their defaults; under bash 3.2,
+or from a ticker started with SIGINT ignored, `run` inherits SIGINT ignored.
 It starts `run` with:
 
-- `$1`: the delivery's absolute path, and no other argument;
-- cwd: the project, the parent of `.groundhog/`;
+- `$1`: the delivery's absolute path, spelled from the canonical instance
+  (so it lies under `GROUNDHOG_INSTANCE` however the ticker reached the
+  instance), and no other argument;
+- cwd: the project, the canonical parent of `.groundhog/`;
 - stdin: `/dev/null`; stdout and stderr: the log;
 - environment: the ticker's, plus `GROUNDHOG_INSTANCE` (the canonical
   instance directory), `GROUNDHOG_DELIVERY_ID` (from the fired line) and
@@ -159,8 +166,12 @@ It starts `run` with:
 When `run` exits, the wrapper appends `exit <attempt-id> <utc> <status>` and
 exits. SIGINT, SIGTERM and SIGHUP sent to the wrapper alone wait for `run`.
 The wrapper's pid is the session's process group: signalling that group stops
-the run and the exit line records it. Only a `kill -9` of the wrapper, or the
-machine stopping, leaves a start without an exit.
+the run and the exit line records it. A start without an exit is left by a
+`kill -9` of the wrapper, a tick killed between the start line and the
+wrapper, or the machine stopping (see [Crash windows](#crash-windows)).
+`interrupted` means the wrapper is gone, not necessarily `run`: after a
+`kill -9` of the wrapper's pid alone, `run` goes on without the lock, and a
+`retry` would start a second copy beside it. Check before retrying.
 
 **States.** A client derives them from the record and the lock; `status`
 reports them as `state`:
@@ -177,6 +188,9 @@ reports them as `state`:
 
 A `pending` delivery whose lock is held for an instant (a tick or `retry` in
 the middle of starting it) still reads `pending` until its start line lands.
+Every line that begins `start ` counts as a start, even one whose fields do
+not parse (its attempt then shows `id` and `started_at` as `null`), so a torn
+start fails closed, as `running` or `interrupted`, never `pending`.
 
 **Never re-run automatically.** Groundhog starts a run by itself only from
 `pending`. An `interrupted` run may have done part of its work; only an
@@ -186,7 +200,7 @@ its own lock.
 
 **Exactly once.** On a host with a lock helper, firings are serialized by the
 mutation lock, so two tickers (cron and a loop, say) fire each occurrence once,
-and the record's lock keeps each delivery to one run at a time. Without a lock
+and the record's lock keeps each delivery's wrapper to one at a time. Without a lock
 helper Groundhog fires unlocked, as it always has, and starts no run.
 
 ## Retry
@@ -195,9 +209,10 @@ helper Groundhog fires unlocked, as it always has, and starts no run.
 new attempt (`by retry`). `<delivery>` is the directory's name in `out/`,
 `out/<name>`, or its absolute path; anything that does not name a directory
 directly under this instance's `out/` exits 2. It takes the mutation lock,
-then the record's lock, and returns once the wrapper has started. It exits 4
-if the record's lock is held (the delivery is running or being started) or the
-mutation lock stays busy, 3 while the instance is paused, and 5 when the
+then the record's lock (three tries, 0.1 s apart, so a reader's instant on it
+does not count as busy), and returns once the wrapper has started. It exits 4
+if the record's lock stays held (the delivery is running or being started) or
+the mutation lock stays busy, 3 while the instance is paused, and 5 when the
 delivery has no record Groundhog made, a `none` record, no executable `run`, or
 the host offers no `handlers-v1`. No token is involved.
 
@@ -221,8 +236,12 @@ marker in `fired/` remains, so the occurrence does not fire again.
 ## The run loop
 
 `run [--interval-seconds N]` ticks, then waits until N seconds (default 60)
-after that tick began, and repeats, until SIGINT, SIGTERM or SIGHUP, after
-which it finishes the tick in progress and exits 0. Each tick runs in a
+after that tick began, and repeats, until SIGINT, SIGTERM or SIGHUP, and
+exits 0. Ctrl-C (the tick's subshell ignores SIGINT), or SIGTERM or SIGHUP to
+the loop's pid alone, lets the tick in progress finish. SIGTERM or SIGHUP to
+the loop's whole process group (a closed terminal pane, a service manager
+stopping the group) kills that tick too, which is one of the crash windows
+below. Each tick runs in a
 subshell, so a failing tick is logged and the loop goes on. The loop holds no
 lock of its own and owns nothing: two loops, or a loop and cron, both tick.
 Runs it started live on in their own sessions after it ends. `last_tick`
@@ -233,10 +252,10 @@ records its ticks with source `runner`.
 | A crash … | leaves | the next tick |
 |---|---|---|
 | while copying into `out/<name>.landing` | a `.landing` copy, no marker | fires again, replacing the copy; the copy never runs; `sweep` removes it if left |
-| after the rename, before the marker | a delivery (pending, if it has a run), no marker | starts its run, and records the occurrence as a collision with its own delivery |
+| after the rename, before the marker | a delivery (pending, if it has a run), no marker | starts its run, and records the occurrence as a collision with its own delivery, which `status` reports as harmless |
 | after the marker, before the scan | a pending delivery | starts its run |
 | after a start line, before the wrapper | a start, no exit, free lock: `interrupted` | leaves it; `retry` restarts |
-| of the wrapper (`kill -9`) | the same | the same |
+| of the wrapper (`kill -9`) | the same, while `run` may still be going | the same |
 | of `run` | an exit line with 128 + N | nothing: `failed` |
 
 ## Read-only JSON projection
@@ -277,8 +296,10 @@ records its ticks with source `runner`.
 | Code | When |
 |---|---|
 | `schedule_unrecognized_path` | a path the schedule grammar rejects (what `lint` lists) |
-| `out_collision` | one per `collision` line: a later occurrence lost its name, so its run never ran |
+| `out_collision` | one per `collision` line: a later occurrence lost its name, so its run never ran; or, when the line names the delivery's own occurrence (a re-arm, or a tick that ended before its marker), harmless |
 | `out_entry_not_directory` | a file or dangling symlink in `out/` |
+| `run_not_executable` | a `none` delivery holds an entry named `run` (no execute bit, or a link that broke in `out/`); it never ran |
+| `firing_failed` | the last tick could not fire this schedule item (`path` is its schedule path); every tick tries again |
 | `record_malformed` | a `.groundhog-record` that does not start with a fired line |
 | `handlers_unavailable` | pending deliveries on a host without `handlers-v1` |
 | `config_ignored` | a protocol 1 `runtime/config.json` is present and ignored |
@@ -288,8 +309,9 @@ records its ticks with source `runner`.
 `status` and `capabilities` are strictly read-only, even before `init`: they
 create, lock-hold, tick, start and repair nothing. `status` reads directory
 names, the files under `runtime/` and each delivery's record, and nothing else
-in a payload. To tell `running` from `interrupted` it takes the record's lock
-for an instant and releases it.
+in a payload. To tell `running` from `interrupted` it takes a shared lock on
+the record for an instant and releases it; readers never collide with each
+other, and a starter that meets one finds the delivery busy for that instant.
 
 ## What clients build on
 
@@ -302,11 +324,21 @@ Groundhog:
   for an instance, and reads `last_tick` for liveness. It owns nothing: when it
   quits it simply stops ticking, and runs go on in their own sessions.
 - **A tool that schedules work** writes the item, `run` included, into a
-  prepared directory and lands it with `add --from`. Its `run` uses `$1`,
-  `GROUNDHOG_INSTANCE`, `GROUNDHOG_DELIVERY_ID` (the same for every attempt,
-  so it can de-duplicate) and `GROUNDHOG_ATTEMPT_ID`.
+  prepared directory and lands it with `add --from`, with `run` already
+  executable. Its `run` uses `$1`, `GROUNDHOG_INSTANCE`,
+  `GROUNDHOG_DELIVERY_ID` and `GROUNDHOG_ATTEMPT_ID`. A retry keeps the
+  delivery id: a `run` that de-duplicates on the delivery id skips every retry
+  and exits 0, which reads `accepted`. De-duplicate on the attempt id, or only
+  on success.
 - **A long-lived loop** in a terminal pane or a service calls `groundhog.sh
-  run`, or its own `while sleep 60; do groundhog.sh tick; done`.
+  run`, or its own `while sleep 60; do groundhog.sh tick; done`. A loop that
+  ticks and then moves `out/*` away moves a delivery from under the run just
+  started for it: it leaves deliveries whose record says `run`, or lets `run`
+  do the moving.
+
+A tick can exit 1 (a firing failed; the rest of the tick still happened) or
+4 (the mutation lock stayed busy); `pause`, `resume` and `retry` can exit 4
+too. Clients try again later rather than read 4 as a refusal.
 
 A client finds `handlers-v1` before it relies on runs, `pause-v2` before it
 calls `pause` without a token, `add-from-v1` before it passes `--from`, and

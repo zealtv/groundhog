@@ -3,7 +3,7 @@
 # and, if installed, a newer one).
 #
 #   tests/run.sh                    all tests, all bashes found
-#   tests/run.sh test_state.sh ...  only the named tests
+#   tests/run.sh test_handlers.sh ...  only the named tests
 #   TEST_BASHES="/bin/bash /opt/homebrew/bin/bash" tests/run.sh
 #
 # Needs: python3 (parses the script's JSON output), standard POSIX tools.

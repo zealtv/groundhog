@@ -105,6 +105,8 @@ gh tick >/dev/null 2>&1
 status_to "$out"
 assert_eq "re-arm: still one delivery for the name" 1 "$(jq_py where "$out" deliveries path "\"out/foo-$td\"" id | wc -l | tr -d ' ')"
 assert_eq "...the refire is reported as a collision" 1 "$(ncoll)"
+assert_contains "...as the same occurrence, with the delivery standing" "$(jget "$out" diagnostics)" "this delivery stands"
+assert_not_contains "...not as a lost run" "$(jget "$out" diagnostics)" "its run never ran"
 assert_true "...with the marker back" test -e "$GHD/fired/$td/daily/foo"
 if have_handlers; then
   assert_eq "...and the delivery's run was not started again" 1 "$(rec_count "foo-$td" start)"

@@ -47,7 +47,7 @@ chmod +x .groundhog/schedule/daily/09/report/run
   fired/      what has happened
 ```
 
-The path above an item is its schedule: `daily/`, `weekly/mon/`, `monthly/1/`, `yearly/03-15/`, `once/2026-05-01/`, `every/15m/`. Move an item to reschedule it. What an item is is up to you; groundhog does not care what's inside.
+The path above an item is its schedule: `daily/`, `weekly/mon/`, `monthly/1/`, `yearly/03-15/`, `once/2026-05-01/`, `every/15m/`. Move an item to reschedule it. What an item is is up to you; apart from `run` and the two files it writes into each delivery (`.groundhog-record`, `.groundhog-log`), groundhog does not care what's inside.
 
 Groundhog is passive: `tick` only fires when invoked. To bring the schedule to life, run it on an interval: `./.groundhog/groundhog.sh run` ticks every 60 seconds until Ctrl-C, or use cron, or `while sleep 60; do ./.groundhog/groundhog.sh tick; done`.
 
